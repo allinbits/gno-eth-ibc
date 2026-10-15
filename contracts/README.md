@@ -59,7 +59,7 @@ them from tm2 types with go-ethereum's `abi` package:
 Header {
   HeaderFields signedHeader {
     uint64 height; uint64 timeSeconds; uint32 timeNanos;
-    bytes32 nextValidatorsHash; bytes32 appHash;
+    bytes32 validatorsHash; bytes32 nextValidatorsHash; bytes32 appHash;
     // hashes of the parts of the 16-leaf header tree the contract does not rebuild
     bytes32 versionLeafHash;          // leafHash(leaf 0: Version)
     bytes32 txsAndLastBlockIDHash;    // subtree of leaves 4..7: NumTxs, TotalTxs, AppVersion, LastBlockID
@@ -67,28 +67,38 @@ Header {
     bytes32 consensusLeafHash;        // leafHash(leaf 12: ConsensusHash)
     bytes32 resultsAndProposerHash;   // subtree of leaves 14..15: LastResultsHash, ProposerAddress
   }
-  Commit commit { uint32 round; uint32 partSetTotal; bytes32 partSetHash; CommitSig[] signatures; }
-  Validator[] validatorSet;           // { bytes pubKey /* 64-byte X||Y */; uint64 votingPower }, set order
+  Commit commit { uint32 round; uint32 partSetTotal; bytes32 partSetHash; bytes signatures; }
+  Validator[] validatorSet;           // { bytes pubKey /* 64-byte X||Y */; uint64 votingPower }, set order;
+                                      // empty when the set is cached
   uint64 trustedHeight;
-  Validator[] trustedValidators;      // empty unless non-adjacent with a different validator set
+  Validator[] trustedValidators;      // only for a non-adjacent header with another set, and only if not cached
 }
-CommitSig { uint32 validatorIndex; uint32 trustedIndex; uint64 timeSeconds; uint32 timeNanos;
-            bytes32 r; bytes32 s; uint8 v; }
+signatures = CommitSig || CommitSig || ...   // 81 bytes each, big-endian:
+  u16 validatorIndex | u16 trustedIndex (0xffff: none) | u64 timeSeconds | u32 timeNanos | r (32) | s (32) | u8 v
 ```
 
 The contract amino-encodes the six leaves it relies on itself (ChainID from its client state, Height,
-Time, ValidatorsHash computed from `validatorSet`, NextValidatorsHash, AppHash) and recomputes
-`Header.Hash()` from them and the five siblings. A relayer therefore cannot make it read one value while
-the signatures cover another.
+Time, ValidatorsHash, NextValidatorsHash, AppHash) and recomputes `Header.Hash()` from them and the five
+siblings. A relayer therefore cannot make it read one value while the signatures cover another.
+
+**Validator set cache.** The client keeps validator sets in storage keyed by their tm2
+`ValidatorSet.Hash`: per validator `(power << 160) | address`, plus size and total power. A set is
+cached only from supplied keys and powers whose hash the contract recomputed (on-curve keys, the exact
+tm2 encoding), and only when an accepted update's header has that set as its *next* set as well, i.e.
+when the next update will need it. Since the hash commits to the keys and powers, a cached entry is the
+set the hash names; a header naming a cached set by `validatorsHash` gets exactly that set, and any
+other claim changes the header hash and fails the signatures. `isValidatorSetCached(hash)` and
+`getValidatorSet(hash)` expose the cache; misbehaviour submissions never write it.
 
 Per signature, the relayer supplies:
 
-* `validatorIndex`: the precommit's index in the commit, which is the index in `validatorSet`. Indices
-  must strictly increase (this also rules out counting a signer twice). Only precommits for the
-  committed BlockID are sent; absent and nil-block precommits are dropped (dropping can only lower the
-  tally).
-* `trustedIndex`: the signer's index in `trustedValidators` (`type(uint32).max` if absent), so the trust
-  check is a lookup rather than a search.
+* `validatorIndex`: the precommit's index in the commit, which is the index in the validator set.
+  Indices must strictly increase (this also rules out counting a signer twice). Only precommits for the
+  committed BlockID are sent; the relayer sends the fewest that clear the thresholds (highest power
+  first; for a trust check, first the signers with the most trusted power). Dropping signatures can only
+  lower the tally.
+* `trustedIndex`: the signer's index in the trusted set (`0xffff` if absent or no trust check), so the
+  trust check is a lookup rather than a search.
 * `v`: tm2 signatures are 64-byte `r||s` with no recovery id. The relayer finds `v ∈ {27,28}` by trial
   recovery (`gnoibc.RecoveryID`). It is not signed; a wrong `v` just fails.
 
@@ -97,20 +107,22 @@ Verification (`_verifyHeader`), following tm2 and AtomOne's `modules/10-gno` ver
 1. the consensus state at `trustedHeight` exists, is within the trusting period
    (`trusted.time + trustingPeriod > now`), and `height > trustedHeight`;
 2. for updates (not misbehaviour): `trusted.time < header.time < now + maxClockDrift`;
-3. each validator's 64-byte key must be on the curve; the contract derives the 33-byte compressed key
-   (prefix from Y's parity) for the tm2 hash and `keccak256(X||Y)[12:]` for `ecrecover`;
-4. adjacent (`height == trustedHeight + 1`) or no `trustedValidators`: the header's validator set hash
-   must equal the trusted `nextValidatorsHash`. Non-adjacent with `trustedValidators`: those must hash to
-   the trusted `nextValidatorsHash`, and more than `trustLevel` (default 1/3) of their power must have
-   signed (`tallied > total * num / den`);
-5. for each signature: rebuild the CanonicalVote sign bytes, require low-S, `ecrecover(sha256(bytes))`
-   must be the validator's address; more than 2/3 of the header set's power must sign
-   (`tallied > total * 2 / 3`).
+3. the header's validator set: supplied keys (each on the curve; the contract derives the 33-byte
+   compressed key for the tm2 hash and `keccak256(X||Y)[12:]` for `ecrecover`) must hash to
+   `validatorsHash`, or the set cached under `validatorsHash` is used;
+4. if `validatorsHash` equals the trusted `nextValidatorsHash`, no trust check is needed. Otherwise the
+   header must be non-adjacent, and more than `trustLevel` (default 1/3) of the trusted next set's power
+   must have signed (`tallied > total * num / den`), the set coming from `trustedValidators` (hashing to
+   the trusted `nextValidatorsHash`) or the cache;
+5. for each signature: rebuild the CanonicalVote sign bytes in one reused buffer, require low-S,
+   `ecrecover(sha256(bytes))` must be the validator's address; more than 2/3 of the header set's power
+   must sign (`tallied > total * 2 / 3`).
 
 `updateClient` then returns `NoOp` if the height already holds the same consensus state, freezes and
 returns `Misbehaviour` if it holds a different one (or if the new header's time is not after the latest
-one's), and otherwise stores `{timestamp (unix ns), appHash, nextValidatorsHash}` at the height. Updates
-only move forward: a new height below `latestHeight` is refused.
+one's), and otherwise stores `{timestamp (unix ns), appHash, nextValidatorsHash}` at the height and caches
+the supplied validator set if it is also the next set. Updates only move forward: a new height below
+`latestHeight` is refused.
 
 ### Misbehaviour
 
@@ -210,60 +222,59 @@ real Go code (`fixtures/cmd/genfixtures`). References are to the gno repository.
 
 ## Gas
 
-Execution gas from `forge test -vv` (`vm.lastCallGas`), first update of the client in the transaction
-(cold storage). A standalone transaction adds 21,000 plus calldata (~2 KB for a 3-validator update).
+Execution gas from `forge test -vv` (`vm.lastCallGas`). A standalone transaction adds 21,000 plus calldata.
 
 | call | gas |
 |---|---|
-| `updateClient`, adjacent, 3 validators, 3 signatures | ~171k |
-| `updateClient`, adjacent, 4 validators, 3 signatures | ~165k (warm client state) |
-| `updateClient`, non-adjacent, 3 trusted + 4 new validators, 4 signatures | ~207k |
-| `misbehaviour`, two 3-validator headers | ~188k |
+| `updateClient`, adjacent, 3 validators supplied and cached, 3 signatures | ~248k |
+| `updateClient`, adjacent, 4 validators supplied and cached, 3 signatures | ~264k |
+| `updateClient`, non-adjacent, 3 trusted + 4 new validators supplied, 4 signatures (4 cached) | ~301k |
+| `misbehaviour`, two 3-validator headers | ~160k |
 | `verifyMembership` (15-step bptree + rootmulti proof) | ~70k |
 | `verifyNonMembership`, key between two neighbours | ~180k |
 | `verifyNonMembership`, key before / after every key (one neighbour) | ~77k–95k |
 
 ### Scaling with the validator set
 
-`test/GasScaling.t.sol` (`make test FORGE_ARGS="--match-contract GasScaling -vv"`) runs `updateClient` on
-fixtures of equal-power secp256k1 sets built with tm2 (`fixtures/cmd/genfixtures`, `test/fixtures/gas.json`),
-each on a fresh client. "tx" is 21,000 + calldata (16 gas per non-zero byte, 4 per zero byte of the
-`updateClient(bytes)` calldata) + execution; EIP-7623's calldata floor does not bind here, execution
-dominates.
+`test/GasScaling.t.sol` (`make test FORGE_ARGS="--match-contract GasScaling -vv"`) replays fixtures of
+equal-power secp256k1 sets built with tm2 (`fixtures/cmd/genfixtures`, `test/fixtures/gas.json`). Every
+measured call starts from cold storage (`vm.cool`). "tx" is 21,000 + calldata (16 gas per non-zero byte,
+4 per zero byte of the `updateClient(bytes)` calldata) + execution. "Fewest" is the minimal signer set
+the relayer sends (here `floor(2N/3) + 1`).
 
-| N | signers | case | exec gas | calldata bytes | est. tx gas |
-|---:|---:|---|---:|---:|---:|
-| 3 | 3 | adjacent, all sign | 156,509 | 2,020 | 194,181 |
-| 3 | 3 | adjacent, fewest > 2/3 | 156,509 | 2,020 | 194,181 |
-| 3 | 3 | non-adjacent, trusted set checked | 184,941 | 2,596 | 227,209 |
-| 3 | 3 | non-adjacent, same set (no trusted set sent) | 156,519 | 2,020 | 194,143 |
-| 7 | 7 | adjacent, all sign | 238,139 | 3,684 | 289,511 |
-| 7 | 5 | adjacent, fewest > 2/3 | 214,463 | 3,236 | 262,171 |
-| 7 | 7 | non-adjacent, trusted set checked | 303,818 | 5,028 | 366,038 |
-| 7 | 7 | non-adjacent, same set | 238,233 | 3,684 | 289,581 |
-| 20 | 20 | adjacent, all sign | 506,115 | 9,092 | 601,919 |
-| 20 | 14 | adjacent, fewest > 2/3 | 433,904 | 7,748 | 518,740 |
-| 20 | 20 | non-adjacent, trusted set checked | 696,295 | 12,932 | 823,167 |
-| 20 | 20 | non-adjacent, same set | 506,181 | 9,092 | 601,973 |
-| 50 | 50 | adjacent, all sign | 1,136,279 | 21,572 | 1,334,695 |
-| 50 | 34 | adjacent, fewest > 2/3 | 940,857 | 17,988 | 1,110,009 |
-| 50 | 50 | non-adjacent, trusted set checked | 1,635,097 | 31,172 | 1,911,333 |
-| 50 | 50 | non-adjacent, same set | 1,136,289 | 21,572 | 1,334,741 |
-| 100 | 100 | adjacent, all sign | 2,226,304 | 42,372 | 2,595,664 |
-| 100 | 67 | adjacent, fewest > 2/3 | 1,811,422 | 34,980 | 2,120,470 |
-| 100 | 100 | non-adjacent, trusted set checked | 3,305,667 | 61,572 | 3,830,583 |
-| 100 | 100 | non-adjacent, same set | 2,226,678 | 42,372 | 2,596,086 |
+Steady state, a set that is already cached (the common case: validator sets change rarely):
 
-Least-squares fit over the adjacent rows (N validators, S signatures; within 5.4% of every row, slightly
-super-linear at N = 100 from memory expansion):
+| N | old: keys, all sign | old: keys, fewest | **cached, fewest** | cached, all sign | calldata (cached, fewest) |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 194,181 | 194,181 | **170,709** | 170,709 | 1,060 B |
+| 7 | 289,511 | 262,171 | **189,309** | 207,878 | 1,220 B |
+| 20 | 601,919 | 518,740 | **272,858** | 328,638 | 1,956 B |
+| 50 | 1,334,695 | 1,110,009 | **458,773** | 607,494 | 3,588 B |
+| 100 | 2,595,664 | 2,120,470 | **765,681** | 1,073,139 | 6,244 B |
 
-* execution ≈ 84k + 8.9k·N + 12.5k·S
-* transaction ≈ 111k + 10.4k·N + 14.3k·S
-* calldata = 772 + 192·N + 224·S bytes (exact: a validator is 6 ABI words, a signature 7)
-* a supplied trusted set adds ≈ 10.8k execution / 12.4k transaction gas per trusted validator
+(est. tx gas; "old" is the client before the cache and packed signatures, same fixtures.)
 
-A validator costs its key check (on-curve, keccak for the address, sha256 of its amino leaf, its share of
-the Merkle root); a signature costs its sign bytes, a sha256, `ecrecover` (3,000) and bookkeeping.
+All cases, est. tx gas (execution gas / calldata bytes in parentheses):
+
+| N | keys, all sign, no caching | keys, fewest, no caching | keys, fewest, set gets cached | cached, all | cached, fewest | non-adjacent, cached same set, fewest | non-adjacent, 1 validator rotated (keys, cached), trust over cached set |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 193,088 (156,628 / 1,636) | 193,088 | 284,210 (247,750) | 170,709 (139,037 / 1,060) | 170,709 | 170,629 | 294,738 (258,338) |
+| 7 | 262,899 (215,163 / 2,724) | 248,607 | 428,909 (383,613) | 207,878 (171,266 / 1,380) | 189,309 | 189,281 | 444,902 (399,714) |
+| 20 | 491,319 (406,827 / 6,276) | 448,032 | 918,412 (841,324) | 328,638 (276,030 / 2,436) | 272,858 | 272,954 | 958,856 (881,960) |
+| 50 | 1,024,991 (855,759 / 14,468) | 908,915 | 2,048,531 (1,898,999) | 607,494 (517,846 / 4,868) | 458,773 | 458,789 | 2,146,570 (1,997,458) |
+| 100 | 1,935,954 (1,625,582 / 28,132) | 1,693,076 | 3,948,272 (3,678,568) | 1,073,139 (921,851 / 8,932) | 765,681 | 765,841 | 4,135,089 (3,866,177) |
+
+Marginal costs (transaction gas):
+
+* a signature: ~14.3k before, now ~9.2k with the set cached (a cold storage read of the entry, 2,100,
+  instead of carrying and hashing the key; 81 instead of 224 calldata bytes) and ~7.3k with keys supplied
+  (packed signature, reused sign-bytes buffer);
+* a validator whose keys are supplied: ~10.7k (about as before); with the set cached: 0;
+* caching a set: ~22.6k per validator once (a new storage slot), paid by the update whose header shows
+  the set as its next set as well; it pays for itself after about three updates;
+* a trust check over a cached set: one cold storage read per trusted signer.
+
+The rotated case caches the new set (its next set is itself), hence its cost.
 
 ## Limitations
 
