@@ -1,0 +1,829 @@
+[
+ {
+  "type": "constructor",
+  "inputs": [
+   {
+    "name": "clientState_",
+    "type": "tuple",
+    "internalType": "struct IGnoLightClientMsgs.ClientState",
+    "components": [
+     {
+      "name": "chainId",
+      "type": "string",
+      "internalType": "string"
+     },
+     {
+      "name": "revisionNumber",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "latestHeight",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "trustLevel",
+      "type": "tuple",
+      "internalType": "struct IGnoLightClientMsgs.TrustThreshold",
+      "components": [
+       {
+        "name": "numerator",
+        "type": "uint64",
+        "internalType": "uint64"
+       },
+       {
+        "name": "denominator",
+        "type": "uint64",
+        "internalType": "uint64"
+       }
+      ]
+     },
+     {
+      "name": "trustingPeriod",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "maxClockDrift",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "isFrozen",
+      "type": "bool",
+      "internalType": "bool"
+     }
+    ]
+   },
+   {
+    "name": "consensusState_",
+    "type": "tuple",
+    "internalType": "struct IGnoLightClientMsgs.ConsensusState",
+    "components": [
+     {
+      "name": "timestamp",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "appHash",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     },
+     {
+      "name": "nextValidatorsHash",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "getClientState",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes",
+    "internalType": "bytes"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getConsensusState",
+  "inputs": [
+   {
+    "name": "height",
+    "type": "uint64",
+    "internalType": "uint64"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "tuple",
+    "internalType": "struct IGnoLightClientMsgs.ConsensusState",
+    "components": [
+     {
+      "name": "timestamp",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "appHash",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     },
+     {
+      "name": "nextValidatorsHash",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "misbehaviour",
+  "inputs": [
+   {
+    "name": "misbehaviourMsg",
+    "type": "bytes",
+    "internalType": "bytes"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "updateClient",
+  "inputs": [
+   {
+    "name": "updateMsg",
+    "type": "bytes",
+    "internalType": "bytes"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint8",
+    "internalType": "enum ILightClientMsgs.UpdateResult"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "verifyMembership",
+  "inputs": [
+   {
+    "name": "msg_",
+    "type": "tuple",
+    "internalType": "struct ILightClientMsgs.MsgVerifyMembership",
+    "components": [
+     {
+      "name": "proof",
+      "type": "bytes",
+      "internalType": "bytes"
+     },
+     {
+      "name": "proofHeight",
+      "type": "tuple",
+      "internalType": "struct IICS02ClientMsgs.Height",
+      "components": [
+       {
+        "name": "revisionNumber",
+        "type": "uint64",
+        "internalType": "uint64"
+       },
+       {
+        "name": "revisionHeight",
+        "type": "uint64",
+        "internalType": "uint64"
+       }
+      ]
+     },
+     {
+      "name": "path",
+      "type": "bytes[]",
+      "internalType": "bytes[]"
+     },
+     {
+      "name": "value",
+      "type": "bytes",
+      "internalType": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "verifyNonMembership",
+  "inputs": [
+   {
+    "name": "msg_",
+    "type": "tuple",
+    "internalType": "struct ILightClientMsgs.MsgVerifyNonMembership",
+    "components": [
+     {
+      "name": "proof",
+      "type": "bytes",
+      "internalType": "bytes"
+     },
+     {
+      "name": "proofHeight",
+      "type": "tuple",
+      "internalType": "struct IICS02ClientMsgs.Height",
+      "components": [
+       {
+        "name": "revisionNumber",
+        "type": "uint64",
+        "internalType": "uint64"
+       },
+       {
+        "name": "revisionHeight",
+        "type": "uint64",
+        "internalType": "uint64"
+       }
+      ]
+     },
+     {
+      "name": "path",
+      "type": "bytes[]",
+      "internalType": "bytes[]"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "event",
+  "name": "ClientUpdated",
+  "inputs": [
+   {
+    "name": "height",
+    "type": "uint64",
+    "indexed": true,
+    "internalType": "uint64"
+   },
+   {
+    "name": "blockHash",
+    "type": "bytes32",
+    "indexed": false,
+    "internalType": "bytes32"
+   },
+   {
+    "name": "appHash",
+    "type": "bytes32",
+    "indexed": false,
+    "internalType": "bytes32"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "Frozen",
+  "inputs": [
+   {
+    "name": "height",
+    "type": "uint64",
+    "indexed": true,
+    "internalType": "uint64"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "error",
+  "name": "BranchNotInChildOrder",
+  "inputs": [
+   {
+    "name": "branch",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ClientExpired",
+  "inputs": [
+   {
+    "name": "latestTimestamp",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "nowTimestamp",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ClientFrozen",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "ConsensusStateNotFound",
+  "inputs": [
+   {
+    "name": "height",
+    "type": "uint64",
+    "internalType": "uint64"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "DuplicateTrustedSigner",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "EmptyChild",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "EmptyLeafKey",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "EmptyLeafValue",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "EmptyMerkleTree",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "EmptyValidatorSet",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "EmptyValue",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "HeaderTimeInFuture",
+  "inputs": [
+   {
+    "name": "headerTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "limit",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "HeaderTimeNotAfterTrusted",
+  "inputs": [
+   {
+    "name": "headerTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "trustedTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "HeightBelowLatest",
+  "inputs": [
+   {
+    "name": "height",
+    "type": "uint64",
+    "internalType": "uint64"
+   },
+   {
+    "name": "latestHeight",
+    "type": "uint64",
+    "internalType": "uint64"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "HeightNotAboveTrusted",
+  "inputs": [
+   {
+    "name": "height",
+    "type": "uint64",
+    "internalType": "uint64"
+   },
+   {
+    "name": "trustedHeight",
+    "type": "uint64",
+    "internalType": "uint64"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InnerHashTooLong",
+  "inputs": [
+   {
+    "name": "step",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InnerPrefixStartsWithLeafPrefix",
+  "inputs": [
+   {
+    "name": "step",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InnerPrefixTooLong",
+  "inputs": [
+   {
+    "name": "step",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InnerPrefixTooShort",
+  "inputs": [
+   {
+    "name": "step",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InnerSuffixMalformed",
+  "inputs": [
+   {
+    "name": "step",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InsufficientTrustedVotingPower",
+  "inputs": [
+   {
+    "name": "tallied",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "total",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InsufficientVotingPower",
+  "inputs": [
+   {
+    "name": "tallied",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "total",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InvalidChildSize",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidClientState",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidConsensusState",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidPathLength",
+  "inputs": [
+   {
+    "name": "expected",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "actual",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InvalidPublicKey",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidRevisionNumber",
+  "inputs": [
+   {
+    "name": "expected",
+    "type": "uint64",
+    "internalType": "uint64"
+   },
+   {
+    "name": "actual",
+    "type": "uint64",
+    "internalType": "uint64"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InvalidSignature",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "recovered",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "expected",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InvalidSignatureEncoding",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "InvalidVotingPower",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "KeyMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "KeyNotLeftOfRight",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "KeyNotRightOfLeft",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "LeafPrefixMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "LeftNotRightMost",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "LengthOpMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "MissingNeighbours",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotMisbehaviour",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotNeighbours",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "PathTooLong",
+  "inputs": [
+   {
+    "name": "depth",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "PathTooShort",
+  "inputs": [
+   {
+    "name": "depth",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "RightNotLeftMost",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "RootMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "SignatureIndexOutOfOrder",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "TrustedConsensusStateExpired",
+  "inputs": [
+   {
+    "name": "expiry",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "nowTimestamp",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "TrustedIndexOutOfRange",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "TrustedSignerMismatch",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "TrustedValidatorsHashMismatch",
+  "inputs": [
+   {
+    "name": "expected",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   },
+   {
+    "name": "actual",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "UnsupportedHashOp",
+  "inputs": [
+   {
+    "name": "op",
+    "type": "uint8",
+    "internalType": "enum ICS23.HashOp"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "UnsupportedLengthOp",
+  "inputs": [
+   {
+    "name": "op",
+    "type": "uint8",
+    "internalType": "enum ICS23.LengthOp"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ValidatorIndexOutOfRange",
+  "inputs": [
+   {
+    "name": "position",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ValidatorsHashMismatch",
+  "inputs": [
+   {
+    "name": "expected",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   },
+   {
+    "name": "actual",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ValueMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "ValueOutOfRange",
+  "inputs": []
+ }
+]
