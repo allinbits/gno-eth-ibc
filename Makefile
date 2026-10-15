@@ -3,7 +3,7 @@ FOUNDRY_IMAGE ?= ghcr.io/foundry-rs/foundry:v1.7.1
 DOCKER_FORGE  = docker run --rm -v "$(CURDIR)":/work -v "$(CURDIR)/.cache/svm":/home/foundry/.svm \
 	-w /work/contracts --entrypoint forge $(FOUNDRY_IMAGE)
 
-.PHONY: build test fmt fmt-check gas fixtures submodules abis relayer-test e2e-local e2e-down
+.PHONY: build test fmt fmt-check gas fixtures submodules abis relayer-test e2e-local e2e-down sepolia-setup sepolia-to-eth sepolia-to-gno
 
 submodules:
 	git submodule update --init --recursive
@@ -46,3 +46,13 @@ e2e-local: build
 e2e-down:
 	-docker rm -f gno-eth-anvil
 	-./testnet/down.sh
+
+# Live Sepolia: needs a funded key in .env (see scripts/sepolia.sh).
+sepolia-setup: build
+	./scripts/sepolia.sh setup
+
+sepolia-to-eth:
+	./scripts/sepolia.sh to-eth
+
+sepolia-to-gno:
+	./scripts/sepolia.sh to-gno
