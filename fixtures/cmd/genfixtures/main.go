@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/gnolang/gno-eth-ibc/fixtures/gnoibc"
+	"github.com/gnolang/gno-eth-ibc/relayer/gnoibc"
 	"github.com/gnolang/gno/tm2/pkg/bft/types"
 	"github.com/gnolang/gno/tm2/pkg/crypto"
 	"github.com/gnolang/gno/tm2/pkg/crypto/secp256k1"

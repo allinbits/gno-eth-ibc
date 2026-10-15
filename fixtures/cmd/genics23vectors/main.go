@@ -17,7 +17,7 @@ import (
 
 	ics23 "github.com/cosmos/ics23/go"
 
-	"github.com/gnolang/gno-eth-ibc/fixtures/gnoibc"
+	"github.com/gnolang/gno-eth-ibc/relayer/gnoibc"
 )
 
 type refData struct {

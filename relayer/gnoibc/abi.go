@@ -190,3 +190,12 @@ func PackClientState(cs ClientState) ([]byte, error)            { return clientS
 func PackConsensusState(cs ConsensusState) ([]byte, error)      { return consensusStateArgs.Pack(cs) }
 func PackExistenceProof(p ExistenceProof) ([]byte, error)       { return existArgs.Pack(p) }
 func PackNonExistenceProof(p NonExistenceProof) ([]byte, error) { return nonExistArgs.Pack(p) }
+
+// UnpackClientState decodes GnoLightClient.getClientState().
+func UnpackClientState(bz []byte) (ClientState, error) {
+	vals, err := clientStateArgs.Unpack(bz)
+	if err != nil {
+		return ClientState{}, err
+	}
+	return *abi.ConvertType(vals[0], new(ClientState)).(*ClientState), nil
+}
