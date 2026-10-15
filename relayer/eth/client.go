@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -122,6 +123,11 @@ func (c *Client) transact(ctx context.Context, bc *bind.BoundContract, method st
 	}
 	tx, err := bc.Transact(o, method, args...)
 	if err != nil {
+		// Keep the revert data: it names the contract error.
+		var de interface{ ErrorData() interface{} }
+		if errors.As(err, &de) && de.ErrorData() != nil {
+			return nil, fmt.Errorf("%s: %w (revert data %v)", method, err, de.ErrorData())
+		}
 		return nil, fmt.Errorf("%s: %w", method, err)
 	}
 	rcpt, err := bind.WaitMined(ctx, c.EC, tx)
@@ -135,9 +141,16 @@ func (c *Client) transact(ctx context.Context, bc *bind.BoundContract, method st
 }
 
 func call[T any](ctx context.Context, bc *bind.BoundContract, method string, args ...any) (T, error) {
+	return callAt[T](ctx, nil, bc, method, args...)
+}
+
+// callAt calls at block (nil = latest). Reads that must see a transaction
+// pass its receipt's block: behind a load-balanced RPC, "latest" can be
+// served by a node that has not imported it yet.
+func callAt[T any](ctx context.Context, block *big.Int, bc *bind.BoundContract, method string, args ...any) (T, error) {
 	var zero T
 	var out []any
-	if err := bc.Call(&bind.CallOpts{Context: ctx}, &out, method, args...); err != nil {
+	if err := bc.Call(&bind.CallOpts{Context: ctx, BlockNumber: block}, &out, method, args...); err != nil {
 		return zero, fmt.Errorf("%s: %w", method, err)
 	}
 	if len(out) != 1 {

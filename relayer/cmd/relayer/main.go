@@ -258,8 +258,10 @@ func cmdRelay(ctx context.Context, args []string) error {
 				s := map[string]any{
 					"sourceClient": rel.Packet.SourceClient, "destClient": rel.Packet.DestinationClient,
 					"sequence": rel.Packet.Sequence, "proofHeight": rel.ProofHeight.RevisionHeight,
-					"recvTx": rel.Recv.TxHash.Hex(), "recvGas": rel.Recv.GasUsed,
 					"acks": hexAll(rel.Acks),
+				}
+				if rel.Recv != nil { // nil when an earlier run delivered it
+					s["recvTx"], s["recvGas"] = rel.Recv.TxHash.Hex(), rel.Recv.GasUsed
 				}
 				if rel.Update != nil {
 					s["updateTx"], s["updateGas"] = rel.Update.TxHash.Hex(), rel.Update.GasUsed
@@ -415,6 +417,14 @@ func cmdRelayEth(ctx context.Context, args []string) error {
 	r, err := newEthToGno(ctx, g, e, *beaconURL, *proofRPC, *ethRPC, *gnoClient)
 	if err != nil {
 		return err
+	}
+	// gno's acknowledgements go back to the EVM chain when a key is set.
+	if os.Getenv("ETH_PRIVATE_KEY") != "" {
+		signer, err := eth.Dial(ctx, *ethRPC, os.Getenv("ETH_PRIVATE_KEY"), dep)
+		if err != nil {
+			return err
+		}
+		r.AckToEth = &relay.GnoToEth{Gno: g, Eth: signer, GnoClientID: *gnoClient}
 	}
 	next := *from
 	for {

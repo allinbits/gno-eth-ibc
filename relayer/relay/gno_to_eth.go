@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/core/types"
 
@@ -170,28 +171,46 @@ func (r *GnoToEth) RelayPacket(ctx context.Context, p ibc.Packet, q int64) (Rela
 	if err != nil {
 		return rel, err
 	}
-	if rel.Recv, err = r.Eth.RecvPacket(ctx, p, proof, rel.ProofHeight); err != nil {
-		return rel, err
-	}
-	acks, err := r.Eth.WrittenAcks(rel.Recv)
+	// A packet an earlier run delivered is not received again: its
+	// acknowledgement is read back from the router's logs and relayed.
+	receipt, err := r.Eth.Commitment(ctx, ibc.Path(p.DestinationClient, ibc.KindPacketReceipt, p.Sequence))
 	if err != nil {
 		return rel, err
 	}
-	rel.Acks = acks[p.Sequence]
-	if rel.Acks == nil {
-		return rel, fmt.Errorf("recvPacket wrote no acknowledgement (already received?)")
+	var ackBlock *big.Int
+	if receipt != ([32]byte{}) {
+		acks, blk, err := r.Eth.WrittenAck(ctx, p.DestinationClient, p.Sequence, 0)
+		if err != nil {
+			return rel, err
+		}
+		rel.Acks, ackBlock = acks, new(big.Int).SetUint64(blk)
+		r.log().Info("packet already received on Ethereum", "client", p.DestinationClient, "sequence", p.Sequence, "block", blk)
+	} else {
+		if rel.Recv, err = r.Eth.RecvPacket(ctx, p, proof, rel.ProofHeight); err != nil {
+			return rel, err
+		}
+		acks, err := r.Eth.WrittenAcks(rel.Recv)
+		if err != nil {
+			return rel, err
+		}
+		rel.Acks, ackBlock = acks[p.Sequence], rel.Recv.BlockNumber
+		if rel.Acks == nil {
+			return rel, fmt.Errorf("recvPacket wrote no acknowledgement")
+		}
 	}
-	stored, err := r.Eth.Commitment(ctx, ibc.Path(p.DestinationClient, ibc.KindAcknowledgement, p.Sequence))
+	stored, err := r.Eth.CommitmentAt(ctx, ibc.Path(p.DestinationClient, ibc.KindAcknowledgement, p.Sequence), ackBlock)
 	if err != nil {
 		return rel, err
 	}
 	if stored != ibc.AckCommitment(rel.Acks) {
 		return rel, fmt.Errorf("ack commitment on Ethereum is %X, want %X", stored, ibc.AckCommitment(rel.Acks))
 	}
-	r.log().Info("received packet on Ethereum", "client", p.DestinationClient, "sequence", p.Sequence,
-		"gas", rel.Recv.GasUsed, "acks", len(rel.Acks))
+	if rel.Recv != nil {
+		r.log().Info("received packet on Ethereum", "client", p.DestinationClient, "sequence", p.Sequence,
+			"gas", rel.Recv.GasUsed, "acks", len(rel.Acks))
+	}
 	if r.Ack != nil {
-		blk := rel.Recv.BlockNumber.Uint64()
+		blk := ackBlock.Uint64()
 		if err := r.Ack.RelayAck(ctx, WrittenAck{Packet: p, Acks: rel.Acks, EVMBlock: blk}); err != nil {
 			return rel, fmt.Errorf("ack back to gno: %w", err)
 		}

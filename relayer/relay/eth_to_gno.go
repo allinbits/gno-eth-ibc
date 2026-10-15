@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,8 @@ import (
 	"github.com/gnolang/gno-eth-ibc/relayer/ethgno"
 	"github.com/gnolang/gno-eth-ibc/relayer/gno"
 	"github.com/gnolang/gno-eth-ibc/relayer/ibc"
+	"github.com/gnolang/gno/gnovm/stdlibs/chain"
+	ctypes "github.com/gnolang/gno/tm2/pkg/bft/rpc/core/types"
 )
 
 // EthRelayRealm takes wire-encoded Ethereum client messages and packets as
@@ -37,6 +40,9 @@ type EthToGno struct {
 	GnoClientID string
 	Tx          gno.TxConfig
 	Log         *slog.Logger
+	// AckToEth, when set, delivers to Ethereum the acknowledgements gno
+	// writes for the packets this relayer delivers.
+	AckToEth *GnoToEth
 
 	params ethgno.ChainParams
 	// execBlock maps the slots of consensus states this relayer created to
@@ -304,6 +310,16 @@ func (r *EthToGno) RelayRange(ctx context.Context, from, to uint64) ([]EthRelaye
 		r.Log.Info("received packet on gno", "client", r.GnoClientID, "sequence", s.Packet.Sequence,
 			"proofSlot", slot, "gas", rel.RecvGas, "result", rel.Result)
 		out = append(out, rel)
+		if r.AckToEth == nil {
+			continue
+		}
+		ack, err := writtenGnoAck(res, s.Packet)
+		if err != nil {
+			return out, err
+		}
+		if err := r.AckToEth.RelayGnoAck(ctx, s.Packet, ack, res.Height); err != nil {
+			return out, fmt.Errorf("ack %d to Ethereum: %w", s.Packet.Sequence, err)
+		}
 	}
 	return out, nil
 }
@@ -328,4 +344,32 @@ func (r *EthToGno) RelayAck(ctx context.Context, w WrittenAck) error {
 	r.Log.Info("acknowledged packet on gno", "client", w.Packet.SourceClient, "sequence", w.Packet.Sequence,
 		"proofSlot", slot, "gas", res.DeliverTx.GasUsed)
 	return nil
+}
+
+// writtenGnoAck returns the app acknowledgement the core wrote for p in the
+// RecvPacket transaction res (its write_acknowledgement event).
+func writtenGnoAck(res *ctypes.ResultBroadcastTxCommit, p ibc.Packet) ([]byte, error) {
+	for _, ev := range res.DeliverTx.Events {
+		ge, ok := ev.(chain.Event)
+		if !ok || ge.PkgPath != gno.CoreRealm || ge.Type != gno.EventWriteAck {
+			continue
+		}
+		e := gno.TxEvent{Event: ge}
+		if e.Attr("packet_sequence") != strconv.FormatUint(p.Sequence, 10) || e.Attr("packet_dest_client") != p.DestinationClient {
+			continue
+		}
+		bz, err := hex.DecodeString(e.Attr("encoded_acknowledgement_hex"))
+		if err != nil {
+			return nil, err
+		}
+		acks, err := ibc.DecodeAcknowledgement(bz)
+		if err != nil {
+			return nil, err
+		}
+		if len(acks) != 1 {
+			return nil, fmt.Errorf("packet %d: %d app acknowledgements, want 1", p.Sequence, len(acks))
+		}
+		return acks[0], nil
+	}
+	return nil, fmt.Errorf("packet %d: no write_acknowledgement event (async ack?)", p.Sequence)
 }

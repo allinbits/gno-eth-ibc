@@ -129,6 +129,19 @@ func decodePayload(bz []byte) (Payload, error) {
 	return pl, err
 }
 
+// DecodeAcknowledgement decodes the protobuf Acknowledgement gno emits
+// (repeated bytes app_acknowledgements = 1) into its app acknowledgements.
+func DecodeAcknowledgement(bz []byte) ([][]byte, error) {
+	var acks [][]byte
+	err := walk(bz, func(num protowire.Number, _ uint64, b []byte) error {
+		if num == 1 {
+			acks = append(acks, append([]byte{}, b...))
+		}
+		return nil
+	})
+	return acks, err
+}
+
 func walk(bz []byte, f func(num protowire.Number, v uint64, b []byte) error) error {
 	for len(bz) > 0 {
 		num, typ, n := protowire.ConsumeTag(bz)

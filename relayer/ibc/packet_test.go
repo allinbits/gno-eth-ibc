@@ -2,6 +2,7 @@ package ibc
 
 import (
 	"encoding/hex"
+	"google.golang.org/protobuf/encoding/protowire"
 	"testing"
 )
 
@@ -30,5 +31,16 @@ func TestPath(t *testing.T) {
 	got := hex.EncodeToString(Path("eth-0", KindPacketCommitment, 58))
 	if got != hex.EncodeToString([]byte("eth-0"))+"01"+"000000000000003a" {
 		t.Fatal(got)
+	}
+}
+
+func TestDecodeAcknowledgement(t *testing.T) {
+	ack := []byte(`{"result":"AQ=="}`)
+	var bz []byte
+	bz = protowire.AppendTag(bz, 1, protowire.BytesType)
+	bz = protowire.AppendBytes(bz, ack)
+	acks, err := DecodeAcknowledgement(bz)
+	if err != nil || len(acks) != 1 || string(acks[0]) != string(ack) {
+		t.Fatalf("got %q, %v", acks, err)
 	}
 }

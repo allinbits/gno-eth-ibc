@@ -3,6 +3,7 @@ package eth
 import (
 	"context"
 	"fmt"
+	"github.com/ethereum/go-ethereum"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -96,7 +97,41 @@ func (c *Client) RecvPacket(ctx context.Context, p ibc.Packet, proof []byte, pro
 
 // Commitment reads ICS26Router's commitment store at keccak256(path).
 func (c *Client) Commitment(ctx context.Context, path []byte) ([32]byte, error) {
-	return call[[32]byte](ctx, c.Router, "getCommitment", crypto.Keccak256Hash(path))
+	return c.CommitmentAt(ctx, path, nil)
+}
+
+// CommitmentAt reads the commitment at path as of block (nil = latest).
+func (c *Client) CommitmentAt(ctx context.Context, path []byte, block *big.Int) ([32]byte, error) {
+	return callAt[[32]byte](ctx, block, c.Router, "getCommitment", crypto.Keccak256Hash(path))
+}
+
+// WrittenAck finds the acknowledgement the router wrote for a packet it
+// received on clientID, and the block it was written in.
+func (c *Client) WrittenAck(ctx context.Context, clientID string, sequence uint64, fromBlock uint64) ([][]byte, uint64, error) {
+	ev := RouterABI.Events["WriteAcknowledgement"]
+	seq := common.BigToHash(new(big.Int).SetUint64(sequence))
+	logs, err := c.EC.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(fromBlock),
+		Addresses: []common.Address{c.Dep.ICS26Router},
+		Topics:    [][]common.Hash{{ev.ID}, {crypto.Keccak256Hash([]byte(clientID))}, {seq}},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(logs) == 0 {
+		return nil, 0, fmt.Errorf("no acknowledgement written for %s/%d", clientID, sequence)
+	}
+	l := logs[len(logs)-1]
+	vals, err := ev.Inputs.NonIndexed().Unpack(l.Data)
+	if err != nil {
+		return nil, 0, fmt.Errorf("WriteAcknowledgement: %w", err)
+	}
+	for i, in := range ev.Inputs.NonIndexed() {
+		if in.Name == "acknowledgements" {
+			return vals[i].([][]byte), l.BlockNumber, nil
+		}
+	}
+	return nil, 0, fmt.Errorf("WriteAcknowledgement has no acknowledgements")
 }
 
 // WrittenAcks extracts the acknowledgements of WriteAcknowledgement events in
@@ -136,4 +171,22 @@ func (c *Client) IBCERC20(ctx context.Context, denom string) (common.Address, er
 // BalanceOf reads an ERC20 balance.
 func (c *Client) BalanceOf(ctx context.Context, token, owner common.Address) (*big.Int, error) {
 	return call[*big.Int](ctx, bindERC20(c, token), "balanceOf", owner)
+}
+
+type abiMsgAckPacket struct {
+	Packet          abiPacket
+	Acknowledgement []byte
+	ProofAcked      []byte
+	ProofHeight     abiHeight
+}
+
+// AckPacket delivers the acknowledgement gno wrote for a packet sent from the
+// EVM chain.
+func (c *Client) AckPacket(ctx context.Context, p ibc.Packet, ack, proof []byte, proofHeight ibc.Height) (*types.Receipt, error) {
+	return c.transact(ctx, c.Router, "ackPacket", abiMsgAckPacket{
+		Packet:          toABIPacket(p),
+		Acknowledgement: ack,
+		ProofAcked:      proof,
+		ProofHeight:     abiHeight{proofHeight.RevisionNumber, proofHeight.RevisionHeight},
+	})
 }
