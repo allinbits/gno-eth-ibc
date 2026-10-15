@@ -1,3 +1,4 @@
 .cache/
 contracts/out/
 contracts/cache/
+testnet/.data/
