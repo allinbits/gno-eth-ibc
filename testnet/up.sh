@@ -8,7 +8,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GNO="${GNO:-$HERE/../../gno}"
 GNO_REALMS="${GNO_REALMS:-$HERE/../../gno-realms}"
-DATA="$HERE/.data"
+DATA="${DATA:-$HERE/.data}"
 BIN="$DATA/bin"
 CHAIN_ID="${CHAIN_ID:-gno-eth-dev}"
 NODES=3
@@ -28,8 +28,11 @@ build() {
 [[ -x "$BIN/gnokey" ]] || build gnokey gno.land/cmd/gnokey
 [[ -x "$BIN/gnogenesis" ]] || build gnogenesis contribs/gnogenesis
 
-rpc_port() { echo $((26657 + 10 * $1)); }
-p2p_port() { echo $((26656 + 10 * $1)); }
+# PORT_OFFSET shifts every port, to run a second testnet next to the first
+# (with its own DATA directory).
+PORT_OFFSET="${PORT_OFFSET:-0}"
+rpc_port() { echo $((26657 + PORT_OFFSET + 10 * $1)); }
+p2p_port() { echo $((26656 + PORT_OFFSET + 10 * $1)); }
 
 if [[ ! -f "$DATA/genesis.json" ]]; then
 	echo "generating genesis"

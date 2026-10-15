@@ -4,3 +4,5 @@ contracts/cache/
 testnet/.data/
 contracts/broadcast/
 contracts/deployments/*.json
+testnet/.data-*/
+.env
