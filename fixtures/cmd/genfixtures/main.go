@@ -180,7 +180,9 @@ func check(err error) {
 
 func main() {
 	out := flag.String("out", "../contracts/test/fixtures/gno.json", "output file")
+	gasOut := flag.String("gas-out", "../contracts/test/fixtures/gas.json", "gas benchmark fixtures output file")
 	flag.Parse()
+	writeGasFixtures(*gasOut)
 
 	kr := keyring{}
 	a0, a1, a2 := newKey(kr, "A0"), newKey(kr, "A1"), newKey(kr, "A2")

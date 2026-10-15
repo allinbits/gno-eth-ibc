@@ -223,6 +223,48 @@ Execution gas from `forge test -vv` (`vm.lastCallGas`), first update of the clie
 | `verifyNonMembership`, key between two neighbours | ~180k |
 | `verifyNonMembership`, key before / after every key (one neighbour) | ~77k–95k |
 
+### Scaling with the validator set
+
+`test/GasScaling.t.sol` (`make test FORGE_ARGS="--match-contract GasScaling -vv"`) runs `updateClient` on
+fixtures of equal-power secp256k1 sets built with tm2 (`fixtures/cmd/genfixtures`, `test/fixtures/gas.json`),
+each on a fresh client. "tx" is 21,000 + calldata (16 gas per non-zero byte, 4 per zero byte of the
+`updateClient(bytes)` calldata) + execution; EIP-7623's calldata floor does not bind here, execution
+dominates.
+
+| N | signers | case | exec gas | calldata bytes | est. tx gas |
+|---:|---:|---|---:|---:|---:|
+| 3 | 3 | adjacent, all sign | 156,509 | 2,020 | 194,181 |
+| 3 | 3 | adjacent, fewest > 2/3 | 156,509 | 2,020 | 194,181 |
+| 3 | 3 | non-adjacent, trusted set checked | 184,941 | 2,596 | 227,209 |
+| 3 | 3 | non-adjacent, same set (no trusted set sent) | 156,519 | 2,020 | 194,143 |
+| 7 | 7 | adjacent, all sign | 238,139 | 3,684 | 289,511 |
+| 7 | 5 | adjacent, fewest > 2/3 | 214,463 | 3,236 | 262,171 |
+| 7 | 7 | non-adjacent, trusted set checked | 303,818 | 5,028 | 366,038 |
+| 7 | 7 | non-adjacent, same set | 238,233 | 3,684 | 289,581 |
+| 20 | 20 | adjacent, all sign | 506,115 | 9,092 | 601,919 |
+| 20 | 14 | adjacent, fewest > 2/3 | 433,904 | 7,748 | 518,740 |
+| 20 | 20 | non-adjacent, trusted set checked | 696,295 | 12,932 | 823,167 |
+| 20 | 20 | non-adjacent, same set | 506,181 | 9,092 | 601,973 |
+| 50 | 50 | adjacent, all sign | 1,136,279 | 21,572 | 1,334,695 |
+| 50 | 34 | adjacent, fewest > 2/3 | 940,857 | 17,988 | 1,110,009 |
+| 50 | 50 | non-adjacent, trusted set checked | 1,635,097 | 31,172 | 1,911,333 |
+| 50 | 50 | non-adjacent, same set | 1,136,289 | 21,572 | 1,334,741 |
+| 100 | 100 | adjacent, all sign | 2,226,304 | 42,372 | 2,595,664 |
+| 100 | 67 | adjacent, fewest > 2/3 | 1,811,422 | 34,980 | 2,120,470 |
+| 100 | 100 | non-adjacent, trusted set checked | 3,305,667 | 61,572 | 3,830,583 |
+| 100 | 100 | non-adjacent, same set | 2,226,678 | 42,372 | 2,596,086 |
+
+Least-squares fit over the adjacent rows (N validators, S signatures; within 5.4% of every row, slightly
+super-linear at N = 100 from memory expansion):
+
+* execution ≈ 84k + 8.9k·N + 12.5k·S
+* transaction ≈ 111k + 10.4k·N + 14.3k·S
+* calldata = 772 + 192·N + 224·S bytes (exact: a validator is 6 ABI words, a signature 7)
+* a supplied trusted set adds ≈ 10.8k execution / 12.4k transaction gas per trusted validator
+
+A validator costs its key check (on-curve, keccak for the address, sha256 of its amino leaf, its share of
+the Merkle root); a signature costs its sign bytes, a sha256, `ecrecover` (3,000) and bookkeeping.
+
 ## Limitations
 
 * Forward-only updates: no backfilling heights below `latestHeight`, so no time-monotonicity check
