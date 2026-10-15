@@ -153,6 +153,25 @@ A relayer must prove against the right header: tm2's header `H` carries the AppH
 committed at `H-1`, so a query at store version `v` verifies against the consensus state of height
 `v+1`.
 
+## Deployment
+
+`script/DeployGnoIBC.s.sol` deploys, in eureka v3.0.2's `E2ETestDeploy` order: an `AccessManager`,
+`ICS26Router` and `ICS20Transfer` behind ERC1967 proxies (`ICS20Transfer.initialize` creates the
+Escrow and IBCERC20 beacons), the eureka role map (relaying public unless `RELAYER_ADDRESS` is set),
+ICS20 on port `transfer`, then `GnoLightClient` from a trusted gno header and
+`ICS26Router.addClient` with counterparty `{GNO_COUNTERPARTY_CLIENT_ID, ["main",
+"/pv/vm:gno.land/r/aib/ibc/core:"]}`. The extra dependencies (OpenZeppelin contracts and
+contracts-upgradeable v5.6.1, permit2 at eureka's pinned commit) are submodules under `lib/`.
+
+```
+relayer trust -gno-rpc http://127.0.0.1:26657 -out contracts/deployments/trust.json
+DEPLOYER_PRIVATE_KEY=0x... GNO_COUNTERPARTY_CLIENT_ID=ethereum-1 \
+  forge script script/DeployGnoIBC.s.sol --rpc-url $ETH_RPC_URL --broadcast
+```
+
+Addresses are written to `deployments/<chainid>.json` (or `DEPLOYMENTS_FILE`). `make e2e-local` runs
+the whole local flow; see `../scripts/e2e-local.sh`.
+
 ## tm2 formats, as checked against the Go source
 
 Every encoding below is also asserted byte-for-byte in `test/Tm2Encoding.t.sol` against output of the
