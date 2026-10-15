@@ -181,6 +181,7 @@ func check(err error) {
 func main() {
 	out := flag.String("out", "../contracts/test/fixtures/gno.json", "output file")
 	gasOut := flag.String("gas-out", "../contracts/test/fixtures/gas.json", "gas benchmark fixtures output file")
+	tsOut := flag.String("ts-out", "", "if set, also write vectors for TypeScript ports of gnoibc to this file")
 	flag.Parse()
 	writeGasFixtures(*gasOut)
 
@@ -356,6 +357,39 @@ func main() {
 		}
 		np := must(gnoibc.EncodeNonMembershipProof(ops))
 		fx.Proofs.NonMembership = append(fx.Proofs.NonMembership, proofCase{Key: full, Value: hexBytes{}, Proof: must(gnoibc.PackNonMembershipProof(np))})
+	}
+
+	if *tsOut != "" {
+		v := tsVectors{Source: "github.com/gnolang/gno-eth-ibc fixtures/cmd/genfixtures -ts-out"}
+		o := func(th int64, tv *types.ValidatorSet, omitV, omitT, all bool) gnoibc.HeaderOptions {
+			return gnoibc.HeaderOptions{TrustedHeight: th, TrustedVals: tv, OmitValidators: omitV, OmitTrusted: omitT, AllSignatures: all}
+		}
+		v.Headers = []tsHeaderCase{
+			newTSHeaderCase("adjacent 3 validators, all signatures, keys", sh11, setA, o(10, setA, false, false, true)),
+			newTSHeaderCase("adjacent 3 validators, minimal signers, keys", sh11, setA, o(10, setA, false, false, false)),
+			newTSHeaderCase("adjacent, round 1, set change announced, cached set", sh12, setA, o(11, setA, true, false, false)),
+			newTSHeaderCase("adjacent 4 validators, one absent precommit", sh13, setB, o(12, setB, false, false, false)),
+			newTSHeaderCase("non-adjacent across a set change, both sets sent", sh20, setB, o(11, setA, false, false, false)),
+			newTSHeaderCase("non-adjacent across a set change, trusted set cached", sh20, setB, o(11, setA, false, true, false)),
+			newTSHeaderCase("non-adjacent across a set change, all cached, all signatures", sh20, setB, o(11, setA, true, true, true)),
+			newTSHeaderCase("non-adjacent, same set", sh20, setB, o(13, setB, true, false, false)),
+			newTSHeaderCase("trust level unreachable, all signatures", sh21, setC, o(11, setA, false, false, true)),
+		}
+		for _, pc := range []struct {
+			name string
+			key  []byte
+		}{
+			{"packet commitment seq 1", append([]byte(paramPrefix), packetKey(clientID, 1, 1)...)},
+			{"packet commitment seq 58 (':' in the key)", append([]byte(paramPrefix), packetKey(clientID, 1, 58)...)},
+			{"acknowledgement seq 1", append([]byte(paramPrefix), packetKey(clientID, 3, 1)...)},
+			{"absent commitment between two keys", append([]byte(paramPrefix), packetKey(clientID, 1, 3)...)},
+			{"absent receipt", append([]byte(paramPrefix), packetKey(clientID, 2, 2)...)},
+			{"absent, after every key", []byte("~")},
+			{"absent, before every key", []byte("!")},
+		} {
+			v.Proofs = append(v.Proofs, newTSProofCase(st, pc.name, pc.key))
+		}
+		writeTSVectors(*tsOut, v)
 	}
 
 	bz := must(json.MarshalIndent(fx, "", "  "))
