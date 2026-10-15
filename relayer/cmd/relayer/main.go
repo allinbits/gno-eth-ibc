@@ -7,6 +7,9 @@
 //	relayer gno-create-eth-client      create a placeholder Ethereum client on gno (local EVM chains)
 //	relayer gno-register-counterparty  register the EVM-side client as the gno client's counterparty
 //	relayer relay                      relay gno -> EVM packets sent in a height range (once, or -follow)
+//	relayer gno-create-eth-client-live create gno's Ethereum light client from a beacon bootstrap
+//	relayer relay-eth                  relay EVM -> gno packets sent in a block range (once, or -follow)
+//	relayer gno-update-eth-client      bring gno's Ethereum light client to the latest finalized block
 //	relayer erc20-balance              print an ICS20 voucher balance on the EVM chain
 package main
 
@@ -25,7 +28,9 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 
+	"github.com/gnolang/gno-eth-ibc/relayer/beacon"
 	"github.com/gnolang/gno-eth-ibc/relayer/eth"
+	"github.com/gnolang/gno-eth-ibc/relayer/ethgno"
 	"github.com/gnolang/gno-eth-ibc/relayer/gno"
 	"github.com/gnolang/gno-eth-ibc/relayer/gnoibc"
 	"github.com/gnolang/gno-eth-ibc/relayer/relay"
@@ -41,6 +46,9 @@ var commands = []command{
 	{"gno-create-eth-client", "create a placeholder Ethereum light client on gno (no beacon chain)", cmdCreateEthClient},
 	{"gno-register-counterparty", "register the EVM-side client id as counterparty of a gno client", cmdRegisterCounterparty},
 	{"relay", "relay gno -> EVM packets sent in a gno height range", cmdRelay},
+	{"gno-create-eth-client-live", "create gno's Ethereum light client from a beacon bootstrap", cmdCreateEthClientLive},
+	{"relay-eth", "relay EVM -> gno packets sent in an EVM block range", cmdRelayEth},
+	{"gno-update-eth-client", "bring gno's Ethereum light client to the latest finalized Ethereum block", cmdUpdateEthClient},
 	{"erc20-balance", "print the ICS20 voucher balance of an address", cmdBalance},
 }
 
@@ -200,6 +208,8 @@ func cmdRelay(ctx context.Context, args []string) error {
 	to := fs.Int64("to", 0, "last gno height to scan (0 = latest)")
 	follow := fs.Bool("follow", false, "keep relaying new blocks")
 	out := fs.String("out", "", "write a JSON summary of the relayed packets")
+	beaconURL := fs.String("beacon", "", "beacon node API; when set, acks written on the EVM chain are relayed back to gno")
+	proofRPC := fs.String("proof-rpc", "", "EVM RPC serving eth_getProof at finalized blocks (default: -eth-rpc)")
 	_ = fs.Parse(args)
 
 	dep, err := eth.LoadDeployment(*depFile)
@@ -209,7 +219,7 @@ func cmdRelay(ctx context.Context, args []string) error {
 	if *gnoClient == "" {
 		*gnoClient = dep.CounterpartyClientID
 	}
-	g, err := dialGno(ctx, *gnoRPC, false)
+	g, err := dialGno(ctx, *gnoRPC, *beaconURL != "")
 	if err != nil {
 		return err
 	}
@@ -217,7 +227,15 @@ func cmdRelay(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	r := &relay.GnoToEth{Gno: g, Eth: e, GnoClientID: *gnoClient, Ack: relay.SkipAcks{}}
+	var acks relay.AckRelayer = relay.SkipAcks{}
+	if *beaconURL != "" {
+		e2g, err := newEthToGno(ctx, g, e, *beaconURL, *proofRPC, *ethRPC, *gnoClient)
+		if err != nil {
+			return err
+		}
+		acks = e2g
+	}
+	r := &relay.GnoToEth{Gno: g, Eth: e, GnoClientID: *gnoClient, Ack: acks}
 
 	var summary []map[string]any
 	next := *from
@@ -298,4 +316,168 @@ func cmdBalance(ctx context.Context, args []string) error {
 		return err
 	}
 	return writeJSON("-", map[string]any{"denom": *denom, "token": token.Hex(), "owner": *owner, "balance": bal.String()})
+}
+
+func newEthToGno(ctx context.Context, g *gno.Client, e *eth.Client, beaconURL, proofRPC, ethRPC, gnoClient string) (*relay.EthToGno, error) {
+	if proofRPC == "" {
+		proofRPC = ethRPC
+	}
+	r := &relay.EthToGno{
+		Gno: g, Eth: e, Beacon: beacon.New(beaconURL), Exec: ethgno.NewExecution(proofRPC),
+		GnoClientID: gnoClient, Tx: gno.EthClientTx,
+	}
+	return r, r.Init(ctx)
+}
+
+func cmdCreateEthClientLive(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("gno-create-eth-client-live", flag.ExitOnError)
+	gnoRPC := fs.String("gno-rpc", "http://127.0.0.1:26657", "gno.land RPC")
+	ethRPC := fs.String("eth-rpc", os.Getenv("ETH_RPC_URL"), "EVM RPC (default $ETH_RPC_URL)")
+	beaconURL := fs.String("beacon", os.Getenv("BEACON_URL"), "beacon node API (default $BEACON_URL)")
+	depFile := fs.String("deployment", "", "deployment JSON written by DeployGnoIBC.s.sol")
+	_ = fs.Parse(args)
+
+	dep, err := eth.LoadDeployment(*depFile)
+	if err != nil {
+		return err
+	}
+	g, err := dialGno(ctx, *gnoRPC, true)
+	if err != nil {
+		return err
+	}
+	ec := ethgno.NewExecution(*ethRPC)
+	bc := beacon.New(*beaconURL)
+	params, err := ethgno.ReadChainParams(ctx, bc)
+	if err != nil {
+		return err
+	}
+	e, err := eth.Dial(ctx, *ethRPC, "", dep)
+	if err != nil {
+		return err
+	}
+	root, err := bc.BlockRoot(ctx, "finalized")
+	if err != nil {
+		return err
+	}
+	boot, err := bc.Bootstrap(ctx, root)
+	if err != nil {
+		return err
+	}
+	exec, err := ec.Header(ctx, boot.Header.BlockHash())
+	if err != nil {
+		return err
+	}
+	src := ethgno.CreateClientScript(
+		ethgno.ClientState(params, e.ChainID.Uint64(), dep.ICS26Router.Bytes(), ethgno.IBCStoreCommitmentSlot,
+			uint64(boot.Header.Beacon.Slot), exec.Number),
+		ethgno.ConsensusState(boot, exec.StateRoot, exec.Timestamp),
+		dep.ClientID)
+	res, err := g.Run(gno.EthClientTx, src, nil)
+	if err != nil {
+		return err
+	}
+	slog.Info("created Ethereum client on gno", "clientId", strings.TrimSpace(string(res.DeliverTx.Data)),
+		"bootstrapSlot", boot.Header.Beacon.Slot, "execBlock", exec.Number, "gas", res.DeliverTx.GasUsed)
+	return nil
+}
+
+func cmdRelayEth(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("relay-eth", flag.ExitOnError)
+	gnoRPC := fs.String("gno-rpc", "http://127.0.0.1:26657", "gno.land RPC")
+	ethRPC := fs.String("eth-rpc", os.Getenv("ETH_RPC_URL"), "EVM RPC (default $ETH_RPC_URL)")
+	proofRPC := fs.String("proof-rpc", "", "EVM RPC serving eth_getProof at finalized blocks (default: -eth-rpc)")
+	beaconURL := fs.String("beacon", os.Getenv("BEACON_URL"), "beacon node API (default $BEACON_URL)")
+	depFile := fs.String("deployment", "", "deployment JSON written by DeployGnoIBC.s.sol")
+	gnoClient := fs.String("gno-client", "", "gno-side Ethereum client id (default: the deployment's counterpartyClientId)")
+	from := fs.Uint64("from", 0, "first EVM block to scan")
+	to := fs.Uint64("to", 0, "last EVM block to scan (0 = latest)")
+	follow := fs.Bool("follow", false, "keep relaying new blocks")
+	_ = fs.Parse(args)
+
+	dep, err := eth.LoadDeployment(*depFile)
+	if err != nil {
+		return err
+	}
+	if *gnoClient == "" {
+		*gnoClient = dep.CounterpartyClientID
+	}
+	g, err := dialGno(ctx, *gnoRPC, true)
+	if err != nil {
+		return err
+	}
+	e, err := eth.Dial(ctx, *ethRPC, "", dep)
+	if err != nil {
+		return err
+	}
+	r, err := newEthToGno(ctx, g, e, *beaconURL, *proofRPC, *ethRPC, *gnoClient)
+	if err != nil {
+		return err
+	}
+	next := *from
+	for {
+		last := *to
+		if last == 0 {
+			if last, err = e.EC.BlockNumber(ctx); err != nil {
+				return err
+			}
+		}
+		if next <= last {
+			if _, err := r.RelayRange(ctx, next, last); err != nil {
+				return err
+			}
+			next = last + 1
+		}
+		if !*follow {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(12 * time.Second):
+		}
+	}
+}
+
+func cmdUpdateEthClient(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("gno-update-eth-client", flag.ExitOnError)
+	gnoRPC := fs.String("gno-rpc", "http://127.0.0.1:26657", "gno.land RPC")
+	ethRPC := fs.String("eth-rpc", os.Getenv("ETH_RPC_URL"), "EVM RPC (default $ETH_RPC_URL)")
+	beaconURL := fs.String("beacon", os.Getenv("BEACON_URL"), "beacon node API (default $BEACON_URL)")
+	depFile := fs.String("deployment", "", "deployment JSON written by DeployGnoIBC.s.sol")
+	gnoClient := fs.String("gno-client", "", "gno-side Ethereum client id (default: the deployment's counterpartyClientId)")
+	_ = fs.Parse(args)
+
+	dep, err := eth.LoadDeployment(*depFile)
+	if err != nil {
+		return err
+	}
+	if *gnoClient == "" {
+		*gnoClient = dep.CounterpartyClientID
+	}
+	g, err := dialGno(ctx, *gnoRPC, true)
+	if err != nil {
+		return err
+	}
+	e, err := eth.Dial(ctx, *ethRPC, "", dep)
+	if err != nil {
+		return err
+	}
+	r, err := newEthToGno(ctx, g, e, *beaconURL, "", *ethRPC, *gnoClient)
+	if err != nil {
+		return err
+	}
+	fin, err := r.Beacon.FinalityUpdate(ctx)
+	if err != nil {
+		return err
+	}
+	h, err := r.Exec.Header(ctx, fin.FinalizedHeader.BlockHash())
+	if err != nil {
+		return err
+	}
+	slot, block, err := r.UpdateTo(ctx, h.Number)
+	if err != nil {
+		return err
+	}
+	slog.Info("gno's Ethereum client is up to date", "client", *gnoClient, "slot", slot, "execBlock", block)
+	return nil
 }

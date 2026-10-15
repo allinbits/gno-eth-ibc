@@ -160,6 +160,10 @@ type TxConfig struct {
 // DefaultTx is generous enough for MsgRun scripts that verify proofs.
 var DefaultTx = TxConfig{GasFee: "10000000ugnot", GasWanted: 100_000_000}
 
+// EthClientTx is for scripts carrying Ethereum light-client data: an update
+// verifies a 512-key sync committee signature and costs 250M to 400M gas.
+var EthClientTx = TxConfig{GasFee: "100000000ugnot", GasWanted: 2_000_000_000}
+
 func (c *Client) base(cfg TxConfig) (gnoclient.BaseTxCfg, error) {
 	if c.tx == nil {
 		return gnoclient.BaseTxCfg{}, fmt.Errorf("no signer configured")
