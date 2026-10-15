@@ -132,6 +132,54 @@
  },
  {
   "type": "function",
+  "name": "getValidatorSet",
+  "inputs": [
+   {
+    "name": "valSetHash",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "addrs",
+    "type": "address[]",
+    "internalType": "address[]"
+   },
+   {
+    "name": "powers",
+    "type": "uint256[]",
+    "internalType": "uint256[]"
+   },
+   {
+    "name": "totalPower",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "isValidatorSetCached",
+  "inputs": [
+   {
+    "name": "valSetHash",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "misbehaviour",
   "inputs": [
    {
@@ -302,6 +350,31 @@
   "anonymous": false
  },
  {
+  "type": "event",
+  "name": "ValidatorSetCached",
+  "inputs": [
+   {
+    "name": "valSetHash",
+    "type": "bytes32",
+    "indexed": true,
+    "internalType": "bytes32"
+   },
+   {
+    "name": "size",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "totalPower",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
   "type": "error",
   "name": "BranchNotInChildOrder",
   "inputs": [
@@ -373,11 +446,6 @@
  {
   "type": "error",
   "name": "EmptyMerkleTree",
-  "inputs": []
- },
- {
-  "type": "error",
-  "name": "EmptyValidatorSet",
   "inputs": []
  },
  {
@@ -544,6 +612,11 @@
  {
   "type": "error",
   "name": "InvalidClientState",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidCommitEncoding",
   "inputs": []
  },
  {
@@ -799,6 +872,38 @@
     "internalType": "uint256"
    }
   ]
+ },
+ {
+  "type": "error",
+  "name": "ValidatorSetHashMismatch",
+  "inputs": [
+   {
+    "name": "claimed",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   },
+   {
+    "name": "computed",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ValidatorSetNotCached",
+  "inputs": [
+   {
+    "name": "valSetHash",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ValidatorSetTooLarge",
+  "inputs": []
  },
  {
   "type": "error",

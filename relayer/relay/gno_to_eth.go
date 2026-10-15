@@ -115,17 +115,24 @@ func (r *GnoToEth) UpdateClient(ctx context.Context, target int64) (*types.Recei
 	if err != nil {
 		return nil, err
 	}
-	// The trusted set is the next validator set of the trusted height; send
-	// it only when the validators changed in between.
-	var trustedVals = vals
+	// Leave out what the client has cached, send the fewest signatures, and
+	// when the trusted next set differs (non-adjacent across a set change)
+	// fetch it so the chosen signers also meet the trust level over it.
+	opts := gnoibc.HeaderOptions{TrustedHeight: trusted}
+	var valsHash [32]byte
+	copy(valsHash[:], sh.ValidatorsHash)
+	if opts.OmitValidators, err = r.Eth.IsValidatorSetCached(ctx, valsHash); err != nil {
+		return nil, err
+	}
 	if !bytes.Equal(vals.Hash(), trustedCons.NextValidatorsHash[:]) {
-		if trustedVals, err = r.Gno.ValidatorSet(ctx, trusted+1, trustedCons.NextValidatorsHash[:]); err != nil {
+		if opts.TrustedVals, err = r.Gno.ValidatorSet(ctx, trusted+1, trustedCons.NextValidatorsHash[:]); err != nil {
 			return nil, err
 		}
-	} else {
-		trustedVals = nil
+		if opts.OmitTrusted, err = r.Eth.IsValidatorSetCached(ctx, trustedCons.NextValidatorsHash); err != nil {
+			return nil, err
+		}
 	}
-	hdr, err := gnoibc.EncodeHeader(sh, vals, trusted, trustedVals)
+	hdr, err := gnoibc.EncodeHeader(sh, vals, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +144,8 @@ func (r *GnoToEth) UpdateClient(ctx context.Context, target int64) (*types.Recei
 	if err != nil {
 		return nil, fmt.Errorf("update %d -> %d: %w", trusted, target, err)
 	}
-	r.log().Info("updated GnoLightClient", "trusted", trusted, "height", target, "gas", rcpt.GasUsed)
+	r.log().Info("updated GnoLightClient", "trusted", trusted, "height", target, "gas", rcpt.GasUsed,
+		"signatures", len(hdr.Commit.Signatures)/gnoibc.SigSize, "keysSent", len(hdr.ValidatorSet)+len(hdr.TrustedValidators))
 	return rcpt, nil
 }
 

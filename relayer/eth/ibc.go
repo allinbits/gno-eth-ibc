@@ -73,6 +73,12 @@ func (c *Client) ConsensusState(ctx context.Context, height uint64) (gnoibc.Cons
 	return v, nil
 }
 
+// IsValidatorSetCached reports whether GnoLightClient holds the validator set
+// with this tm2 hash, so that updates may leave it out.
+func (c *Client) IsValidatorSetCached(ctx context.Context, valSetHash [32]byte) (bool, error) {
+	return call[bool](ctx, c.LightClient, "isValidatorSetCached", valSetHash)
+}
+
 // UpdateClient submits a GnoLightClient update through the router.
 func (c *Client) UpdateClient(ctx context.Context, msg []byte) (*types.Receipt, error) {
 	return c.transact(ctx, c.Router, "updateClient", c.Dep.ClientID, msg)

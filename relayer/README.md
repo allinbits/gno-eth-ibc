@@ -38,8 +38,11 @@ For the `send_packet` events of the core realm (`gno.land/r/aib/ibc/core`) on th
 1. pick the proof height: the state after block `q` (the latest block whose successor is committed),
    because header `q+1` carries the AppHash of that state;
 2. update GnoLightClient to `q+1` from its latest consensus state `T` through
-   `ICS26Router.updateClient`: header and commit of `q+1`, its validator set, and the validators of
-   `T+1` only if they differ from those of `q+1`;
+   `ICS26Router.updateClient`: header and commit of `q+1` with the fewest signatures that clear 2/3
+   (highest power first; across a validator set change, first enough of the trusted set's signers to
+   clear the trust level), its validator set unless the client has it cached
+   (`isValidatorSetCached`), and the validators of `T+1` only if they differ from those of `q+1` and
+   are not cached;
 3. query `"/pv/vm:gno.land/r/aib/ibc/core:" || client || 0x01 || seq_be` in the `main` store at
    height `q` with `prove=true`, check the value is the packet's commitment, encode the two ICS23 ops;
 4. `ICS26Router.recvPacket(packet, proof, {0, q+1})`, then read the `WriteAcknowledgement` event and
