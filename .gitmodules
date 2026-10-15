@@ -4,3 +4,12 @@
 [submodule "contracts/lib/solidity-ibc-eureka"]
 	path = contracts/lib/solidity-ibc-eureka
 	url = https://github.com/cosmos/solidity-ibc-eureka
+[submodule "contracts/lib/openzeppelin-contracts"]
+	path = contracts/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "contracts/lib/openzeppelin-contracts-upgradeable"]
+	path = contracts/lib/openzeppelin-contracts-upgradeable
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable
+[submodule "contracts/lib/permit2"]
+	path = contracts/lib/permit2
+	url = https://github.com/Uniswap/permit2
