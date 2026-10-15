@@ -10,6 +10,7 @@
 //	relayer gno-create-eth-client-live create gno's Ethereum light client from a beacon bootstrap
 //	relayer relay-eth                  relay EVM -> gno packets sent in a block range (once, or -follow)
 //	relayer gno-update-eth-client      bring gno's Ethereum light client to the latest finalized block
+//	relayer eth-send-transfer          send an ICS20 transfer from the EVM chain (approve + sendTransfer)
 //	relayer erc20-balance              print an ICS20 voucher balance on the EVM chain
 package main
 
@@ -21,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"os"
 	"os/signal"
 	"strings"
@@ -48,6 +50,7 @@ var commands = []command{
 	{"relay", "relay gno -> EVM packets sent in a gno height range", cmdRelay},
 	{"gno-create-eth-client-live", "create gno's Ethereum light client from a beacon bootstrap", cmdCreateEthClientLive},
 	{"relay-eth", "relay EVM -> gno packets sent in an EVM block range", cmdRelayEth},
+	{"eth-send-transfer", "send an ICS20 transfer of an ERC20 token or voucher from the EVM chain", cmdEthSendTransfer},
 	{"gno-update-eth-client", "bring gno's Ethereum light client to the latest finalized Ethereum block", cmdUpdateEthClient},
 	{"erc20-balance", "print the ICS20 voucher balance of an address", cmdBalance},
 }
@@ -479,5 +482,47 @@ func cmdUpdateEthClient(ctx context.Context, args []string) error {
 		return err
 	}
 	slog.Info("gno's Ethereum client is up to date", "client", *gnoClient, "slot", slot, "execBlock", block)
+	return nil
+}
+
+func cmdEthSendTransfer(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("eth-send-transfer", flag.ExitOnError)
+	ethRPC := fs.String("eth-rpc", os.Getenv("ETH_RPC_URL"), "EVM RPC (default $ETH_RPC_URL)")
+	depFile := fs.String("deployment", "", "deployment JSON written by DeployGnoIBC.s.sol")
+	token := fs.String("token", "", "ERC20 token address (an ICS20 voucher returns to its origin)")
+	denom := fs.String("denom", "", "instead of -token: the full ICS20 denom path of a voucher, e.g. transfer/client-0/ugnot")
+	amount := fs.String("amount", "", "amount in base units")
+	receiver := fs.String("receiver", "", "receiver on gno.land (g1...)")
+	timeout := fs.Duration("timeout", time.Hour, "packet timeout from now")
+	memo := fs.String("memo", "", "ICS20 memo")
+	_ = fs.Parse(args)
+
+	dep, err := eth.LoadDeployment(*depFile)
+	if err != nil {
+		return err
+	}
+	e, err := eth.Dial(ctx, *ethRPC, os.Getenv("ETH_PRIVATE_KEY"), dep)
+	if err != nil {
+		return err
+	}
+	addr := common.HexToAddress(*token)
+	if *denom != "" {
+		if addr, err = e.IBCERC20(ctx, *denom); err != nil {
+			return err
+		}
+	}
+	if addr == (common.Address{}) {
+		return errors.New("no token: pass -token or the -denom of an existing voucher")
+	}
+	amt, ok := new(big.Int).SetString(*amount, 10)
+	if !ok || amt.Sign() <= 0 {
+		return fmt.Errorf("bad amount %q", *amount)
+	}
+	rcpt, err := e.SendTransfer(ctx, addr, amt, *receiver, dep.ClientID, uint64(time.Now().Add(*timeout).Unix()), *memo)
+	if err != nil {
+		return err
+	}
+	slog.Info("sent ICS20 transfer", "token", addr, "amount", amt, "receiver", *receiver,
+		"block", rcpt.BlockNumber, "tx", rcpt.TxHash, "gas", rcpt.GasUsed)
 	return nil
 }
