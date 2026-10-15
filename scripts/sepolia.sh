@@ -91,8 +91,12 @@ to_gno() {
 	BLOCK=$(sed -n 's/.* block=\([0-9]*\).*/\1/p' <<<"$OUT" | tail -1)
 
 	step "relaying to gno once Sepolia finalizes block $BLOCK, then the acknowledgement to Sepolia"
+	GNO_FROM=$(gno_height)
 	"$RELAYER" relay-eth -gno-rpc "$GNO_RPC" -eth-rpc "$ETH_RPC_URL" -proof-rpc "$PROOF_RPC" -beacon "$BEACON_URL" \
 		-deployment "$DEP" -gno-client "$GNO_CLIENT" -from "$BLOCK" -to "$BLOCK"
+	# Acks relay-eth could not deliver (an earlier run, async acks) are picked up here.
+	"$RELAYER" relay-gno-acks -gno-rpc "$GNO_RPC" -eth-rpc "$ETH_RPC_URL" -deployment "$DEP" \
+		-gno-client "$GNO_CLIENT" -from "$GNO_FROM"
 }
 
 build

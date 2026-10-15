@@ -11,6 +11,7 @@
 //	relayer relay-eth                  relay EVM -> gno packets sent in a block range (once, or -follow)
 //	relayer gno-update-eth-client      bring gno's Ethereum light client to the latest finalized block
 //	relayer eth-send-transfer          send an ICS20 transfer from the EVM chain (approve + sendTransfer)
+//	relayer relay-gno-acks             relay gno's acks for EVM packets written in a gno height range
 //	relayer erc20-balance              print an ICS20 voucher balance on the EVM chain
 package main
 
@@ -51,6 +52,7 @@ var commands = []command{
 	{"gno-create-eth-client-live", "create gno's Ethereum light client from a beacon bootstrap", cmdCreateEthClientLive},
 	{"relay-eth", "relay EVM -> gno packets sent in an EVM block range", cmdRelayEth},
 	{"eth-send-transfer", "send an ICS20 transfer of an ERC20 token or voucher from the EVM chain", cmdEthSendTransfer},
+	{"relay-gno-acks", "relay to the EVM chain the acks gno wrote for EVM packets in a gno height range", cmdRelayGnoAcks},
 	{"gno-update-eth-client", "bring gno's Ethereum light client to the latest finalized Ethereum block", cmdUpdateEthClient},
 	{"erc20-balance", "print the ICS20 voucher balance of an address", cmdBalance},
 }
@@ -535,4 +537,40 @@ func cmdEthSendTransfer(ctx context.Context, args []string) error {
 	slog.Info("sent ICS20 transfer", "token", addr, "amount", amt, "receiver", *receiver,
 		"block", rcpt.BlockNumber, "tx", rcpt.TxHash, "gas", rcpt.GasUsed)
 	return nil
+}
+
+func cmdRelayGnoAcks(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("relay-gno-acks", flag.ExitOnError)
+	gnoRPC := fs.String("gno-rpc", "http://127.0.0.1:26657", "gno.land RPC")
+	ethRPC := fs.String("eth-rpc", os.Getenv("ETH_RPC_URL"), "EVM RPC (default $ETH_RPC_URL)")
+	depFile := fs.String("deployment", "", "deployment JSON written by DeployGnoIBC.s.sol")
+	gnoClient := fs.String("gno-client", "", "gno-side client id (default: the deployment's counterpartyClientId)")
+	from := fs.Int64("from", 1, "first gno height to scan")
+	to := fs.Int64("to", 0, "last gno height to scan (0 = latest)")
+	_ = fs.Parse(args)
+
+	dep, err := eth.LoadDeployment(*depFile)
+	if err != nil {
+		return err
+	}
+	if *gnoClient == "" {
+		*gnoClient = dep.CounterpartyClientID
+	}
+	g, err := dialGno(ctx, *gnoRPC, false)
+	if err != nil {
+		return err
+	}
+	e, err := eth.Dial(ctx, *ethRPC, os.Getenv("ETH_PRIVATE_KEY"), dep)
+	if err != nil {
+		return err
+	}
+	if *to == 0 {
+		if *to, err = g.LatestHeight(ctx); err != nil {
+			return err
+		}
+	}
+	r := &relay.GnoToEth{Gno: g, Eth: e, GnoClientID: *gnoClient}
+	n, err := r.RelayGnoAcks(ctx, *from, *to)
+	slog.Info("relayed gno acknowledgements", "count", n)
+	return err
 }
