@@ -4,6 +4,8 @@
 package gnoibc
 
 import (
+	"encoding/binary"
+
 	"github.com/ethereum/go-ethereum/accounts/abi"
 )
 
@@ -20,6 +22,7 @@ type HeaderFields struct {
 	Height             uint64
 	TimeSeconds        uint64
 	TimeNanos          uint32
+	ValidatorsHash     [32]byte
 	NextValidatorsHash [32]byte
 	AppHash            [32]byte
 	// Merkle siblings of the six leaves the contract re-encodes itself:
@@ -31,9 +34,12 @@ type HeaderFields struct {
 	ResultsAndProposerHash [32]byte
 }
 
+// CommitSig is one precommit. On the wire it is packed into SigSize bytes
+// (see Pack): validatorIndex u16 | trustedIndex u16 | timeSeconds u64 |
+// timeNanos u32 | r | s | v, big-endian.
 type CommitSig struct {
-	ValidatorIndex uint32
-	TrustedIndex   uint32
+	ValidatorIndex uint16
+	TrustedIndex   uint16
 	TimeSeconds    uint64
 	TimeNanos      uint32
 	R              [32]byte
@@ -41,11 +47,26 @@ type CommitSig struct {
 	V              uint8
 }
 
+// SigSize is the packed size of a CommitSig.
+const SigSize = 81
+
+// Pack appends the packed signature to b.
+func (c CommitSig) Pack(b []byte) []byte {
+	b = binary.BigEndian.AppendUint16(b, c.ValidatorIndex)
+	b = binary.BigEndian.AppendUint16(b, c.TrustedIndex)
+	b = binary.BigEndian.AppendUint64(b, c.TimeSeconds)
+	b = binary.BigEndian.AppendUint32(b, c.TimeNanos)
+	b = append(b, c.R[:]...)
+	b = append(b, c.S[:]...)
+	return append(b, c.V)
+}
+
+// Commit is the ABI commit: Signatures holds packed CommitSigs.
 type Commit struct {
 	Round        uint32
 	PartSetTotal uint32
 	PartSetHash  [32]byte
-	Signatures   []CommitSig
+	Signatures   []byte
 }
 
 type Header struct {
@@ -121,6 +142,7 @@ var (
 			m("height", "uint64"),
 			m("timeSeconds", "uint64"),
 			m("timeNanos", "uint32"),
+			m("validatorsHash", "bytes32"),
 			m("nextValidatorsHash", "bytes32"),
 			m("appHash", "bytes32"),
 			m("versionLeafHash", "bytes32"),
@@ -133,15 +155,7 @@ var (
 			m("round", "uint32"),
 			m("partSetTotal", "uint32"),
 			m("partSetHash", "bytes32"),
-			m("signatures", "tuple[]",
-				m("validatorIndex", "uint32"),
-				m("trustedIndex", "uint32"),
-				m("timeSeconds", "uint64"),
-				m("timeNanos", "uint32"),
-				m("r", "bytes32"),
-				m("s", "bytes32"),
-				m("v", "uint8"),
-			),
+			m("signatures", "bytes"),
 		),
 		m("validatorSet", "tuple[]", validatorComps...),
 		m("trustedHeight", "uint64"),

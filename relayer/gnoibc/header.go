@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"sort"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/gnolang/gno/tm2/pkg/amino"
@@ -12,8 +13,9 @@ import (
 	"github.com/gnolang/gno/tm2/pkg/crypto/secp256k1"
 )
 
-// NoTrustedIndex marks a signature whose signer is not in the trusted set.
-const NoTrustedIndex = math.MaxUint32
+// NoTrustedIndex marks a signature whose signer is not in the trusted set (or
+// whose update does not check the trust level).
+const NoTrustedIndex = math.MaxUint16
 
 // HeaderLeaves returns the 16 amino-encoded leaves that types.Header.Hash
 // feeds to merkle.SimpleHashFromByteSlices (same order, same nil rule as
@@ -86,6 +88,7 @@ func EncodeHeaderFields(h *types.Header) (HeaderFields, error) {
 	if len(h.ValidatorsHash) != 32 {
 		return hf, fmt.Errorf("validators hash must be 32 bytes")
 	}
+	copy(hf.ValidatorsHash[:], h.ValidatorsHash)
 	hf.Height = uint64(h.Height)
 	hf.TimeSeconds = uint64(h.Time.Unix())
 	hf.TimeNanos = uint32(h.Time.Nanosecond())
@@ -160,14 +163,118 @@ func RecoveryID(digest []byte, sig []byte, pk secp256k1.PubKeySecp256k1) (uint8,
 	return 0, fmt.Errorf("signature does not recover to the validator key")
 }
 
-// EncodeCommit converts the precommits for the commit's BlockID. Absent
-// precommits and precommits for another BlockID (nil votes) are dropped: the
-// contract only counts power for the committed block, so omitting them only
-// lowers the tally.
-func EncodeCommit(chainID string, commit *types.Commit, vals, trustedVals *types.ValidatorSet) (Commit, error) {
+// HeaderOptions shape an update message.
+type HeaderOptions struct {
+	// TrustedHeight is the client's consensus state the update verifies from.
+	TrustedHeight int64
+	// TrustedVals is the next validator set of the trusted height. When the
+	// update is non-adjacent and the header's set differs from it, the client
+	// checks the trust level over it, and the signers are chosen to meet it.
+	// Nil means the header's set is the trusted set.
+	TrustedVals *types.ValidatorSet
+	// OmitValidators leaves out the header's validator set: the client has
+	// it cached (GnoLightClient.isValidatorSetCached).
+	OmitValidators bool
+	// OmitTrusted leaves out the trusted set: the client has it cached.
+	OmitTrusted bool
+	// AllSignatures sends every precommit for the block instead of the
+	// fewest that meet the thresholds.
+	AllSignatures bool
+	// TrustLevel defaults to 1/3, the client's default.
+	TrustNumerator, TrustDenominator uint64
+}
+
+// NeedsTrustCheck reports whether the client will check the trust level for
+// a header of height h with validator set vals.
+func (o HeaderOptions) NeedsTrustCheck(h int64, vals *types.ValidatorSet) bool {
+	return o.TrustedVals != nil && h != o.TrustedHeight+1 && !bytes.Equal(vals.Hash(), o.TrustedVals.Hash())
+}
+
+// SelectSigners returns the indices (ascending) of the precommits to send:
+// all precommits for the commit's BlockID, or, unless all is set, a minimal
+// prefix of them: first by trusted power until more than num/den of the
+// trusted set's power signed (when trusted is non-nil), then by power until
+// more than 2/3 of vals' power signed. Thresholds are tm2's: strictly more
+// than total*2/3 and total*num/den, with integer division.
+func SelectSigners(commit *types.Commit, vals, trusted *types.ValidatorSet, num, den uint64, all bool) ([]int, error) {
+	var cands []int
+	for idx, pc := range commit.Precommits {
+		if pc != nil && pc.BlockID.Equals(commit.BlockID) && idx < vals.Size() {
+			cands = append(cands, idx)
+		}
+	}
+	if all {
+		return cands, nil
+	}
+	chosen := map[int]bool{}
+	var tallied, trustTallied int64
+	add := func(idx int) {
+		chosen[idx] = true
+		v := vals.Validators[idx]
+		tallied += v.VotingPower
+		if trusted != nil {
+			if _, tv := trusted.GetByAddress(v.Address); tv != nil {
+				trustTallied += tv.VotingPower
+			}
+		}
+	}
+	trustedPower := func(idx int) int64 {
+		if trusted == nil {
+			return 0
+		}
+		if _, tv := trusted.GetByAddress(vals.Validators[idx].Address); tv != nil {
+			return tv.VotingPower
+		}
+		return 0
+	}
+	byDesc := func(key func(int) int64) []int {
+		out := append([]int(nil), cands...)
+		sort.SliceStable(out, func(a, b int) bool { return key(out[a]) > key(out[b]) })
+		return out
+	}
+	if trusted != nil {
+		need := trusted.TotalVotingPower() * int64(num) / int64(den)
+		for _, idx := range byDesc(trustedPower) {
+			if trustTallied > need {
+				break
+			}
+			if trustedPower(idx) > 0 {
+				add(idx)
+			}
+		}
+		if trustTallied <= need {
+			return nil, fmt.Errorf("trusted signers hold %d, need more than %d", trustTallied, need)
+		}
+	}
+	need := vals.TotalVotingPower() * 2 / 3
+	for _, idx := range byDesc(func(i int) int64 { return vals.Validators[i].VotingPower }) {
+		if tallied > need {
+			break
+		}
+		if !chosen[idx] {
+			add(idx)
+		}
+	}
+	if tallied <= need {
+		return nil, fmt.Errorf("signers hold %d, need more than %d", tallied, need)
+	}
+	out := make([]int, 0, len(chosen))
+	for idx := range chosen {
+		out = append(out, idx)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+// EncodeCommit packs the chosen precommits (indices into vals and the
+// commit). trusted, when non-nil, fills in each signer's trusted index.
+func EncodeCommit(chainID string, commit *types.Commit, vals, trusted *types.ValidatorSet, signers []int) (Commit, error) {
 	var c Commit
 	if commit.Round() < 0 || commit.BlockID.PartsHeader.Total < 0 {
 		return c, fmt.Errorf("negative round or part set total")
+	}
+	if vals.Size() >= NoTrustedIndex {
+		return c, fmt.Errorf("validator set too large")
 	}
 	c.Round = uint32(commit.Round())
 	c.PartSetTotal = uint32(commit.BlockID.PartsHeader.Total)
@@ -175,13 +282,12 @@ func EncodeCommit(chainID string, commit *types.Commit, vals, trustedVals *types
 	if c.PartSetHash, err = to32(commit.BlockID.PartsHeader.Hash); err != nil {
 		return c, fmt.Errorf("part set hash: %w", err)
 	}
-	for idx, pc := range commit.Precommits {
-		if pc == nil || !pc.BlockID.Equals(commit.BlockID) {
-			continue
-		}
+	c.Signatures = make([]byte, 0, len(signers)*SigSize)
+	for _, idx := range signers {
+		pc := commit.Precommits[idx]
 		_, val := vals.GetByIndex(idx)
-		if val == nil {
-			return c, fmt.Errorf("precommit %d has no validator", idx)
+		if pc == nil || val == nil {
+			return c, fmt.Errorf("no precommit or validator at %d", idx)
 		}
 		pk, ok := val.PubKey.(secp256k1.PubKeySecp256k1)
 		if !ok {
@@ -193,7 +299,7 @@ func EncodeCommit(chainID string, commit *types.Commit, vals, trustedVals *types
 			return c, fmt.Errorf("precommit %d: %w", idx, err)
 		}
 		cs := CommitSig{
-			ValidatorIndex: uint32(idx),
+			ValidatorIndex: uint16(idx),
 			TrustedIndex:   NoTrustedIndex,
 			TimeSeconds:    uint64(pc.Timestamp.Unix()),
 			TimeNanos:      uint32(pc.Timestamp.Nanosecond()),
@@ -201,41 +307,52 @@ func EncodeCommit(chainID string, commit *types.Commit, vals, trustedVals *types
 		}
 		copy(cs.R[:], pc.Signature[:32])
 		copy(cs.S[:], pc.Signature[32:])
-		if trustedVals != nil {
-			if ti, tv := trustedVals.GetByAddress(val.Address); tv != nil {
-				cs.TrustedIndex = uint32(ti)
+		if trusted != nil {
+			if ti, tv := trusted.GetByAddress(val.Address); tv != nil {
+				cs.TrustedIndex = uint16(ti)
 			}
 		}
-		c.Signatures = append(c.Signatures, cs)
+		c.Signatures = cs.Pack(c.Signatures)
 	}
 	return c, nil
 }
 
-// EncodeHeader builds the updateClient message. trustedVals must be the
-// validator set whose hash is the NextValidatorsHash of the consensus state
-// at trustedHeight. Pass nil when header.ValidatorsHash equals that hash
-// (always the case for adjacent headers): the contract then uses vals.
-func EncodeHeader(sh *types.SignedHeader, vals *types.ValidatorSet, trustedHeight int64, trustedVals *types.ValidatorSet) (Header, error) {
+// EncodeHeader builds the updateClient message for sh, signed by vals.
+func EncodeHeader(sh *types.SignedHeader, vals *types.ValidatorSet, o HeaderOptions) (Header, error) {
 	var h Header
 	var err error
 	if !bytes.Equal(vals.Hash(), sh.ValidatorsHash) {
 		return h, fmt.Errorf("validator set does not match header")
 	}
+	if o.TrustNumerator == 0 {
+		o.TrustNumerator, o.TrustDenominator = 1, 3
+	}
+	var trustCheck *types.ValidatorSet
+	if o.NeedsTrustCheck(sh.Height, vals) {
+		trustCheck = o.TrustedVals
+	}
 	if h.SignedHeader, err = EncodeHeaderFields(sh.Header); err != nil {
 		return h, err
 	}
-	if h.Commit, err = EncodeCommit(sh.ChainID, sh.Commit, vals, trustedVals); err != nil {
+	signers, err := SelectSigners(sh.Commit, vals, trustCheck, o.TrustNumerator, o.TrustDenominator, o.AllSignatures)
+	if err != nil {
 		return h, err
 	}
-	if h.ValidatorSet, err = EncodeValidatorSet(vals); err != nil {
+	if h.Commit, err = EncodeCommit(sh.ChainID, sh.Commit, vals, trustCheck, signers); err != nil {
 		return h, err
 	}
-	if h.TrustedValidators, err = EncodeValidatorSet(trustedVals); err != nil {
-		return h, err
+	h.ValidatorSet = []Validator{}
+	if !o.OmitValidators {
+		if h.ValidatorSet, err = EncodeValidatorSet(vals); err != nil {
+			return h, err
+		}
 	}
-	if h.TrustedValidators == nil {
-		h.TrustedValidators = []Validator{}
+	h.TrustedValidators = []Validator{}
+	if trustCheck != nil && !o.OmitTrusted {
+		if h.TrustedValidators, err = EncodeValidatorSet(trustCheck); err != nil {
+			return h, err
+		}
 	}
-	h.TrustedHeight = uint64(trustedHeight)
+	h.TrustedHeight = uint64(o.TrustedHeight)
 	return h, nil
 }

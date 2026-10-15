@@ -229,12 +229,12 @@ func main() {
 		Timestamp: uint64(h10.Time.UnixNano()), AppHash: app10, NextValidatorsHash: nv10,
 	}))
 
-	add := func(name string, sh *types.SignedHeader, vals *types.ValidatorSet, trustedHeight int64, trustedVals *types.ValidatorSet, expectValid bool) gnoibc.Header {
-		if expectValid {
-			check(vals.VerifyCommit(sh.ChainID, sh.Commit.BlockID, sh.Height, sh.Commit))
-		}
+	// Fixtures carry every precommit unless the options ask for the minimal
+	// subset: the tests drop and tamper with signatures themselves.
+	addOpts := func(name string, sh *types.SignedHeader, vals *types.ValidatorSet, o gnoibc.HeaderOptions) gnoibc.Header {
+		check(vals.VerifyCommit(sh.ChainID, sh.Commit.BlockID, sh.Height, sh.Commit))
 		check(sh.ValidateBasic(sh.ChainID))
-		hdr := must(gnoibc.EncodeHeader(sh, vals, trustedHeight, trustedVals))
+		hdr := must(gnoibc.EncodeHeader(sh, vals, o))
 		fx.Updates[name] = update{
 			Msg:                must(gnoibc.PackHeader(hdr)),
 			Height:             uint64(sh.Height),
@@ -242,9 +242,12 @@ func main() {
 			AppHash:            sh.AppHash,
 			NextValidatorsHash: sh.NextValidatorsHash,
 			BlockHash:          sh.Hash(),
-			NumSignatures:      len(hdr.Commit.Signatures),
+			NumSignatures:      len(hdr.Commit.Signatures) / gnoibc.SigSize,
 		}
 		return hdr
+	}
+	add := func(name string, sh *types.SignedHeader, vals *types.ValidatorSet, trustedHeight int64, trustedVals *types.ValidatorSet, _ bool) gnoibc.Header {
+		return addOpts(name, sh, vals, gnoibc.HeaderOptions{TrustedHeight: trustedHeight, TrustedVals: trustedVals, AllSignatures: true})
 	}
 
 	all := func(vs *types.ValidatorSet) []int {
@@ -291,14 +294,26 @@ func main() {
 	idxA2, _ := setC.GetByAddress(a2.Address())
 	idxD, _ := setC.GetByAddress(d.Address())
 	idxE, _ := setC.GetByAddress(e.Address())
-	add("h21Untrusted", sign(kr, h21, setC, []int{idxA2, idxD, idxE}, 0), setC, 11, setA, true)
+	sh21 := sign(kr, h21, setC, []int{idxA2, idxD, idxE}, 0)
+	add("h21Untrusted", sh21, setC, 11, setA, true)
+
+	// --- validator set cache: the client caches A after h11 (next = A) and B
+	// after h13 (next = B); these variants leave cached sets out ---
+	sh12 := sign(kr, h12, setA, all(setA), 1)
+	addOpts("h11NoVals", sh11, setA, gnoibc.HeaderOptions{TrustedHeight: 10, OmitValidators: true, AllSignatures: true})
+	addOpts("h12NoVals", sh12, setA, gnoibc.HeaderOptions{TrustedHeight: 11, OmitValidators: true, AllSignatures: true})
+	sh13 := sign(kr, h13, setB, []int{0, 1, 3}, 0)
+	addOpts("h13NoVals", sh13, setB, gnoibc.HeaderOptions{TrustedHeight: 12, OmitValidators: true, AllSignatures: true})
+	addOpts("h20From11CachedTrusted", sh20, setB, gnoibc.HeaderOptions{TrustedHeight: 11, TrustedVals: setA, OmitTrusted: true, AllSignatures: true})
+	addOpts("h20From11AllCached", sh20, setB, gnoibc.HeaderOptions{TrustedHeight: 11, TrustedVals: setA, OmitTrusted: true, OmitValidators: true, AllSignatures: true})
+	addOpts("h20From11Min", sh20, setB, gnoibc.HeaderOptions{TrustedHeight: 11, TrustedVals: setA})
+	addOpts("h21UntrustedCached", sh21, setC, gnoibc.HeaderOptions{TrustedHeight: 11, TrustedVals: setA, OmitTrusted: true, AllSignatures: true})
 
 	// --- encoding vectors from h11 / h12 ---
 	for _, l := range gnoibc.HeaderLeaves(h11) {
 		fx.Encoding.HeaderLeaves = append(fx.Encoding.HeaderLeaves, l)
 	}
 	fx.Encoding.HeaderHash = h11.Hash()
-	sh12 := sign(kr, h12, setA, all(setA), 1)
 	for _, sh := range []*types.SignedHeader{sh11, sh12} {
 		for i, pc := range sh.Commit.Precommits {
 			if pc != nil {

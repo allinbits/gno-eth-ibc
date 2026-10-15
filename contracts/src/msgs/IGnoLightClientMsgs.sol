@@ -51,8 +51,9 @@ interface IGnoLightClientMsgs {
     }
 
     /// @notice The tm2 header fields the client reads, plus the Merkle siblings needed to recompute Header.Hash.
-    /// @dev The contract amino-encodes ChainID (from the client state), Height, Time, ValidatorsHash (computed from
-    /// the supplied validator set), NextValidatorsHash and AppHash itself, so what it reads is what is hashed. The
+    /// @dev The contract amino-encodes ChainID (from the client state), Height, Time, ValidatorsHash (checked
+    /// against the supplied validator set, or naming a cached one), NextValidatorsHash and AppHash itself, so what
+    /// it reads is what is hashed. The
     /// other ten leaves enter only as hashes of the 16-leaf simple Merkle tree:
     /// leaf 0 (Version), subtree 4..7 (NumTxs, TotalTxs, AppVersion, LastBlockID), subtree 8..9 (LastCommitHash,
     /// DataHash), leaf 12 (ConsensusHash) and subtree 14..15 (LastResultsHash, ProposerAddress).
@@ -60,6 +61,7 @@ interface IGnoLightClientMsgs {
         uint64 height;
         uint64 timeSeconds;
         uint32 timeNanos;
+        bytes32 validatorsHash;
         bytes32 nextValidatorsHash;
         bytes32 appHash;
         bytes32 versionLeafHash;
@@ -69,17 +71,18 @@ interface IGnoLightClientMsgs {
         bytes32 resultsAndProposerHash;
     }
 
-    /// @notice One precommit for the committed BlockID.
-    /// @param validatorIndex Index of the signer in Header.validatorSet; strictly increasing across the commit
-    /// @param trustedIndex Index of the signer in Header.trustedValidators, or type(uint32).max if absent
+    /// @notice One precommit for the committed BlockID. On the wire (Commit.signatures) each is packed into 81
+    /// bytes, big-endian: validatorIndex u16 | trustedIndex u16 | timeSeconds u64 | timeNanos u32 | r | s | v u8.
+    /// @param validatorIndex Index of the signer in the header's validator set; strictly increasing
+    /// @param trustedIndex Index of the signer in the trusted validator set, or 0xffff if absent
     /// @param timeSeconds Vote timestamp, seconds part
     /// @param timeNanos Vote timestamp, nanoseconds part
     /// @param r Signature r
     /// @param s Signature s, must be in the lower half of the curve order
     /// @param v Recovery id, 27 or 28. Not signed: the relayer finds it by trial recovery.
     struct CommitSig {
-        uint32 validatorIndex;
-        uint32 trustedIndex;
+        uint16 validatorIndex;
+        uint16 trustedIndex;
         uint64 timeSeconds;
         uint32 timeNanos;
         bytes32 r;
@@ -88,20 +91,23 @@ interface IGnoLightClientMsgs {
     }
 
     /// @notice The commit for the header. BlockID.Hash is the header hash, recomputed by the contract.
+    /// @param signatures CommitSigs packed back to back, 81 bytes each (see CommitSig)
     struct Commit {
         uint32 round;
         uint32 partSetTotal;
         bytes32 partSetHash;
-        CommitSig[] signatures;
+        bytes signatures;
     }
 
     /// @notice The updateClient message: abi.encode(Header).
     /// @param signedHeader The header to trust
     /// @param commit Its commit
-    /// @param validatorSet The header's validator set, in tm2 set order; must hash to Header.ValidatorsHash
+    /// @param validatorSet The header's validator set, in tm2 set order, hashing to signedHeader.validatorsHash.
+    /// Leave empty when that set is cached (isValidatorSetCached): the client caches a supplied set once a header
+    /// whose next validator set is the same set is accepted.
     /// @param trustedHeight Height of the stored consensus state to verify from
-    /// @param trustedValidators Validator set hashing to that consensus state's nextValidatorsHash. Leave empty
-    /// when validatorSet itself has that hash (always so for adjacent headers).
+    /// @param trustedValidators The validator set hashing to that consensus state's nextValidatorsHash. Needed
+    /// only for a non-adjacent header with a different validator set, and then only if it is not cached.
     struct Header {
         HeaderFields signedHeader;
         Commit commit;

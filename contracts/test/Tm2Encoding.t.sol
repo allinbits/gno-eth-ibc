@@ -5,6 +5,7 @@ import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol
 import { Tm2Encoding } from "../src/lib/Tm2Encoding.sol";
 import { Tm2Merkle } from "../src/lib/Tm2Merkle.sol";
 import { Fixtures } from "./utils/Fixtures.sol";
+import { Sigs } from "./utils/Sigs.sol";
 
 /// @notice Byte-equality of the Solidity amino encodings with what tm2 (Go) produced for the fixtures.
 contract Tm2EncodingTest is Fixtures {
@@ -56,22 +57,19 @@ contract Tm2EncodingTest is Fixtures {
         for (uint256 n = 0; n < 2; ++n) {
             Msgs.Header memory h = _header(names[n]);
             bytes32 blockHash = _updateBytes32(names[n], "blockHash");
-            (bytes memory pre, bytes memory post) = Tm2Encoding.voteSignBytesParts(
+            Tm2Encoding.VoteBuffer memory buf = Tm2Encoding.newVoteBuffer(
                 chainId, h.signedHeader.height, h.commit.round, blockHash, h.commit.partSetTotal, h.commit.partSetHash
             );
-            for (uint256 i = 0; i < h.commit.signatures.length; ++i) {
-                Msgs.CommitSig memory s = h.commit.signatures[i];
-                assertEq(Tm2Encoding.voteSignBytes(pre, post, s.timeSeconds, s.timeNanos), want[k++]);
+            Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+            for (uint256 i = 0; i < sigs.length; ++i) {
+                assertEq(Tm2Encoding.voteSignBytes(buf, sigs[i].timeSeconds, sigs[i].timeNanos), want[k++]);
             }
         }
         assertEq(k, want.length);
         // h12 commits at round 1, and every commit has one vote with a zero-nanosecond timestamp
         assertEq(_header("h12").commit.round, 1);
-        assertEq(
-            _header("h11").commit.signatures[0].timeNanos == 0 || _header("h11").commit.signatures[1].timeNanos == 0
-                || _header("h11").commit.signatures[2].timeNanos == 0,
-            true
-        );
+        Msgs.CommitSig[] memory s11 = Sigs.decode(_header("h11").commit.signatures);
+        assertTrue(s11[0].timeNanos == 0 || s11[1].timeNanos == 0 || s11[2].timeNanos == 0);
     }
 
     function test_validatorEncodingMatchesGo() public view {

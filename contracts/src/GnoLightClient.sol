@@ -21,21 +21,33 @@ import { Tm2Merkle } from "./lib/Tm2Merkle.sol";
 contract GnoLightClient is ILightClient, IGnoLightClientErrors {
     /// @notice Lower half of the secp256k1 group order; tm2 rejects signatures with s above it.
     uint256 private constant SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
-    uint32 private constant NO_TRUSTED_INDEX = type(uint32).max;
+    uint256 private constant NO_TRUSTED_INDEX = type(uint16).max;
     uint256 private constant NANOS = 1e9;
+    /// @notice Size of one packed CommitSig (see IGnoLightClientMsgs.Commit).
+    uint256 private constant SIG_SIZE = 81;
 
     Msgs.ClientState private _clientState;
     mapping(uint64 height => Msgs.ConsensusState) private _consensusStates;
 
+    /// @notice Cached validator sets, keyed by their tm2 ValidatorSet.Hash: (size << 128) | totalPower, 0 when
+    /// not cached. Entries are written only from validators whose hash the contract recomputed from their keys
+    /// and powers, so a cached entry is exactly the set the hash commits to.
+    mapping(bytes32 valSetHash => uint256 meta) private _valSetMeta;
+    /// @notice (votingPower << 160) | ethereumAddress of each validator, in set order.
+    mapping(bytes32 valSetHash => mapping(uint256 index => uint256 entry)) private _valSetEntries;
+
     event ClientUpdated(uint64 indexed height, bytes32 blockHash, bytes32 appHash);
     event Frozen(uint64 indexed height);
+    event ValidatorSetCached(bytes32 indexed valSetHash, uint256 size, uint256 totalPower);
 
-    /// @notice Validator set as the contract uses it.
+    /// @notice A validator set as the contract uses it: supplied in the message (entries in memory) or cached
+    /// (entries in storage).
     struct ValSet {
-        address[] addrs;
-        uint256[] powers;
-        uint256 total;
         bytes32 hash;
+        uint256 size;
+        uint256 total;
+        bool cached;
+        uint256[] entries; // (power << 160) | address, only when supplied
     }
 
     /// @notice A header that passed verification.
@@ -43,6 +55,7 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         bytes32 blockHash;
         uint64 height;
         Msgs.ConsensusState consensusState;
+        ValSet vals;
     }
 
     /// @param clientState_ Initial client state; latestHeight must be the height of consensusState_
@@ -70,6 +83,27 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
     /// @notice The consensus state stored at height (zero timestamp if none).
     function getConsensusState(uint64 height) external view returns (Msgs.ConsensusState memory) {
         return _consensusStates[height];
+    }
+
+    /// @notice Whether the validator set with this tm2 hash is cached, i.e. may be omitted from updates.
+    function isValidatorSetCached(bytes32 valSetHash) external view returns (bool) {
+        return _valSetMeta[valSetHash] != 0;
+    }
+
+    /// @notice A cached validator set: Ethereum addresses and powers in set order, and the total power.
+    function getValidatorSet(bytes32 valSetHash)
+        external
+        view
+        returns (address[] memory addrs, uint256[] memory powers, uint256 totalPower)
+    {
+        uint256 meta = _valSetMeta[valSetHash];
+        uint256 n = meta >> 128;
+        addrs = new address[](n);
+        powers = new uint256[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            (addrs[i], powers[i]) = _unpack(_valSetEntries[valSetHash][i]);
+        }
+        totalPower = uint128(meta);
     }
 
     // ================================================================ update
@@ -104,6 +138,8 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
 
         _consensusStates[height] = v.consensusState;
         _clientState.latestHeight = height;
+        // The next header's set is this one's next set; when it is this set, keep it for the updates to come.
+        if (!v.vals.cached && v.vals.hash == v.consensusState.nextValidatorsHash) _cacheValSet(v.vals);
         emit ClientUpdated(height, v.blockHash, v.consensusState.appHash);
         return ILightClientMsgs.UpdateResult.Update;
     }
@@ -170,32 +206,32 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
             if (headerTime >= limit) revert HeaderTimeInFuture(headerTime, limit);
         }
 
-        ValSet memory vals = _parseValidatorSet(header.validatorSet);
+        // The header's validator set: supplied (and hashed here) or cached under the hash the header claims.
+        // Either way the set is the preimage of hf.validatorsHash, which the header hash commits to.
+        v.vals = _valSet(header.validatorSet, hf.validatorsHash, false);
         bytes memory chainId = bytes(_clientState.chainId);
-        v.blockHash = Tm2Encoding.headerHash(hf, chainId, vals.hash);
+        v.blockHash = Tm2Encoding.headerHash(hf, chainId, hf.validatorsHash);
         v.height = hf.height;
         v.consensusState = Msgs.ConsensusState({
             timestamp: headerTime, appHash: hf.appHash, nextValidatorsHash: hf.nextValidatorsHash
         });
 
-        // Which validator set the trust comes from. Adjacent headers, and non-adjacent ones whose validator
-        // set is already the trusted next set, need no second set: >2/3 of it signing implies >1/3.
+        // Adjacent headers must be signed by the trusted next set. Non-adjacent ones signed by that same set
+        // need no second check (>2/3 of it implies >1/3); otherwise more than the trust level of the trusted
+        // next set must have signed too.
+        bool adjacent = hf.height == header.trustedHeight + 1;
         ValSet memory trustedVals;
-        bool checkTrust = hf.height != header.trustedHeight + 1 && header.trustedValidators.length != 0;
+        bool checkTrust = hf.validatorsHash != trusted.nextValidatorsHash;
         if (checkTrust) {
-            trustedVals = _parseValidatorSet(header.trustedValidators);
-            if (trustedVals.hash != trusted.nextValidatorsHash) {
-                revert TrustedValidatorsHashMismatch(trusted.nextValidatorsHash, trustedVals.hash);
-            }
-        } else if (vals.hash != trusted.nextValidatorsHash) {
-            revert ValidatorsHashMismatch(trusted.nextValidatorsHash, vals.hash);
+            if (adjacent) revert ValidatorsHashMismatch(trusted.nextValidatorsHash, hf.validatorsHash);
+            trustedVals = _valSet(header.trustedValidators, trusted.nextValidatorsHash, true);
         }
 
         (uint256 tallied, uint256 trustedTallied) =
-            _verifyCommit(chainId, hf.height, v.blockHash, header.commit, vals, trustedVals, checkTrust);
+            _verifyCommit(chainId, hf.height, v.blockHash, header.commit, v.vals, trustedVals, checkTrust);
 
         // tm2 VerifyCommit: talliedVotingPower > TotalVotingPower()*2/3
-        if (tallied <= vals.total * 2 / 3) revert InsufficientVotingPower(tallied, vals.total);
+        if (tallied <= v.vals.total * 2 / 3) revert InsufficientVotingPower(tallied, v.vals.total);
         if (checkTrust) {
             Msgs.TrustThreshold memory tl = _clientState.trustLevel;
             // atomone 10-gno VerifyLightCommit: tallied > total*numerator/denominator
@@ -205,8 +241,8 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         }
     }
 
-    /// @notice Verifies each precommit for the block and returns the power behind it, in the header's set and
-    /// (if checkTrust) in the trusted set.
+    /// @notice Verifies each packed precommit for the block and returns the power behind it, in the header's
+    /// set and (if checkTrust) in the trusted set.
     function _verifyCommit(
         bytes memory chainId,
         uint64 height,
@@ -217,45 +253,75 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         bool checkTrust
     )
         private
-        pure
+        view
         returns (uint256 tallied, uint256 trustedTallied)
     {
-        (bytes memory pre, bytes memory post) = Tm2Encoding.voteSignBytesParts(
+        bytes memory sigs = commit.signatures;
+        if (sigs.length % SIG_SIZE != 0) revert InvalidCommitEncoding();
+        Tm2Encoding.VoteBuffer memory buf = Tm2Encoding.newVoteBuffer(
             chainId, height, commit.round, blockHash, commit.partSetTotal, commit.partSetHash
         );
-        bool[] memory seenTrusted = new bool[](checkTrust ? trustedVals.addrs.length : 0);
+        bool[] memory seenTrusted = new bool[](checkTrust ? trustedVals.size : 0);
         uint256 nextIndex = 0;
-        for (uint256 i = 0; i < commit.signatures.length; ++i) {
-            Msgs.CommitSig memory sig = commit.signatures[i];
+        uint256 n = sigs.length / SIG_SIZE;
+        for (uint256 i = 0; i < n; ++i) {
+            Sig memory sig = _sigAt(sigs, i);
             if (sig.validatorIndex < nextIndex) revert SignatureIndexOutOfOrder(i);
-            if (sig.validatorIndex >= vals.addrs.length) revert ValidatorIndexOutOfRange(i);
-            nextIndex = uint256(sig.validatorIndex) + 1;
+            if (sig.validatorIndex >= vals.size) revert ValidatorIndexOutOfRange(i);
+            nextIndex = sig.validatorIndex + 1;
 
-            address signer = _recover(Tm2Encoding.voteSignBytes(pre, post, sig.timeSeconds, sig.timeNanos), sig, i);
-            address expected = vals.addrs[sig.validatorIndex];
+            address signer = _recover(Tm2Encoding.voteSignBytes(buf, sig.timeSeconds, sig.timeNanos), sig, i);
+            (address expected, uint256 power) = _entry(vals, sig.validatorIndex);
             if (signer != expected) revert InvalidSignature(i, signer, expected);
-            tallied += vals.powers[sig.validatorIndex];
+            tallied += power;
 
             if (checkTrust && sig.trustedIndex != NO_TRUSTED_INDEX) {
-                if (sig.trustedIndex >= trustedVals.addrs.length) revert TrustedIndexOutOfRange(i);
-                if (trustedVals.addrs[sig.trustedIndex] != signer) revert TrustedSignerMismatch(i);
+                if (sig.trustedIndex >= trustedVals.size) revert TrustedIndexOutOfRange(i);
+                (address trustedAddr, uint256 trustedPower) = _entry(trustedVals, sig.trustedIndex);
+                if (trustedAddr != signer) revert TrustedSignerMismatch(i);
                 if (seenTrusted[sig.trustedIndex]) revert DuplicateTrustedSigner(i);
                 seenTrusted[sig.trustedIndex] = true;
-                trustedTallied += trustedVals.powers[sig.trustedIndex];
+                trustedTallied += trustedPower;
             }
         }
     }
 
+    /// @notice One precommit of the packed signature list.
+    struct Sig {
+        uint256 validatorIndex;
+        uint256 trustedIndex;
+        uint64 timeSeconds;
+        uint32 timeNanos;
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+    }
+
+    /// @notice Reads the i-th 81-byte record: validatorIndex u16 | trustedIndex u16 | timeSeconds u64 |
+    /// timeNanos u32 | r | s | v u8, big-endian.
+    function _sigAt(bytes memory sigs, uint256 i) private pure returns (Sig memory sig) {
+        uint256 w;
+        bytes32 r;
+        bytes32 s;
+        uint256 v;
+        assembly ("memory-safe") {
+            let p := add(add(sigs, 32), mul(i, 81))
+            w := mload(p)
+            r := mload(add(p, 16))
+            s := mload(add(p, 48))
+            v := byte(0, mload(add(p, 80)))
+        }
+        sig.validatorIndex = w >> 240;
+        sig.trustedIndex = (w >> 224) & 0xffff;
+        sig.timeSeconds = uint64(w >> 160);
+        sig.timeNanos = uint32(w >> 128);
+        sig.r = r;
+        sig.s = s;
+        sig.v = uint8(v);
+    }
+
     /// @notice ecrecover over sha256(signBytes), as tm2 secp256k1 signs; enforces low-S like tm2's verifier.
-    function _recover(
-        bytes memory signBytes,
-        Msgs.CommitSig memory sig,
-        uint256 position
-    )
-        private
-        pure
-        returns (address signer)
-    {
+    function _recover(bytes memory signBytes, Sig memory sig, uint256 position) private pure returns (address signer) {
         if (uint256(sig.s) > SECP256K1_HALF_N || sig.s == 0 || sig.r == 0 || (sig.v != 27 && sig.v != 28)) {
             revert InvalidSignatureEncoding(position);
         }
@@ -263,19 +329,64 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         if (signer == address(0)) revert InvalidSignatureEncoding(position);
     }
 
+    /// @notice The validator set with tm2 hash `expected`: parsed from `supplied` (whose recomputed hash must
+    /// equal it) or, when nothing is supplied, read from the cache.
+    function _valSet(
+        Msgs.Validator[] memory supplied,
+        bytes32 expected,
+        bool trustedSet
+    )
+        private
+        view
+        returns (ValSet memory vs)
+    {
+        if (supplied.length != 0) {
+            vs = _parseValidatorSet(supplied);
+            if (vs.hash != expected) {
+                if (trustedSet) revert TrustedValidatorsHashMismatch(expected, vs.hash);
+                revert ValidatorSetHashMismatch(expected, vs.hash);
+            }
+            return vs;
+        }
+        uint256 meta = _valSetMeta[expected];
+        if (meta == 0) revert ValidatorSetNotCached(expected);
+        vs.hash = expected;
+        vs.size = meta >> 128;
+        vs.total = uint128(meta);
+        vs.cached = true;
+    }
+
+    function _entry(ValSet memory vs, uint256 i) private view returns (address, uint256) {
+        return _unpack(vs.cached ? _valSetEntries[vs.hash][i] : vs.entries[i]);
+    }
+
+    function _unpack(uint256 e) private pure returns (address addr, uint256 power) {
+        addr = address(uint160(e));
+        power = e >> 160;
+    }
+
+    function _cacheValSet(ValSet memory vs) private {
+        if (_valSetMeta[vs.hash] != 0) return;
+        mapping(uint256 => uint256) storage entries = _valSetEntries[vs.hash];
+        for (uint256 i = 0; i < vs.size; ++i) {
+            entries[i] = vs.entries[i];
+        }
+        _valSetMeta[vs.hash] = (vs.size << 128) | vs.total;
+        emit ValidatorSetCached(vs.hash, vs.size, vs.total);
+    }
+
     /// @notice Derives addresses and the tm2 ValidatorSet.Hash of a secp256k1 validator set.
     function _parseValidatorSet(Msgs.Validator[] memory validators) private pure returns (ValSet memory vs) {
         uint256 n = validators.length;
-        if (n == 0) revert EmptyValidatorSet();
-        vs.addrs = new address[](n);
-        vs.powers = new uint256[](n);
+        if (n > NO_TRUSTED_INDEX) revert ValidatorSetTooLarge();
+        vs.size = n;
+        vs.entries = new uint256[](n);
         bytes32[] memory leaves = new bytes32[](n);
         for (uint256 i = 0; i < n; ++i) {
             uint64 power = validators[i].votingPower;
             if (power == 0 || power > uint64(type(int64).max)) revert InvalidVotingPower();
             (bytes memory compressed, address addr) = Tm2Encoding.parsePubKey(validators[i].pubKey);
-            vs.addrs[i] = addr;
-            vs.powers[i] = power;
+            vs.entries[i] = (uint256(power) << 160) | uint160(addr);
             vs.total += power;
             leaves[i] = Tm2Merkle.leafHash(Tm2Encoding.validatorLeaf(compressed, power));
         }

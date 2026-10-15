@@ -12,6 +12,7 @@ import { IGnoLightClientErrors as Errs } from "../src/errors/IGnoLightClientErro
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 import { ICS23 } from "../src/lib/ICS23.sol";
 import { Fixtures } from "./utils/Fixtures.sol";
+import { Sigs } from "./utils/Sigs.sol";
 
 contract GnoLightClientTest is Fixtures {
     GnoLightClient internal client;
@@ -49,15 +50,16 @@ contract GnoLightClientTest is Fixtures {
     }
 
     function _keepSignatures(Msgs.Header memory h, uint32[] memory keepIdx) internal pure {
+        Msgs.CommitSig[] memory all = Sigs.decode(h.commit.signatures);
         Msgs.CommitSig[] memory kept = new Msgs.CommitSig[](keepIdx.length);
         uint256 k = 0;
-        for (uint256 i = 0; i < h.commit.signatures.length; ++i) {
+        for (uint256 i = 0; i < all.length; ++i) {
             for (uint256 j = 0; j < keepIdx.length; ++j) {
-                if (h.commit.signatures[i].validatorIndex == keepIdx[j]) kept[k++] = h.commit.signatures[i];
+                if (all[i].validatorIndex == keepIdx[j]) kept[k++] = all[i];
             }
         }
         require(k == keepIdx.length, "missing signature");
-        h.commit.signatures = kept;
+        h.commit.signatures = Sigs.encode(kept);
     }
 
     // ================================================================ construction
@@ -137,14 +139,18 @@ contract GnoLightClientTest is Fixtures {
 
     function test_revert_invalidSignature() public {
         Msgs.Header memory h = _header("h11");
-        h.commit.signatures[1].r = bytes32(uint256(h.commit.signatures[1].r) ^ 1);
+        Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+        sigs[1].r = bytes32(uint256(sigs[1].r) ^ 1);
+        h.commit.signatures = Sigs.encode(sigs);
         vm.expectPartialRevert(Errs.InvalidSignature.selector);
         client.updateClient(abi.encode(h));
     }
 
     function test_revert_tamperedVoteTimestamp() public {
         Msgs.Header memory h = _header("h11");
-        h.commit.signatures[2].timeNanos += 1;
+        Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+        sigs[2].timeNanos += 1;
+        h.commit.signatures = Sigs.encode(sigs);
         vm.expectPartialRevert(Errs.InvalidSignature.selector);
         client.updateClient(abi.encode(h));
     }
@@ -158,17 +164,21 @@ contract GnoLightClientTest is Fixtures {
 
     function test_revert_highS() public {
         Msgs.Header memory h = _header("h11");
-        Msgs.CommitSig memory s = h.commit.signatures[0];
+        Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+        Msgs.CommitSig memory s = sigs[0];
         // (r, n - s, v ^ 1) is the same ECDSA signature in its malleable form; tm2 rejects it
         s.s = bytes32(SECP256K1_N - uint256(s.s));
         s.v = s.v == 27 ? 28 : 27;
+        h.commit.signatures = Sigs.encode(sigs);
         vm.expectRevert(abi.encodeWithSelector(Errs.InvalidSignatureEncoding.selector, 0));
         client.updateClient(abi.encode(h));
     }
 
     function test_revert_duplicateSignature() public {
         Msgs.Header memory h = _header("h11");
-        h.commit.signatures[1] = h.commit.signatures[0];
+        Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+        sigs[1] = sigs[0];
+        h.commit.signatures = Sigs.encode(sigs);
         vm.expectRevert(abi.encodeWithSelector(Errs.SignatureIndexOutOfOrder.selector, 1));
         client.updateClient(abi.encode(h));
     }
@@ -236,9 +246,11 @@ contract GnoLightClientTest is Fixtures {
         Msgs.Header memory h = _header("h20From11");
         // B = A's three keys (10 each) + D. Keep 3 of 4 signers of B, of which only one is in A.
         // Any 3 of B include two of A, so instead mark the A members as untrusted: trust tally drops.
-        for (uint256 i = 0; i < h.commit.signatures.length; ++i) {
-            h.commit.signatures[i].trustedIndex = type(uint32).max;
+        Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+        for (uint256 i = 0; i < sigs.length; ++i) {
+            sigs[i].trustedIndex = type(uint16).max;
         }
+        h.commit.signatures = Sigs.encode(sigs);
         vm.expectRevert(abi.encodeWithSelector(Errs.InsufficientTrustedVotingPower.selector, 0, 60));
         client.updateClient(abi.encode(h));
     }
@@ -255,18 +267,20 @@ contract GnoLightClientTest is Fixtures {
         _update("h11");
         Msgs.Header memory h = _header("h20From11");
         // point a signature at another trusted validator
-        Msgs.CommitSig memory s = h.commit.signatures[0];
-        s.trustedIndex = s.trustedIndex == 0 ? 1 : 0;
+        Msgs.CommitSig[] memory sigs = Sigs.decode(h.commit.signatures);
+        sigs[0].trustedIndex = sigs[0].trustedIndex == 0 ? 1 : 0;
+        h.commit.signatures = Sigs.encode(sigs);
         vm.expectRevert(abi.encodeWithSelector(Errs.TrustedSignerMismatch.selector, 0));
         client.updateClient(abi.encode(h));
     }
 
     function test_revert_validatorSetNotTrusted() public {
         _update("h11");
-        // h13 is signed by B, but 11's next validators are A and no trusted set is supplied
+        // h13 is signed by B, but 11's next validators are A: the trust level is checked over A (cached after h11),
+        // and the message names no A signer
         Msgs.Header memory h = _header("h13");
         h.trustedHeight = 11;
-        vm.expectPartialRevert(Errs.ValidatorsHashMismatch.selector);
+        vm.expectRevert(abi.encodeWithSelector(Errs.InsufficientTrustedVotingPower.selector, 0, 60));
         client.updateClient(abi.encode(h));
     }
 

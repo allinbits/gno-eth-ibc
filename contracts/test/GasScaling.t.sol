@@ -10,9 +10,10 @@ import { GnoLightClient } from "../src/GnoLightClient.sol";
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 
 /// @notice updateClient gas against validator set size, on fixtures from fixtures/cmd/genfixtures (gas.json):
-/// equal-power sets of 3, 7, 20, 50 and 100 secp256k1 validators. Each case runs on a freshly deployed client
-/// (cold storage). Prints execution gas and an estimate of the full transaction cost: 21000 + calldata at
-/// 16 gas per non-zero and 4 per zero byte of the updateClient(bytes) calldata.
+/// equal-power sets of 3, 7, 20, 50 and 100 secp256k1 validators. Each measured call starts from cold storage
+/// (vm.cool) and from the state its case needs (state snapshots). Prints execution gas and an estimate of the
+/// full transaction cost: 21000 + calldata at 16 gas per non-zero and 4 per zero byte of the
+/// updateClient(bytes) calldata.
 contract GasScalingTest is Test {
     string internal fx;
 
@@ -32,46 +33,55 @@ contract GasScalingTest is Test {
         }
     }
 
-    function _run(uint256 i, string memory field) internal returns (uint256 execGas, uint256 txGas, uint256 size) {
-        GnoLightClient client = new GnoLightClient(
-            abi.decode(_bytes(i, "clientState"), (Msgs.ClientState)),
-            abi.decode(_bytes(i, "consensusState"), (Msgs.ConsensusState))
-        );
+    function _measure(GnoLightClient client, uint256 i, string memory field, string memory label) internal {
         bytes memory m = _bytes(i, field);
         bytes memory callData = abi.encodeCall(GnoLightClient.updateClient, (m));
+        vm.cool(address(client));
         ILightClientMsgs.UpdateResult res = client.updateClient(m);
-        assertEq(uint8(res), uint8(ILightClientMsgs.UpdateResult.Update));
-        execGas = vm.lastCallGas().gasTotalUsed;
-        txGas = 21_000 + _calldataGas(callData) + execGas;
-        size = callData.length;
+        assertEq(uint8(res), uint8(ILightClientMsgs.UpdateResult.Update), label);
+        uint256 execGas = vm.lastCallGas().gasTotalUsed;
+        uint256 txGas = 21_000 + _calldataGas(callData) + execGas;
+        uint256 sigs = abi.decode(m, (Msgs.Header)).commit.signatures.length / 81;
+        console.log(
+            string.concat(
+                vm.toString(vm.parseJsonUint(fx, string.concat(".cases[", vm.toString(i), "].n"))),
+                " | ",
+                vm.toString(sigs),
+                " | ",
+                label,
+                " | ",
+                vm.toString(execGas),
+                " | ",
+                vm.toString(callData.length),
+                " | ",
+                vm.toString(txGas)
+            )
+        );
     }
 
     function test_gasScaling() public {
         Msgs.ConsensusState memory trusted = abi.decode(_bytes(0, "consensusState"), (Msgs.ConsensusState));
         vm.warp(trusted.timestamp / 1e9 + 120);
-        string[4] memory fields = ["adjacentAll", "adjacentMin", "nonAdjacentTrusted", "nonAdjacentSameSet"];
-        console.log("n | signers | case | exec gas | calldata bytes | est. tx gas");
+        console.log("n | signatures | case | exec gas | calldata bytes | est. tx gas");
         for (uint256 i = 0; i < CASES; ++i) {
-            uint256 n = vm.parseJsonUint(fx, string.concat(".cases[", vm.toString(i), "].n"));
-            uint256 minSigners = vm.parseJsonUint(fx, string.concat(".cases[", vm.toString(i), "].minSigners"));
-            for (uint256 f = 0; f < fields.length; ++f) {
-                (uint256 execGas, uint256 txGas, uint256 size) = _run(i, fields[f]);
-                console.log(
-                    string.concat(
-                        vm.toString(n),
-                        " | ",
-                        vm.toString(f == 1 ? minSigners : n),
-                        " | ",
-                        fields[f],
-                        " | ",
-                        vm.toString(execGas),
-                        " | ",
-                        vm.toString(size),
-                        " | ",
-                        vm.toString(txGas)
-                    )
-                );
-            }
+            GnoLightClient client = new GnoLightClient(
+                abi.decode(_bytes(i, "clientState"), (Msgs.ClientState)),
+                abi.decode(_bytes(i, "consensusState"), (Msgs.ConsensusState))
+            );
+            uint256 fresh = vm.snapshotState();
+            _measure(client, i, "uncachedAll", "keys, all sign, set changes next");
+            vm.revertToState(fresh);
+            _measure(client, i, "uncachedMin", "keys, fewest signers, set changes next");
+            vm.revertToState(fresh);
+            _measure(client, i, "firstSight", "keys, fewest signers, set gets cached");
+            uint256 cached = vm.snapshotState();
+            _measure(client, i, "cachedAll", "cached set, all sign");
+            vm.revertToState(cached);
+            _measure(client, i, "cachedMin", "cached set, fewest signers");
+            vm.revertToState(cached);
+            _measure(client, i, "nonAdjacentSame", "non-adjacent, cached same set, fewest signers");
+            vm.revertToState(cached);
+            _measure(client, i, "nonAdjacentRotated", "non-adjacent, 1 validator rotated, trust over cached set");
         }
     }
 }

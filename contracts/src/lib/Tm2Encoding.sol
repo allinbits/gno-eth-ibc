@@ -119,11 +119,23 @@ library Tm2Encoding {
 
     // ---------------------------------------------------------------- votes
 
-    /// @notice The part of CanonicalVote sign bytes before the timestamp and after it. Every precommit of a
-    /// commit shares them; only the timestamp differs (tm2/pkg/bft/types/block.go Commit.VoteSignBytes).
+    /// @notice A reusable buffer holding the CanonicalVote sign bytes of one commit. Every precommit of a commit
+    /// shares all fields but the timestamp (tm2/pkg/bft/types/block.go Commit.VoteSignBytes), so the shared
+    /// prefix is written once and each vote only rewrites timestamp, chain ID and length prefix in place.
     /// CanonicalVote (canonical.go): 1 Type uvarint, 2 Height fixed64, 3 Round fixed64,
     /// 4 BlockID {1 Hash, 2 PartsHeader {1 Total uvarint, 2 Hash}}, 5 Timestamp, 6 ChainID. Zero fields omitted.
-    function voteSignBytesParts(
+    /// @dev Layout of buf: 32 bytes of headroom (room for the length word of the returned view), 2 bytes for the
+    /// sign bytes' uvarint length prefix, the shared prefix, then the per-vote tail.
+    struct VoteBuffer {
+        bytes buf;
+        uint256 preLen;
+        bytes chainId;
+    }
+
+    /// @notice Largest timestamp field: tag, length, 0x08 + 10-byte varint, 0x10 + 5-byte varint.
+    uint256 private constant MAX_TS_FIELD = 19;
+
+    function newVoteBuffer(
         bytes memory chainId,
         uint64 height,
         uint32 round,
@@ -133,7 +145,7 @@ library Tm2Encoding {
     )
         internal
         pure
-        returns (bytes memory pre, bytes memory post)
+        returns (VoteBuffer memory b)
     {
         bytes memory psh = abi.encodePacked(
             partSetTotal == 0 ? bytes("") : abi.encodePacked(bytes1(0x08), uvarint(partSetTotal)),
@@ -141,7 +153,7 @@ library Tm2Encoding {
             partSetHash
         );
         bytes memory blockId = abi.encodePacked(bytes2(0x0a20), blockHash, bytes1(0x12), uvarint(psh.length), psh);
-        pre = abi.encodePacked(
+        bytes memory pre = abi.encodePacked(
             bytes1(0x08),
             bytes1(PRECOMMIT_TYPE),
             bytes1(0x11),
@@ -151,29 +163,67 @@ library Tm2Encoding {
             uvarint(blockId.length),
             blockId
         );
-        post = abi.encodePacked(bytes1(0x32), uvarint(chainId.length), chainId);
+        bytes memory post = abi.encodePacked(bytes1(0x32), uvarint(chainId.length), chainId);
+        b.buf = new bytes(34 + pre.length + MAX_TS_FIELD + post.length);
+        b.preLen = pre.length;
+        b.chainId = post;
+        assembly ("memory-safe") {
+            mcopy(add(mload(b), 66), add(pre, 32), mload(pre))
+        }
     }
 
-    /// @notice amino.MarshalSized(CanonicalVote): uvarint length prefix, then the body.
-    function voteSignBytes(
-        bytes memory pre,
-        bytes memory post,
-        uint64 seconds_,
-        uint32 nanos
-    )
+    /// @notice amino.MarshalSized(CanonicalVote) for a vote with this timestamp. The result aliases the buffer:
+    /// it is valid until the next call on the same buffer.
+    function voteSignBytes(VoteBuffer memory b, uint64 seconds_, uint32 nanos)
         internal
         pure
-        returns (bytes memory)
+        returns (bytes memory out)
     {
-        bytes memory ts = timestampBody(seconds_, nanos);
-        uint256 bodyLen = pre.length + 1 + _uvarintLen(ts.length) + ts.length + post.length;
-        return abi.encodePacked(uvarint(bodyLen), pre, bytes1(0x2a), uvarint(ts.length), ts, post);
-    }
-
-    function _uvarintLen(uint256 v) private pure returns (uint256 n) {
-        n = 1;
-        for (v >>= 7; v != 0; v >>= 7) {
-            ++n;
+        if (seconds_ > MAX_INT64 || nanos >= 1e9) revert ValueOutOfRange();
+        bytes memory buf = b.buf;
+        bytes memory post = b.chainId;
+        uint256 preLen = b.preLen;
+        assembly ("memory-safe") {
+            function putVarint(p, v) -> q {
+                for { } gt(v, 0x7f) { } {
+                    mstore8(p, or(and(v, 0x7f), 0x80))
+                    v := shr(7, v)
+                    p := add(p, 1)
+                }
+                mstore8(p, v)
+                q := add(p, 1)
+            }
+            let body := add(buf, 66) // after length word, headroom and prefix room
+            let tag := add(body, preLen)
+            let q := add(tag, 2)
+            if seconds_ {
+                mstore8(q, 0x08)
+                q := putVarint(add(q, 1), seconds_)
+            }
+            if nanos {
+                mstore8(q, 0x10)
+                q := putVarint(add(q, 1), nanos)
+            }
+            mstore8(tag, 0x2a)
+            mstore8(add(tag, 1), sub(q, add(tag, 2)))
+            let postLen := mload(post)
+            mcopy(q, add(post, 32), postLen)
+            let end := add(q, postLen)
+            let bodyLen := sub(end, body)
+            let start
+            switch lt(bodyLen, 128)
+            case 1 {
+                start := sub(body, 1)
+                mstore8(start, bodyLen)
+            }
+            default {
+                // the shared prefix is far below 16384 bytes, so two varint bytes always suffice
+                start := sub(body, 2)
+                mstore8(start, or(and(bodyLen, 0x7f), 0x80))
+                mstore8(add(start, 1), shr(7, bodyLen))
+            }
+            out := sub(start, 32)
+            mstore(out, sub(end, start))
         }
     }
 

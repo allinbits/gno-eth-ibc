@@ -14,7 +14,10 @@ interface IGnoLightClientErrors {
     error TrustedConsensusStateExpired(uint256 expiry, uint256 nowTimestamp);
     error HeaderTimeNotAfterTrusted(uint256 headerTime, uint256 trustedTime);
     error HeaderTimeInFuture(uint256 headerTime, uint256 limit);
-    error EmptyValidatorSet();
+    error ValidatorSetTooLarge();
+    error ValidatorSetNotCached(bytes32 valSetHash);
+    error ValidatorSetHashMismatch(bytes32 claimed, bytes32 computed);
+    error InvalidCommitEncoding();
     error InvalidVotingPower();
     error ValidatorsHashMismatch(bytes32 expected, bytes32 actual);
     error TrustedValidatorsHashMismatch(bytes32 expected, bytes32 actual);
