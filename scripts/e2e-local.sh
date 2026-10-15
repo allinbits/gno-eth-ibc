@@ -84,30 +84,37 @@ ETH_CLIENT=$(json "$DEP" '["clientId"]')
 step "registering $ETH_CLIENT as counterparty of $GNO_CLIENT on gno"
 "$RELAYER" gno-register-counterparty -gno-rpc "$GNO_RPC" -client "$GNO_CLIENT" -counterparty "$ETH_CLIENT"
 
-step "sending $AMOUNT ugnot from gno to $RECEIVER"
-FROM=$(rpc_height)
-TIMEOUT=$(( $(date +%s) + 3600 ))
-echo "" | "$ROOT/testnet/.data/bin/gnokey" maketx call \
-	-home "$ROOT/testnet/.data/gnokey" -insecure-password-stdin \
-	-pkgpath gno.land/r/aib/ibc/apps/transfer -func Transfer \
-	-args "$GNO_CLIENT" -args "$RECEIVER" -args ugnot -args "$AMOUNT" -args "$TIMEOUT" -args "" \
-	-send "${AMOUNT}ugnot" -gas-fee 10000000ugnot -gas-wanted 150000000 \
-	-broadcast -chainid "$GNO_CHAIN_ID" -remote "$GNO_RPC" test1 | tee "$WORK/transfer.txt"
-grep -q "OK!" "$WORK/transfer.txt"
+# Two rounds: the first update supplies the validator keys (and the client caches the set), the second
+# relies on the cache.
+transfer_and_relay() {
+	local round=$1
+	step "round $round: sending $AMOUNT ugnot from gno to $RECEIVER"
+	FROM=$(rpc_height)
+	TIMEOUT=$(( $(date +%s) + 3600 ))
+	echo "" | "$ROOT/testnet/.data/bin/gnokey" maketx call \
+		-home "$ROOT/testnet/.data/gnokey" -insecure-password-stdin \
+		-pkgpath gno.land/r/aib/ibc/apps/transfer -func Transfer \
+		-args "$GNO_CLIENT" -args "$RECEIVER" -args ugnot -args "$AMOUNT" -args "$TIMEOUT" -args "" \
+		-send "${AMOUNT}ugnot" -gas-fee 10000000ugnot -gas-wanted 150000000 \
+		-broadcast -chainid "$GNO_CHAIN_ID" -remote "$GNO_RPC" test1 >"$WORK/transfer-$round.txt"
+	grep -q "OK!" "$WORK/transfer-$round.txt" || { cat "$WORK/transfer-$round.txt"; exit 1; }
 
-step "relaying gno -> anvil"
-"$RELAYER" relay -gno-rpc "$GNO_RPC" -eth-rpc "$ETH_RPC_URL" -deployment "$DEP" -gno-client "$GNO_CLIENT" \
-	-from "$FROM" -out "$WORK/relay.json"
-cat "$WORK/relay.json"
-[[ "$(json "$WORK/relay.json" '.__len__()')" -ge 1 ]] || { echo "no packet relayed" >&2; exit 1; }
+	step "round $round: relaying gno -> anvil"
+	"$RELAYER" relay -gno-rpc "$GNO_RPC" -eth-rpc "$ETH_RPC_URL" -deployment "$DEP" -gno-client "$GNO_CLIENT" \
+		-from "$FROM" -out "$WORK/relay-$round.json"
+	cat "$WORK/relay-$round.json"
+	[[ "$(json "$WORK/relay-$round.json" '.__len__()')" -ge 1 ]] || { echo "no packet relayed" >&2; exit 1; }
+}
+transfer_and_relay 1
+transfer_and_relay 2
 
 step "checking the receiver's voucher balance"
 "$RELAYER" erc20-balance -eth-rpc "$ETH_RPC_URL" -deployment "$DEP" -denom "transfer/$ETH_CLIENT/ugnot" \
 	-owner "$RECEIVER" | tee "$WORK/balance.json"
 BAL=$(json "$WORK/balance.json" '["balance"]')
-if [[ "$BAL" != "$AMOUNT" ]]; then
-	echo "FAIL: receiver holds $BAL, want $AMOUNT" >&2
+if [[ "$BAL" != "$(( 2 * AMOUNT ))" ]]; then
+	echo "FAIL: receiver holds $BAL, want $(( 2 * AMOUNT ))" >&2
 	exit 1
 fi
 echo
-echo "PASS: $AMOUNT ugnot relayed from gno ($GNO_CLIENT) to anvil ($ETH_CLIENT); ack committed on anvil; receiver balance $BAL"
+echo "PASS: 2 x $AMOUNT ugnot relayed from gno ($GNO_CLIENT) to anvil ($ETH_CLIENT); ack committed on anvil; receiver balance $BAL"
