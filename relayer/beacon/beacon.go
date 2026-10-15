@@ -57,6 +57,11 @@ func truncate(b []byte) string {
 // Uint64 is a uint64 the beacon API encodes as a decimal string.
 type Uint64 uint64
 
+// MarshalJSON writes the decimal string the beacon API uses.
+func (u Uint64) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + strconv.FormatUint(uint64(u), 10) + `"`), nil
+}
+
 func (u *Uint64) UnmarshalJSON(b []byte) error {
 	s := strings.Trim(string(b), `"`)
 	v, err := strconv.ParseUint(s, 10, 64)
