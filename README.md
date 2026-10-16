@@ -31,7 +31,7 @@ gno.land (3 secp256k1 validators)                    Ethereum (Sepolia)
   committee's aggregate key minus the non-signers
   (`bls12381.FastAggregateVerifyExcluding`). Storage is proven with
   `eth_getProof` at finalized blocks. Messages go through `MsgCall` to
-  `r/aib/ibc/ethrelay` in the `p/clockwork/wire` format.
+  `r/aib/ibc/ethrelay` in the `p/aib/encoding/wire/v0` format.
 
 ## Run it
 

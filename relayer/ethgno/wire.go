@@ -9,7 +9,7 @@ import (
 	"github.com/gnolang/gno-eth-ibc/relayer/beacon"
 )
 
-// Writer encodes the positional wire format of gno.land/p/clockwork/wire:
+// Writer encodes the positional wire format of gno.land/p/aib/encoding/wire/v0:
 // Uint is 8 bytes big-endian, Uvarint LEB128, Str and Blob a Uvarint length
 // and the bytes, Bool and Byte one byte.
 type Writer struct{ buf []byte }
