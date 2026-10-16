@@ -184,6 +184,27 @@ DEPLOYER_PRIVATE_KEY=0x... GNO_COUNTERPARTY_CLIENT_ID=ethereum-1 \
 Addresses are written to `deployments/<chainid>.json` (or `DEPLOYMENTS_FILE`). `make e2e-local` runs
 the whole local flow; see `../scripts/e2e-local.sh`.
 
+### Vouchers of gno.land denoms
+
+ICS20 carries amounts in base units. On first receipt of a denom, `ICS20Transfer` deploys an
+`IBCERC20` voucher whose `decimals()` is 18 and cannot be changed, so 1 GNOT (1,000,000 ugnot) would
+show in wallets as 10^-12 tokens. Each gno.land denom therefore gets a `GnoVoucher`
+(`src/GnoVoucher.sol`): an ERC20 with the denom's name, symbol and gno.land decimals that only
+`ICS20Transfer` mints and burns, registered with `ICS20Transfer.setCustomERC20` before the denom's
+first transfer. Amounts are never scaled.
+
+The deploy script registers ugnot (`Gno.land`, `GNOT`, 6 decimals) as `transfer/<clientId>/ugnot`,
+recorded as `ugnotVoucher`, and grants the deployer `ERC20_CUSTOMIZER_ROLE`. Register other denoms,
+such as GRC20 tokens, before anyone sends them:
+
+```
+DEPLOYER_PRIVATE_KEY=0x... GNO_DENOM=gno.land/r/demo/foo VOUCHER_NAME=Foo VOUCHER_SYMBOL=FOO \
+  VOUCHER_DECIMALS=4 forge script script/RegisterGnoDenom.s.sol --rpc-url $ETH_RPC_URL --broadcast
+```
+
+A denom sent before it is registered gets an 18-decimal `IBCERC20` for good: `setCustomERC20`
+refuses a denom that already has a token.
+
 ## tm2 formats, as checked against the Go source
 
 Every encoding below is also asserted byte-for-byte in `test/Tm2Encoding.t.sol` against output of the

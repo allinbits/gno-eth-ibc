@@ -16,13 +16,15 @@ import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 
 import { GnoLightClient } from "../src/GnoLightClient.sol";
+import { GnoDenoms } from "./GnoDenoms.sol";
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 
 /// @title Deploy IBC v2 on an EVM chain with a GnoLightClient tracking a gno.land chain
 /// @notice Deploys, in the order and with the roles of solidity-ibc-eureka v3.0.2's E2ETestDeploy:
 /// AccessManager, ICS26Router and ICS20Transfer behind ERC1967 proxies (ICS20Transfer creating its Escrow and
 /// IBCERC20 beacons), registers ICS20 on port "transfer", then deploys GnoLightClient from a trusted gno header
-/// and adds it to the router with the gno side as counterparty.
+/// and adds it to the router with the gno side as counterparty. Last, it registers the voucher of ugnot (6
+/// decimals, see GnoVoucher); other gno.land denoms are registered with RegisterGnoDenom.s.sol.
 /// @dev Environment:
 ///   DEPLOYER_PRIVATE_KEY        deployer key (required; never stored)
 ///   GNO_TRUST_FILE              JSON with "clientState" and "consensusState", each the ABI encoding of the
@@ -44,6 +46,7 @@ contract DeployGnoIBC is Script {
         address ics20Transfer;
         address gnoLightClient;
         string clientId;
+        address ugnotVoucher;
     }
 
     function run() external returns (Deployed memory d) {
@@ -67,6 +70,7 @@ contract DeployGnoIBC is Script {
         j.serialize("ics26Router", d.ics26Router);
         j.serialize("ics20Transfer", d.ics20Transfer);
         j.serialize("gnoLightClient", d.gnoLightClient);
+        j.serialize("ugnotVoucher", d.ugnotVoucher);
         j.serialize("gnoChainId", cs.chainId);
         j.serialize("counterpartyClientId", counterparty);
         j = j.serialize("clientId", d.clientId);
@@ -121,6 +125,7 @@ contract DeployGnoIBC is Script {
         am.setTargetFunctionRole(d.ics26Router, IBCRolesLib.uupsUpgradeSelectors(), IBCRolesLib.ADMIN_ROLE);
         if (relayer != address(0)) am.grantRole(IBCRolesLib.RELAYER_ROLE, relayer, 0);
         am.grantRole(IBCRolesLib.ID_CUSTOMIZER_ROLE, deployer, 0);
+        am.grantRole(IBCRolesLib.ERC20_CUSTOMIZER_ROLE, deployer, 0);
 
         ICS26Router(d.ics26Router).addIBCApp(ICS20Lib.DEFAULT_PORT_ID, d.ics20Transfer);
 
@@ -132,5 +137,7 @@ contract DeployGnoIBC is Script {
             .addClient(
                 IICS02ClientMsgs.CounterpartyInfo({ clientId: counterparty, merklePrefix: prefix }), d.gnoLightClient
             );
+
+        d.ugnotVoucher = GnoDenoms.register(d.ics20Transfer, d.clientId, "ugnot", "Gno.land", "GNOT", 6);
     }
 }
