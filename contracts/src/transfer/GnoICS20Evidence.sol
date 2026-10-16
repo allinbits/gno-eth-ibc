@@ -83,7 +83,7 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         rec.burned = burned;
         rec.amount = data.amount;
         rec.legacy = true;
-        GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
+        GnoTransferStorage.openRecord(rec, keccak256(bytes(packet.sourceClient)));
         GnoTransferStorage.syncReserve(GnoTransferStorage.routeHash(packet.sourceClient), rec, 0);
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
     }
@@ -172,6 +172,17 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         }
         rec.provenGen = g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen;
         emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function incidents(string calldata clientId)
+        external
+        view
+        delegated
+        returns (Incident[] memory, uint64 resolvedUpTo)
+    {
+        GnoTransferStorage.Route storage r = _g().routes[GnoTransferStorage.routeHash(clientId)];
+        return (r.incidents, r.resolvedUpTo);
     }
 
     /// @notice See IGnoICS20Controls.

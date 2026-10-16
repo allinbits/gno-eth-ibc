@@ -868,8 +868,8 @@ contract ReviewRegressionsTest is ControlsFixture {
 
     /// @notice Round 3 #1: kind 10 names the start of the suspected compromise interval; every ack and timeout
     /// processed from it on (a forged success, a forged refund paid in full, a genuine refund paid in full) must be
-    /// settled by kind 12 before kind 13 reopens the route; one processed before it need not be; and a second
-    /// replacement waits for the first's reconciliation.
+    /// settled by kind 12 before kind 13 reopens the route; one processed before it need not be; and a retired id
+    /// is never replaced again.
     function test_r3_1_suspectInterval_settledBeforeReopen() public {
         _setLimits(address(usdc), 1000, 1000, 1000);
         bytes memory ok = bytes("{\"result\":\"AQ==\"}");
@@ -906,10 +906,9 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.startPrank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-2", 3));
         ctl.reopenRoute("gnoland-2");
-        // one replacement at a time
-        router.addClient("gnoland-8", IICS02ClientMsgs.CounterpartyInfo("ethereum-8", _prefix()), address(lc2));
+        // only the route's current client is replaced (a replacement while closed is test_r7_1_…)
         vm.expectRevert(T.GnoBadRoute.selector);
-        ctl.migrateRoute("gnoland-2", "gnoland-8", 0);
+        ctl.migrateRoute(clientId, "gnoland-8", 0);
         // a record processed before the interval does not count
         ctl.settleRecords(clientId, _item(before.sequence, 3, 0));
         (, open) = ctl.suspectRecords(clientId);
@@ -1829,6 +1828,70 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(adapter.successes(), 1);
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
         ctl.notifySettled(pkt, bytes("{\"result\":\"AQ==\"}"), 0);
+    }
+
+    /// @notice Round 7 #2: a reopening for a late loss on a retired client never reaches the live client's records:
+    /// a forged success ack the live client accepted is counted when that client is replaced in turn (suspectFrom 0),
+    /// and the route reopens only once it is settled.
+    function test_r7_2_lateLossReopening_keepsTheLiveClientsRecords() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        string memory usdcBack = string.concat("transfer/", CP, "/", Strings.toHexString(address(usdc)));
+        IICS26RouterMsgs.Packet memory sent = _send(alice, address(usdc), 100, clientId);
+        _ack(sent, bytes("{\"result\":\"AQ==\"}"));
+        assertTrue(_isSuccessAck(_transferIn(clientId, usdcBack, 100, bob))); // a forged receive on client-0
+        uint64 inbound = nextRecvSeq[keccak256(bytes(clientId))];
+        _retire(); // client-0 -> gnoland-9
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        // gnoland-9 accepts a forged success ack of an undelivered packet
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 50, "gnoland-9");
+        _ack(b, bytes("{\"result\":\"AQ==\"}"));
+        _settle(_item(inbound, 5, 100)); // a late loss on client-0 closes the route
+        assertTrue(ctl.routeClosed(clientId));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9"); // the late loss accepted
+        assertFalse(ctl.routeClosed(clientId));
+        // gnoland-9 replaced in turn, its interval from block 0: the forged ack counts
+        address lc8 = address(new MockLightClient());
+        vm.startPrank(address(admin));
+        router.addClient("gnoland-8", IICS02ClientMsgs.CounterpartyInfo("ethereum-8", _prefix()), lc8);
+        ctl.migrateRoute("gnoland-9", "gnoland-8", 0);
+        vm.stopPrank();
+        (, uint64 open) = ctl.suspectRecords("gnoland-9");
+        assertEq(open, 1);
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-8", 1));
+        ctl.reopenRoute("gnoland-8");
+        _proveRefundable(b);
+        vm.startPrank(address(admin));
+        ctl.settleRecords("gnoland-9", _item(b.sequence, 1, 50));
+        ctl.reopenRoute("gnoland-8");
+        vm.stopPrank();
+        assertFalse(ctl.routeClosed(clientId));
+    }
+
+    /// @notice Round 7 #4: acks and timeouts on the live client between a late-loss closure and its reopening count
+    /// against no incident: kind 13 reopens.
+    function test_r7_4_liveClientAcks_duringLateLossClosure() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory late = _send(alice, address(usdc), 20, clientId);
+        _errorAck(late); // a forged refund, paid at once
+        _retire();
+        _proveDelivered(late);
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        IICS26RouterMsgs.Packet memory ok = _send(alice, address(usdc), 5, "gnoland-9");
+        IICS26RouterMsgs.Packet memory out = _send(alice, address(usdc), 5, "gnoland-9");
+        _settle(_item(late.sequence, 4, 20)); // a late loss closes the route
+        assertTrue(ctl.routeClosed(clientId));
+        _ack(ok, bytes("{\"result\":\"AQ==\"}")); // the live client's success ack
+        vm.warp(out.timeoutTimestamp);
+        router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(out, "", IICS02ClientMsgs.Height(0, 1)));
+        (, uint64 open) = ctl.suspectRecords("gnoland-9");
+        assertEq(open, 0, "the live client counts against no incident");
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertFalse(ctl.routeClosed(clientId));
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

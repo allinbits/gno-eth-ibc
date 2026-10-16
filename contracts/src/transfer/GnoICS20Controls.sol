@@ -111,7 +111,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                         break;
                     }
                     rec.payment = Payment.Claimed;
-                    GnoTransferStorage.closeRecord(rec, route);
+                    GnoTransferStorage.closeRecord(rec, keccak256(bytes(q.clientId)));
                     GnoTransferStorage.releaseNotice(q.clientId, q.sequence);
                 } else if (got != 0) {
                     // a refund the token refuses waits apart, so the refunds behind it are paid
@@ -188,12 +188,15 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         rec.processedBlock = uint64(block.number);
         bytes32 route = GnoTransferStorage.routeHash(clientId);
         GnoTransferStorage.Route storage r = g.routes[route];
-        rec.processedIndex = uint64(r.processed.length);
-        r.processed.push(GnoTransferStorage.ProcessedRef(keccak256(bytes(clientId)), sequence, uint64(block.number)));
-        // processed while a replacement is being reconciled: inside its suspected interval, one more to settle
-        if (r.closed) ++r.suspectOpen;
+        bytes32 clientHash = keccak256(bytes(clientId));
+        GnoTransferStorage.ClientRecon storage c = g.clients[clientHash];
+        rec.processedIndex = uint64(c.processed.length);
+        c.processed.push(uint64(block.number));
+        // processed on a retired client (its incident's reconciliation under way): one more suspect record; the live
+        // client's never count
+        if (c.incident != 0) ++c.suspectOpen;
         if (outcome == Outcome.Success) {
-            GnoTransferStorage.closeRecord(rec, route);
+            GnoTransferStorage.closeRecord(rec, clientHash);
             GnoTransferStorage.syncReserve(route, rec, reservedBefore);
             emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
             GnoTransferStorage.notify(refundee, notice, clientId, sequence);
@@ -214,7 +217,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         ) {
             if (GnoTransferStorage.tryPayRefund(rec, amount, route, reservedBefore, true)) {
                 rec.payment = Payment.Paid;
-                GnoTransferStorage.closeRecord(rec, route);
+                GnoTransferStorage.closeRecord(rec, clientHash);
                 paid = true;
                 emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
             } else {
@@ -325,18 +328,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice The index of the first record processed at or after `fromBlock` (binary search; the list is in
     /// processing order).
-    function _firstProcessedAt(
-        GnoTransferStorage.ProcessedRef[] storage list,
-        uint64 fromBlock
-    )
-        private
-        view
-        returns (uint256 lo)
-    {
+    function _firstProcessedAt(uint64[] storage list, uint64 fromBlock) private view returns (uint256 lo) {
         uint256 hi = list.length;
         while (lo < hi) {
             uint256 mid = (lo + hi) / 2;
-            if (list[mid].blockNumber < fromBlock) lo = mid + 1;
+            if (list[mid] < fromBlock) lo = mid + 1;
             else hi = mid;
         }
     }
@@ -408,22 +404,26 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         );
         string memory key = GnoTransferStorage.routeKey(oldClientId);
         GnoTransferStorage.Route storage r = g.routes[keccak256(bytes(key))];
-        // one replacement at a time: the last one's reconciliation completes (kind 13) before the next
-        require(!r.closed, GnoBadRoute());
+        // only the route's current client is replaced; also while the route is closed (an earlier incident's
+        // reconciliation unfinished: it carries over untouched), and a reopening under way is aborted
+        string memory current = bytes(g.currentOf[key]).length == 0 ? key : g.currentOf[key];
+        require(keccak256(bytes(current)) == keccak256(bytes(oldClientId)), GnoBadRoute());
+        GnoTransferStorage.abortReopening(r, key);
         g.routeOf[newClientId] = key;
         g.currentOf[key] = newClientId;
         g.retired[oldClientId] = true;
-        // closed until its records are reconciled (kind 12) and it is reopened (kind 13)
+        // closed until every incident is reconciled (kind 12) and the route reopened (kind 13)
         r.closed = true;
         ++r.verifierGen;
-        // the suspected compromise interval: every ack and timeout processed from `suspectFrom` on must be settled
-        // by kind 12 before kind 13 (ADR §7.12); it never reaches below the records the previous reopening left
-        // reconciled
-        uint256 start = _firstProcessedAt(r.processed, suspectFrom);
-        if (start < r.processedFloor) start = r.processedFloor;
-        r.suspectFrom = suspectFrom;
-        r.suspectStart = uint64(start);
-        r.suspectOpen = uint64(r.processed.length - start);
+        // the new incident covers the retired client: its acks and timeouts processed from `suspectFrom` on must be
+        // settled by kind 12 before kind 13 (ADR §7.12); the client's own list holds only its records
+        bytes32 oldHash = keccak256(bytes(oldClientId));
+        r.incidents.push(Incident(GnoTransferStorage.REPLACEMENT, GnoTransferStorage.OPEN, oldHash, suspectFrom));
+        GnoTransferStorage.ClientRecon storage c = g.clients[oldHash];
+        uint256 start = _firstProcessedAt(c.processed, suspectFrom);
+        c.incident = uint32(r.incidents.length);
+        c.suspectStart = uint64(start);
+        c.suspectOpen = uint64(c.processed.length - start);
         emit GnoRouteMigrated(oldClientId, newClientId, key);
     }
 
@@ -492,8 +492,9 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function suspectRecords(string calldata clientId) external view delegated returns (uint64 from, uint64 open) {
-        GnoTransferStorage.Route storage r = _route(clientId);
-        return (r.suspectFrom, r.suspectOpen);
+        GnoTransferStorage.ClientRecon storage c = _g().clients[keccak256(bytes(clientId))];
+        if (c.incident != 0) from = _route(clientId).incidents[c.incident - 1].suspectFrom;
+        return (from, c.suspectOpen);
     }
 
     /// @notice See IGnoICS20Controls.
@@ -503,7 +504,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function openRecords(string calldata clientId) external view delegated returns (uint64) {
-        return _route(clientId).openRecords;
+        return _g().clients[keccak256(bytes(clientId))].open;
     }
 
     /// @notice See IGnoICS20Controls.

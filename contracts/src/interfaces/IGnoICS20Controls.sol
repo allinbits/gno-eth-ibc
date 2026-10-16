@@ -108,6 +108,16 @@ interface IGnoICS20ControlsTypes {
         uint64 provenGen;
     }
 
+    /// @notice A closure of a route (the reconciliation state machine, docs/controls.md): a replacement (kind 10
+    /// or the emergency recovery) covering the client id it retired, or a loss kind 12 booked while the route was
+    /// open (covering no records); open, then reopening (kind 13 under way), then resolved.
+    struct Incident {
+        uint8 kind;
+        uint8 status;
+        bytes32 client;
+        uint64 suspectFrom;
+    }
+
     /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.
     struct SettleItem {
         uint64 sequence;
@@ -320,6 +330,9 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function reserved(string calldata clientId, address token) external view returns (uint256);
     /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).
     function openRecords(string calldata clientId) external view returns (uint64);
+
+    /// @notice The incidents of `clientId`'s route, and how many of them (from the first) are resolved.
+    function incidents(string calldata clientId) external view returns (Incident[] memory, uint64 resolvedUpTo);
     /// @notice The part of the route's losses of the token kind 13 accepted as a deficit.
     function acceptedDeficit(string calldata clientId, address token) external view returns (uint256);
     function refundsHeld(string calldata clientId) external view returns (bool);

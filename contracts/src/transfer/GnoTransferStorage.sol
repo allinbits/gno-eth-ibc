@@ -38,37 +38,36 @@ library GnoTransferStorage {
         uint64 quarantineDeadline;
         address seenClient;
         uint64 seenTransition;
-        /// Send records of the route still open: an outstanding packet, or a refund queued, parked or unpaid, not
-        /// settled by kind 12. Kind 13 reopens only at zero (ADR §5.4).
-        uint64 openRecords;
         /// Tokens kind 12 recorded a loss of (each once), for kind 13's accepted deficits.
         address[] lossTokens;
         /// Kind 13 under way: its deficits are accepted in batches from `deficitCursor`; the route opens with the last.
         bool reopening;
         uint64 deficitCursor;
-        /// Every ack and timeout processed on the route, in processing order (append-only): the records of the
-        /// suspected compromise interval are found in it by binary search (ADR §7.12).
-        ProcessedRef[] processed;
-        /// The processed records the last reopening left reconciled: those below this index belong to an earlier
-        /// replacement's reconciliation (or before any), never to a later one's suspected interval.
-        uint64 processedFloor;
-        /// The last replacement: the block starting its suspected compromise interval, the first processed index
-        /// inside it, and how many of its records kind 12 still has to settle before kind 13.
-        uint64 suspectFrom;
-        uint64 suspectStart;
-        uint64 suspectOpen;
         /// Bumped whenever the route's client may be re-pointed (a verifier swap, a replacement): an outcome proven
         /// under an earlier generation is void, even if the same client comes back.
         uint64 verifierGen;
-        /// Closed again by a loss kind 12 booked after the route reopened: kind 13 reopens it once more.
-        bool lossClosed;
+        /// The route's incidents (closures), appended; every one below `resolvedUpTo` is resolved. The route is
+        /// open only when all are (docs/controls.md, the reconciliation state machine).
+        IGnoICS20ControlsTypes.Incident[] incidents;
+        uint64 resolvedUpTo;
     }
 
-    /// @notice A send record processed by an ack or timeout, at a block.
-    struct ProcessedRef {
-        bytes32 clientHash;
-        uint64 sequence;
-        uint64 blockNumber;
+    /// @notice Incident kinds and statuses.
+    uint8 internal constant REPLACEMENT = 1;
+    uint8 internal constant LATE_LOSS = 2;
+    uint8 internal constant OPEN = 1;
+    uint8 internal constant REOPENING = 2;
+    uint8 internal constant RESOLVED = 3;
+
+    /// @notice One client id of a route (a generation): the blocks at which its acks and timeouts were processed
+    /// (append-only; a record keeps its index), its open records, and once retired the incident covering it, the
+    /// first suspect index and how many of its records processed from there on are unsettled.
+    struct ClientRecon {
+        uint64[] processed;
+        uint64 open;
+        uint32 incident;
+        uint64 suspectStart;
+        uint64 suspectOpen;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.
@@ -121,6 +120,8 @@ library GnoTransferStorage {
         /// The hash of the success ack `proveOutcome` proved for a delivered record (the success notification a
         /// reconciliation owes is built with it).
         mapping(bytes32 clientHash => mapping(uint64 sequence => bytes32)) provenAck;
+        /// Per client id: its reconciliation counters (ClientRecon).
+        mapping(bytes32 clientHash => ClientRecon) clients;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))
@@ -260,17 +261,37 @@ library GnoTransferStorage {
 
     // ------------------------------------------------------------------------------------------ open records --
 
-    /// @notice A record now open (written by a send or a backfill).
-    function openRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 route) internal {
+    /// @notice A record of client `clientHash` now open (written by a send or a backfill).
+    function openRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 clientHash) internal {
         rec.open = true;
-        ++layout().routes[route].openRecords;
+        ++layout().clients[clientHash].open;
     }
 
     /// @notice A record closed: its packet acknowledged with success, its refund paid in full, or settled by kind 12.
-    function closeRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 route) internal {
+    function closeRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 clientHash) internal {
         if (!rec.open) return;
         rec.open = false;
-        --layout().routes[route].openRecords;
+        --layout().clients[clientHash].open;
+    }
+
+    // ---------------------------------------------------------------------------------------------- incidents --
+
+    /// @notice Whether an incident's reconciliation is complete: a replacement's client has no open and no
+    /// unsettled suspect record; a late loss always is (it needs only its losses accepted).
+    function incidentSettled(IGnoICS20ControlsTypes.Incident storage inc) internal view returns (bool) {
+        if (inc.kind == LATE_LOSS) return true;
+        ClientRecon storage c = layout().clients[inc.client];
+        return c.open == 0 && c.suspectOpen == 0;
+    }
+
+    /// @notice Aborts a reopening under way: its incidents back to open, the route stays closed.
+    function abortReopening(Route storage r, string memory key) internal {
+        if (!r.reopening) return;
+        r.reopening = false;
+        for (uint256 i = r.resolvedUpTo; i < r.incidents.length; i++) {
+            if (r.incidents[i].status == REOPENING) r.incidents[i].status = OPEN;
+        }
+        emit IGnoICS20ControlsTypes.GnoReopenAborted(key);
     }
 
     // ---------------------------------------------------------------------------------------- reservations --

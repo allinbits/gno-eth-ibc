@@ -106,7 +106,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
         if (got == remaining) {
             rec.payment = Payment.Claimed;
-            GnoTransferStorage.closeRecord(rec, route);
+            GnoTransferStorage.closeRecord(rec, keccak256(bytes(clientId)));
             emit GnoOutcomeRecorded(clientId, sequence, rec.outcome, Payment.Claimed);
             GnoTransferStorage.releaseNotice(clientId, sequence);
         }
@@ -129,8 +129,12 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(g.retired[clientId], GnoBadSettlement(type(uint256).max));
         bytes32 clientHash = keccak256(bytes(clientId));
         bytes32 route = GnoTransferStorage.routeHash(clientId);
-        // sealed while a reopening accepts the deficits: the loss ledger it walks never changes behind it
-        require(!g.routes[route].reopening, GnoRouteReopening(clientId));
+        // sealed while its incident reopens: the records kind 13 found settled never change behind it
+        uint32 inc = g.clients[clientHash].incident;
+        require(
+            inc != 0 && g.routes[route].incidents[inc - 1].status != GnoTransferStorage.REOPENING,
+            GnoRouteReopening(clientId)
+        );
         // an outcome counts only while the client that proved it is still the route's active replacement, under
         // the same generation; checked again for every outcome consumed and after the last payment, since a
         // payment runs token code that could freeze or swap it (any change rolls the whole batch back)
@@ -168,9 +172,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             GnoBadSettlement(i)
         );
         // a record processed in the suspected compromise interval: one fewer to settle
-        if (rec.processedBlock != 0 && rec.processedIndex >= g.routes[route].suspectStart) {
-            --g.routes[route].suspectOpen;
-        }
+        GnoTransferStorage.ClientRecon storage c = g.clients[clientHash];
+        if (rec.processedBlock != 0 && rec.processedIndex >= c.suspectStart) --c.suspectOpen;
         uint8 action = it.action;
         bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
@@ -222,7 +225,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
             if (terminal == 1 || rec.payment == Payment.Claimed) emit GnoNotificationDue(clientId, it.sequence);
         }
-        GnoTransferStorage.closeRecord(rec, route);
+        GnoTransferStorage.closeRecord(rec, clientHash);
         GnoTransferStorage.syncReserve(route, rec, reservedBefore);
         emit GnoSettled(clientId, it.sequence, action, it.amount);
     }
@@ -261,13 +264,16 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         private
     {
         GnoTransferStorage.Route storage r = g.routes[route];
+        // the loss ledger never changes while a reopening walks it
+        require(!r.reopening, GnoRouteReopening(clientId));
         if (g.losses[route][token] == 0) r.lossTokens.push(token);
         g.losses[route][token] += amount;
         string memory key = GnoTransferStorage.routeKey(clientId);
         emit GnoLossRecorded(key, token, sequence, amount);
         if (!r.closed) {
+            // a late loss: an incident of its own, which needs only its loss accepted by a new kind 13
             r.closed = true;
-            r.lossClosed = true;
+            r.incidents.push(Incident(GnoTransferStorage.LATE_LOSS, GnoTransferStorage.OPEN, bytes32(0), 0));
             emit GnoRouteClosedForLoss(key);
         }
     }
@@ -286,15 +292,19 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     function reopenRoute(string calldata clientId) external delegated restricted nonReentrant {
         GnoTransferStorage.Route storage r = _route(clientId);
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
-        // every record of the retired ids reconciled first: no outstanding packet, no refund owed (a route closed
-        // again for a late loss was reconciled when it first reopened: its open records are the live client's)
-        require(r.lossClosed || r.openRecords == 0, GnoRecordsOpen(clientId, r.openRecords));
-        // and every ack or timeout processed in the suspected compromise interval settled
-        require(r.suspectOpen == 0, GnoSuspectUnsettled(clientId, r.suspectOpen));
+        // every unresolved incident settled: its client's records reconciled (no outstanding packet, no refund owed,
+        // no unsettled suspect record); a late loss needs only its loss accepted
+        for (uint256 i = r.resolvedUpTo; i < r.incidents.length; i++) {
+            Incident storage inc = r.incidents[i];
+            if (inc.kind == GnoTransferStorage.REPLACEMENT) {
+                GnoTransferStorage.ClientRecon storage c = _g().clients[inc.client];
+                require(c.open == 0, GnoRecordsOpen(clientId, c.open));
+                require(c.suspectOpen == 0, GnoSuspectUnsettled(clientId, c.suspectOpen));
+            }
+            inc.status = GnoTransferStorage.REOPENING;
+        }
         r.reopening = true;
         r.deficitCursor = 0;
-        // every record processed so far is reconciled: a later replacement's interval starts above them
-        r.processedFloor = uint64(r.processed.length);
         _acceptDeficits(r, clientId, REOPEN_BATCH);
     }
 
@@ -324,14 +334,20 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         }
         r.deficitCursor = uint64(i);
         if (i == r.lossTokens.length) {
-            r.reopening = false;
-            // every prerequisite again before the route opens: nothing opened or became suspect meanwhile
-            if ((!r.lossClosed && r.openRecords != 0) || r.suspectOpen != 0) {
-                emit GnoReopenAborted(key);
-                return;
+            // every reopening incident again before the route opens: nothing opened or became suspect meanwhile
+            uint256 n = r.incidents.length;
+            for (uint256 k = r.resolvedUpTo; k < n; k++) {
+                if (!GnoTransferStorage.incidentSettled(r.incidents[k])) {
+                    GnoTransferStorage.abortReopening(r, key);
+                    return;
+                }
             }
+            for (uint256 k = r.resolvedUpTo; k < n; k++) {
+                r.incidents[k].status = GnoTransferStorage.RESOLVED;
+            }
+            r.resolvedUpTo = uint64(n);
+            r.reopening = false;
             r.closed = false;
-            r.lossClosed = false;
             emit GnoRouteReopened(key);
         }
     }

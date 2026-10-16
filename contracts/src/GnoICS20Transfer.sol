@@ -804,7 +804,7 @@ contract GnoICS20Transfer is
         rec.burned = burned;
         rec.amount = msg_.amount;
         bytes32 route = GnoTransferStorage.routeHash(msg_.sourceClient);
-        GnoTransferStorage.openRecord(rec, route);
+        GnoTransferStorage.openRecord(rec, keccak256(bytes(msg_.sourceClient)));
         // an escrowed send's amount stays reserved until its outcome is known (its refund could be owed)
         GnoTransferStorage.syncReserve(route, rec, 0);
         emit GnoSendRecorded(msg_.sourceClient, sequence, commitment, msg_.denom, msg_.amount);

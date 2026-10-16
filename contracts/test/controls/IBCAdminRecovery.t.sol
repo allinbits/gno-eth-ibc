@@ -7,6 +7,7 @@ import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessMa
 import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
 
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
+import { IGnoICS20ControlsTypes, IGnoICS20ControlsTypes as T } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
@@ -295,6 +296,57 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertEq(usdc.balanceOf(alice), before + 100);
         assertTrue(_isSuccessAck(_transferIn("gnoland-7", "ugnot", 5, bob)));
         assertEq(_status(_recvGov(_env(3, S.KIND_SETTINGS, P.settings("gnoland-7", 1 days)))), S.STATUS_RECORDED);
+    }
+
+    /// @notice Round 7 #1: the first recovery's client freezes (or expires) before the route's reconciliation
+    /// completes; a second recovery replaces it while the route is still closed, the first incident's open record
+    /// carries over, and it is proven and settled through the second client before the route reopens.
+    function test_r7_1_consecutiveRecoveries_whileClosed_frozen() public {
+        _consecutiveRecoveries(false);
+    }
+
+    function test_r7_1_consecutiveRecoveries_whileClosed_expired() public {
+        _consecutiveRecoveries(true);
+    }
+
+    function _consecutiveRecoveries(bool expired) internal {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory inFlight = _send(alice, address(usdc), 100, clientId);
+        _openFrozen();
+        _skip(DELAY);
+        admin.executeRecovery();
+        assertTrue(ctl.routeClosed(clientId));
+        assertEq(ctl.openRecords(clientId), 1, "client-0's record still to reconcile");
+        // the first recovery's client goes bad before the reconciliation
+        if (expired) attested.setStatus(false, true);
+        else attested.setStatus(true, false);
+        MockLightClient second = new MockLightClient();
+        IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-8");
+        p.lightClient = address(second);
+        p.codeHash = address(second).codehash;
+        _approve(0, p);
+        _approve(1, p);
+        _approve(2, p);
+        assertEq(_openedAt(), _now());
+        _skip(DELAY);
+        admin.executeRecovery();
+        assertEq(admin.govClient(), "gnoland-8");
+        (IGnoICS20ControlsTypes.Incident[] memory inc, uint64 resolved) = ctl.incidents(clientId);
+        assertEq(inc.length, 2);
+        assertEq(resolved, 0);
+        assertEq(ctl.openRecords(clientId), 1, "carried over");
+        _proveRefundable(inFlight); // through the active client, gnoland-8
+        uint256 before = usdc.balanceOf(alice);
+        T.SettleItem[] memory items = new T.SettleItem[](1);
+        items[0] = T.SettleItem(inFlight.sequence, 1, 100);
+        vm.startPrank(address(admin));
+        ctl.settleRecords(clientId, items);
+        ctl.reopenRoute("gnoland-8");
+        vm.stopPrank();
+        assertEq(usdc.balanceOf(alice), before + 100);
+        assertFalse(ctl.routeClosed(clientId));
+        (, resolved) = ctl.incidents(clientId);
+        assertEq(resolved, 2);
     }
 
     function test_executeRefusesAClientWithAnotherCode() public {
