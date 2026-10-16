@@ -174,6 +174,8 @@ interface IGnoICS20ControlsTypes {
     /// @notice A reopening found a prerequisite broken at its last batch (a record opened meanwhile): the route
     /// stays closed, for kind 12 and a new kind 13.
     event GnoReopenAborted(string routeKey);
+    /// @notice A loss booked after the route reopened closed it again, until a kind 13 accepts it.
+    event GnoRouteClosedForLoss(string routeKey);
     event GnoOutcomeProven(string clientId, uint64 indexed sequence, Proven proven);
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).

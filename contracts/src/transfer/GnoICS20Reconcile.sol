@@ -170,11 +170,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 );
                 rec.settlement = 4;
                 if (owed) _reject(rec, clientId, it.sequence);
-                if (it.amount != 0) {
-                    if (g.losses[route][rec.token] == 0) g.routes[route].lossTokens.push(rec.token);
-                    g.losses[route][rec.token] += it.amount;
-                    emit GnoLossRecorded(GnoTransferStorage.routeKey(clientId), rec.token, it.sequence, it.amount);
-                }
+                if (it.amount != 0) _bookLoss(g, route, clientId, rec.token, it.sequence, it.amount);
             } else {
                 revert GnoBadSettlement(i);
             }
@@ -204,10 +200,32 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(amount != 0 && amount == it.amount, GnoBadSettlement(i));
         address token = address(uint160(r));
         g.receives[clientHash][it.sequence] = uint160(token); // booked: never again
-        if (g.losses[route][token] == 0) g.routes[route].lossTokens.push(token);
-        g.losses[route][token] += amount;
-        emit GnoLossRecorded(GnoTransferStorage.routeKey(clientId), token, it.sequence, amount);
+        _bookLoss(g, route, clientId, token, it.sequence, amount);
         emit GnoSettled(clientId, it.sequence, 5, amount);
+    }
+
+    /// @notice Books a loss of the route. A loss found after the route reopened closes it again at once: it opens
+    /// only by a new kind 13, which accepts the loss as a deficit (ADR §7.9), never with a loss left unaccepted.
+    function _bookLoss(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        string calldata clientId,
+        address token,
+        uint64 sequence,
+        uint256 amount
+    )
+        private
+    {
+        GnoTransferStorage.Route storage r = g.routes[route];
+        if (g.losses[route][token] == 0) r.lossTokens.push(token);
+        g.losses[route][token] += amount;
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        emit GnoLossRecorded(key, token, sequence, amount);
+        if (!r.closed) {
+            r.closed = true;
+            r.lossClosed = true;
+            emit GnoRouteClosedForLoss(key);
+        }
     }
 
     /// @notice A queued or parked refund rejected by reconciliation: never paid, its notification dropped.
@@ -224,8 +242,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     function reopenRoute(string calldata clientId) external delegated restricted {
         GnoTransferStorage.Route storage r = _route(clientId);
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
-        // every record of the retired ids reconciled first: no outstanding packet, no refund owed
-        require(r.openRecords == 0, GnoRecordsOpen(clientId, r.openRecords));
+        // every record of the retired ids reconciled first: no outstanding packet, no refund owed (a route closed
+        // again for a late loss was reconciled when it first reopened: its open records are the live client's)
+        require(r.lossClosed || r.openRecords == 0, GnoRecordsOpen(clientId, r.openRecords));
         // and every ack or timeout processed in the suspected compromise interval settled
         require(r.suspectOpen == 0, GnoSuspectUnsettled(clientId, r.suspectOpen));
         r.reopening = true;
@@ -263,11 +282,12 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         if (i == r.lossTokens.length) {
             r.reopening = false;
             // every prerequisite again before the route opens: nothing opened or became suspect meanwhile
-            if (r.openRecords != 0 || r.suspectOpen != 0) {
+            if ((!r.lossClosed && r.openRecords != 0) || r.suspectOpen != 0) {
                 emit GnoReopenAborted(key);
                 return;
             }
             r.closed = false;
+            r.lossClosed = false;
             emit GnoRouteReopened(key);
         }
     }

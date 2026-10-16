@@ -1501,6 +1501,34 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(big.balanceOf(alice), type(uint256).max);
     }
 
+    /// @notice Round 6 #4: kind 12 booking a loss after the reopening finished closes the route again at once; a
+    /// new kind 13 accepts the loss and opens it (the live client's outstanding sends do not block it).
+    function test_r6_4_lossAfterReopening_closesTheRouteAgain() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 10, clientId);
+        IICS26RouterMsgs.Packet memory late = _send(alice, address(usdc), 20, clientId);
+        _errorAck(a); // forged refunds, paid at once
+        _errorAck(late);
+        _retire();
+        _proveDelivered(a);
+        _proveDelivered(late);
+        _settle(_item(a.sequence, 4, 10));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertFalse(ctl.routeClosed(clientId));
+        assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 10);
+        _send(alice, address(usdc), 5, "gnoland-9"); // the live client's outstanding send
+        _settle(_item(late.sequence, 4, 20)); // a loss found after the reopening
+        assertTrue(ctl.routeClosed(clientId), "closed again");
+        assertEq(ctl.losses(clientId, address(usdc)), 30);
+        assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 10);
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertFalse(ctl.routeClosed(clientId));
+        assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 30);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {

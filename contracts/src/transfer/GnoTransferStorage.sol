@@ -58,6 +58,8 @@ library GnoTransferStorage {
         /// Bumped whenever the route's client may be re-pointed (a verifier swap, a replacement): an outcome proven
         /// under an earlier generation is void, even if the same client comes back.
         uint64 verifierGen;
+        /// Closed again by a loss kind 12 booked after the route reopened: kind 13 reopens it once more.
+        bool lossClosed;
     }
 
     /// @notice A send record processed by an ack or timeout, at a block.
