@@ -355,6 +355,8 @@ contract IBCAdminExec is IIBCAdmin {
             : abi.encodeCall(IICS02ClientAccessControlled.migrateClient, (clientId, info, lc));
         if (!_call(router, call)) return "client";
         if (address(IICS02Client(router).getClient(clientId)) != lc) revert AuthorityLost(router);
+        // a client a governed decision added: the only kind a route replacement may move to
+        if (op == 1) S.layout().enrolled[keccak256(bytes(clientId))] = true;
         return "";
     }
 
@@ -467,7 +469,8 @@ contract IBCAdminExec is IIBCAdmin {
         (string memory oldId, string memory newId) = abi.decode(p, (string, string));
         S.Layout storage l = S.layout();
         if (keccak256(bytes(oldId)) != keccak256(bytes(l.govClient))) return "client";
-        if (!_call(router, abi.encodeCall(IICS02Client.getClient, (newId)))) return "client";
+        // only a custom id a kind 6 enrolled (its verifier code-hash pinned), never one the router generated
+        if (!l.enrolled[keccak256(bytes(newId))]) return "client";
         if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId)))) return "route";
         S.replaceRoute(l, router, frozenClient, oldId, newId);
         return "";

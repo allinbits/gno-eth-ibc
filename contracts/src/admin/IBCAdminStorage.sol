@@ -119,6 +119,8 @@ library IBCAdminStorage {
         mapping(bytes32 setting => uint64 seq) appliedSeq;
         /// gno.land's chain id (an emergency recovery's client must follow it).
         string gnoChainId;
+        /// Client ids a kind 6 op 1 added (custom, verifier pinned): the only targets of a kind 10.
+        mapping(bytes32 clientHash => bool) enrolled;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.IBCAdmin")) - 1)) & ~bytes32(uint256(0xff))

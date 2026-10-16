@@ -595,6 +595,22 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertFalse(ctl.routePaused(clientId), "A's old flag stays dead");
     }
 
+    /// @notice Round 3 #7: kind 10 moves only to a client a governed kind 6 enrolled, never to one anybody created
+    /// through the router's permissionless addClient.
+    function test_r3_7_routeReplacementNeedsAnEnrolledClient() public {
+        vm.prank(makeAddr("attacker"));
+        string memory forged = router.addClient(
+            IICS02ClientMsgs.CounterpartyInfo("ethereum-6", _prefix()), address(new MockLightClient())
+        );
+        assertEq(forged, "client-1");
+        uint64 seq = _decide(S.KIND_ROUTE, P.route(clientId, forged));
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.SPENT);
+        assertEq(admin.epoch(), 1);
+        assertFalse(ctl.isRetired(clientId));
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {
