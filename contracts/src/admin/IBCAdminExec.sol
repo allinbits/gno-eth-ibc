@@ -416,7 +416,12 @@ contract IBCAdminExec is IIBCAdmin {
         address escrowImpl = UpgradeableBeacon(escrowBeacon).implementation();
         address tokenImpl = UpgradeableBeacon(tokenBeacon).implementation();
         if (proxy == router || proxy == ics20) {
+            // the transfer app keeps the controls: the new code answers the pinned probe with at least the running
+            // version, before the upgrade (the implementation) and after it (the proxy)
+            uint256 running = proxy == ics20 ? _controlsVersion(ics20) : 0;
+            if (proxy == ics20 && _controlsVersion(impl) < running) revert AuthorityLost(proxy);
             UUPSUpgradeable(proxy).upgradeToAndCall{ gas: CALL_GAS }(impl, call);
+            if (proxy == ics20 && _controlsVersion(ics20) < running) revert AuthorityLost(proxy);
             if (IAccessManaged(proxy).authority() != accessManager) revert AuthorityLost(proxy);
             if (proxy == ics20) {
                 if (IICS20Transfer(ics20).ics26() != router) revert AuthorityLost(proxy);
@@ -440,6 +445,12 @@ contract IBCAdminExec is IIBCAdmin {
         ) {
             revert AuthorityLost(proxy);
         }
+    }
+
+    /// @notice `gnoControlsVersion()` of `target`, zero if it does not answer one.
+    function _controlsVersion(address target) private view returns (uint256) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature("gnoControlsVersion()"));
+        return ok && ret.length == 32 ? abi.decode(ret, (uint256)) : 0;
     }
 
     /// @notice Runs a step of this executor as IBCAdmin in a call frame of its own (IBCAdmin.selfDelegate), so that

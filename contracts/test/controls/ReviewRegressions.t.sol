@@ -34,9 +34,11 @@ import {
     ReentrantToken,
     BeaconSwappingFork,
     AllowingExec,
-    HookToken
+    HookToken,
+    OlderFork
 } from "../utils/ControlsMocks.sol";
 import { ICS26Router } from "@eureka/ICS26Router.sol";
+import { ICS20Transfer } from "@eureka/ICS20Transfer.sol";
 import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
 import { Escrow } from "@eureka/utils/Escrow.sol";
@@ -1327,6 +1329,49 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(ctl.retryNotification{ gas: cap }(clientId, pkt.sequence, notice));
         assertEq(adapter.notices(), 1);
         assertEq(usdc.balanceOf(bob), 100);
+    }
+
+    /// @notice Round 5 #2: kind 7 never installs on the transfer proxy code that cannot keep the controls: the stock
+    /// ICS20Transfer (no probe) or an older fork is spent, with a live route alias, a reservation and an unpaid
+    /// refund in place; a compatible fork is installed.
+    function test_r5_2_upgradeToStockOrOlderTransfer_isRefused() public {
+        _setLimits(address(usdc), 1000, 1000, 10);
+        IICS26RouterMsgs.Packet memory sent = _send(alice, address(usdc), 100, clientId);
+        _ack(sent, bytes("{\"result\":\"AQ==\"}"));
+        _retire();
+        _proveDelivered(sent);
+        _settle(_item(sent.sequence, 3, 0));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9"); // a live route alias: gnoland-9 -> client-0
+        IICS26RouterMsgs.Packet memory owed = _send(alice, address(usdc), 100, "gnoland-9");
+        vm.warp(owed.timeoutTimestamp);
+        router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(owed, "", IICS02ClientMsgs.Height(0, 1)));
+        assertEq(uint8(ctl.sendRecord("gnoland-9", owed.sequence).payment), uint8(T.Payment.Queued), "unpaid");
+        assertEq(ctl.reserved(clientId, address(usdc)), 100);
+        bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+        bytes32 before = vm.load(address(ics20), implSlot);
+        address stock = address(new ICS20Transfer());
+        address controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
+        address older = address(new OlderFork(controls));
+        address fork = address(new GnoICS20Transfer(controls));
+        uint64 toStock = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), stock, stock.codehash, ""));
+        uint64 toOlder = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), older, older.codehash, ""));
+        uint64 toFork = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), fork, fork.codehash, ""));
+        _skip(7 days);
+        admin.execute(toStock);
+        admin.execute(toOlder);
+        assertEq(_state(toStock), S.SPENT);
+        assertEq(_state(toOlder), S.SPENT);
+        assertEq(vm.load(address(ics20), implSlot), before);
+        admin.execute(toFork);
+        assertEq(_state(toFork), S.EXECUTED);
+        // the controls stand: the alias, the reservation and the queued refund
+        assertEq(ctl.reserved("gnoland-9", address(usdc)), 100);
+        for (uint256 i = 0; i < 20 && ctl.sendRecord("gnoland-9", owed.sequence).refunded < 100; i++) {
+            _skip(1 days);
+            ctl.claim("gnoland-9", address(usdc), 1);
+        }
+        assertEq(ctl.sendRecord("gnoland-9", owed.sequence).refunded, 100);
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

@@ -679,6 +679,13 @@ contract GnoICS20Transfer is
     // view functions (IGnoICS20Controls) run in GnoICS20Controls, which `fallback` delegatecalls, so this contract
     // stays under EIP-170; both share GnoTransferStorage's layout.
 
+    /// @notice The version of the controls this implementation keeps (records, reservations, route aliases, the
+    /// controls' namespace). Kind 7 installs on the transfer proxy only an implementation answering at least the
+    /// running one's: never one that would drop the controls (the stock ICS20Transfer answers nothing).
+    function gnoControlsVersion() external pure virtual returns (uint256) {
+        return 1;
+    }
+
     /// @notice GnoICS20Controls, fixed with this implementation (its address is in this code, so a code hash of the
     /// implementation pins it).
     address public immutable CONTROLS;

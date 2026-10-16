@@ -186,3 +186,12 @@ contract HookToken is ERC20 {
         }
     }
 }
+
+/// @notice A fork that answers an older controls version than the running one (a downgrade).
+contract OlderFork is GnoICS20Transfer {
+    constructor(address controls) GnoICS20Transfer(controls) { }
+
+    function gnoControlsVersion() external pure override returns (uint256) {
+        return 0;
+    }
+}
