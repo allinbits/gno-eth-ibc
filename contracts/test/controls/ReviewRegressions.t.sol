@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { Vm } from "forge-std/Vm.sol";
+import { ERC20Mock } from "@openzeppelin-contracts/mocks/token/ERC20Mock.sol";
 import { IERC20 } from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessManager.sol";
 import { ISignatureTransfer } from "@uniswap/permit2/src/interfaces/ISignatureTransfer.sol";
@@ -752,6 +753,44 @@ contract ReviewRegressionsTest is ControlsFixture {
         adapter.setRefuse(false);
         assertTrue(ctl.retryNotification(clientId, pkt.sequence));
         assertEq(usdc.balanceOf(bob), 500);
+    }
+
+    /// @notice Round 3 #3: losses in 70 tokens: kind 13 (through IBCAdmin.execute, its fixed budget) starts the
+    /// reopening, anyone continues it in bounded batches, and the route opens with the last batch.
+    function test_r3_3_manyLossTokens_reopenInBatches() public {
+        uint256 n = 70;
+        T.SettleItem[] memory items = new T.SettleItem[](n);
+        address[] memory tokens = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ERC20Mock t = new ERC20Mock();
+            t.mint(alice, 10);
+            vm.prank(alice);
+            t.approve(address(ics20), type(uint256).max);
+            _setLimits(address(t), 100, 100, 100);
+            IICS26RouterMsgs.Packet memory pkt = _send(alice, address(t), 10, clientId);
+            _errorAck(pkt); // a forged refund, paid at once
+            items[i] = T.SettleItem(pkt.sequence, 4, 10);
+            tokens[i] = address(t);
+        }
+        _retire();
+        _settle(items);
+        uint64 seq = _decide(S.KIND_REOPEN, P.reopen("gnoland-9"));
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+        assertTrue(ctl.routeReopening(clientId));
+        assertTrue(ctl.routeClosed(clientId), "closed until the last batch");
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
+        vm.startPrank(bob); // anyone
+        while (ctl.routeReopening(clientId)) {
+            ctl.continueReopen(clientId, 16);
+        }
+        vm.stopPrank();
+        assertFalse(ctl.routeClosed(clientId));
+        for (uint256 i = 0; i < n; i++) {
+            assertEq(ctl.acceptedDeficit(clientId, tokens[i]), 10);
+        }
+        assertTrue(_isSuccessAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
     }
 
     // ============================================================== #20 send variants and reentrancy ==

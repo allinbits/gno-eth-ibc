@@ -163,9 +163,13 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice Points `newClientId` at `oldClientId`'s route, retires `oldClientId` and closes the route (constant
     /// work); kind 12 settles its records and kind 13 reopens it.
     function migrateRoute(string calldata oldClientId, string calldata newClientId) external;
-    /// @notice Kind 13: reopens a closed route, refused while any of its send records is open (`openRecords`);
-    /// every recorded loss not yet accepted becomes an accepted deficit.
+    /// @notice Kind 13: starts reopening a closed route, refused while any of its send records is open
+    /// (`openRecords`). Every recorded loss not yet accepted becomes an accepted deficit, in batches: the first here,
+    /// the rest by `continueReopen`; the route opens when the last batch completes.
     function reopenRoute(string calldata clientId) external;
+    /// @notice Accepts the next batch (at most 16 tokens) of a reopening route's deficits, and opens it after the
+    /// last. Permissionless.
+    function continueReopen(string calldata clientId, uint256 n) external;
     /// @notice Kind 12: applies reconciliation outcomes to send records of a retired client id, each at most once:
     /// 1 genuine refund: pay its remainder (`amount` must equal the amount less what was refunded, zero when it was
     /// paid in full, which only settles the record; parked if the token refuses), 2 reject a queued or parked refund,
@@ -212,6 +216,7 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function refundsHold(string calldata clientId) external view returns (IGuardians.Flag memory);
     function routePaused(string calldata clientId) external view returns (bool);
     function routeClosed(string calldata clientId) external view returns (bool);
+    function routeReopening(string calldata clientId) external view returns (bool);
     /// @notice Losses kind 12 recorded on the route for the token.
     function losses(string calldata clientId, address token) external view returns (uint256);
     /// @notice Escrow of the token reserved for the route's owed refunds (queued, parked or decided but unpaid).

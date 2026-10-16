@@ -422,6 +422,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
+    function routeReopening(string calldata clientId) external view delegated returns (bool) {
+        return _route(clientId).reopening;
+    }
+
+    /// @notice See IGnoICS20Controls.
     function openRecords(string calldata clientId) external view delegated returns (uint64) {
         return _route(clientId).openRecords;
     }

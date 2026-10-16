@@ -41,6 +41,9 @@ library GnoTransferStorage {
         uint64 openRecords;
         /// Tokens kind 12 recorded a loss of (each once), for kind 13's accepted deficits.
         address[] lossTokens;
+        /// Kind 13 under way: its deficits are accepted in batches from `deficitCursor`; the route opens with the last.
+        bool reopening;
+        uint64 deficitCursor;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.

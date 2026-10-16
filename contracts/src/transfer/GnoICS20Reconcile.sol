@@ -166,17 +166,37 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         emit GnoRefundRejected(clientId, sequence);
     }
 
+    /// @notice Deficits accepted per call: kind 13's first batch, and at most this per `continueReopen` call.
+    uint256 private constant REOPEN_BATCH = 16;
+
     /// @notice See IGnoICS20Controls.
     function reopenRoute(string calldata clientId) external delegated restricted {
         GnoTransferStorage.Route storage r = _route(clientId);
-        require(r.closed, GnoNotClosed(clientId));
+        require(r.closed && !r.reopening, GnoNotClosed(clientId));
         // every record of the retired ids reconciled first: no outstanding packet, no refund owed
         require(r.openRecords == 0, GnoRecordsOpen(clientId, r.openRecords));
+        r.reopening = true;
+        r.deficitCursor = 0;
+        _acceptDeficits(r, clientId, REOPEN_BATCH);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function continueReopen(string calldata clientId, uint256 n) external delegated nonReentrant {
+        GnoTransferStorage.Route storage r = _route(clientId);
+        require(r.reopening, GnoNotClosed(clientId));
+        _acceptDeficits(r, clientId, n > REOPEN_BATCH ? REOPEN_BATCH : n);
+    }
+
+    /// @notice Accepts as deficits up to `n` tokens' losses not yet accepted (ADR §7.9: a loss not recapitalized),
+    /// and opens the route when none is left.
+    function _acceptDeficits(GnoTransferStorage.Route storage r, string calldata clientId, uint256 n) private {
         string memory key = GnoTransferStorage.routeKey(clientId);
         bytes32 route = keccak256(bytes(key));
         GnoTransferStorage.Layout storage g = _g();
-        // a loss not recapitalized is accepted as the route's deficit by this decision (ADR §7.9)
-        for (uint256 i = 0; i < r.lossTokens.length; i++) {
+        uint256 i = r.deficitCursor;
+        uint256 end = r.lossTokens.length;
+        if (end > i + n) end = i + n;
+        for (; i < end; i++) {
             address token = r.lossTokens[i];
             uint256 open_ = g.losses[route][token] - g.acceptedDeficit[route][token];
             if (open_ != 0) {
@@ -184,8 +204,12 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 emit GnoDeficitAccepted(key, token, open_);
             }
         }
-        r.closed = false;
-        emit GnoRouteReopened(key);
+        r.deficitCursor = uint64(i);
+        if (i == r.lossTokens.length) {
+            r.reopening = false;
+            r.closed = false;
+            emit GnoRouteReopened(key);
+        }
     }
 
     /// @notice See IGnoICS20Controls.
