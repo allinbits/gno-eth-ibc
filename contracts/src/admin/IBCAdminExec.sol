@@ -128,9 +128,10 @@ contract IBCAdminExec is IIBCAdmin {
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_CLIENT) {
-            (uint8 op, string memory clientId,,, address lc,) =
+            (uint8 op, string memory clientId, string memory cp, bytes[] memory prefix, address lc,) =
                 abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
-            bool ok = (op == 1 || op == 2) && bytes(clientId).length != 0 && lc != address(0);
+            bool ok = (op == 1 || op == 2) && bytes(clientId).length != 0 && lc != address(0)
+                && S.canonicalCounterparty(cp, prefix);
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_UPGRADE) {
@@ -352,6 +353,15 @@ contract IBCAdminExec is IIBCAdmin {
             bytes32 codeHash
         ) = abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
         if (!_codeIs(lc, codeHash)) return "codehash";
+        // gno.land's exact prefix; a verifier swap keeps the client's counterparty
+        if (!S.canonicalCounterparty(counterpartyClientId, merklePrefix)) return "counterparty";
+        if (
+            op == 2
+                && keccak256(bytes(IICS02Client(router).getCounterparty(clientId).clientId))
+                    != keccak256(bytes(counterpartyClientId))
+        ) {
+            return "counterparty";
+        }
         // a retired client id is final: never migrated back to a live client (ADR §7.12)
         if (op == 2 && IGnoICS20Controls(ics20).isRetired(clientId)) return "retired";
         IICS02ClientMsgs.CounterpartyInfo memory info =

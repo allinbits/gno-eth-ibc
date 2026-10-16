@@ -182,6 +182,30 @@ contract IBCAdminRecoveryTest is ControlsFixture {
     }
 
     /// @notice #11: the attested client must follow gno.land's chain and still be usable when the recovery executes.
+    /// @notice Round 5 sweep (b): a proposal's counterparty must be canonical: gno.land's exact merkle prefix and a
+    /// well-formed client id.
+    function test_proposal_canonicalCounterpartyOnly() public {
+        lc.setStatus(true, false);
+        IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-7");
+        p.merklePrefix[1] = "/pv/vm:gno.land/r/evil/ibc/core:";
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.approveRecovery(p);
+        p = _proposal("gnoland-7");
+        bytes[] memory longer = new bytes[](3);
+        (longer[0], longer[1], longer[2]) = (p.merklePrefix[0], p.merklePrefix[1], bytes(""));
+        p.merklePrefix = longer;
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.approveRecovery(p);
+        p = _proposal("gnoland-7");
+        p.counterpartyClientId = "Ethereum-7";
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.approveRecovery(p);
+        _approve(0, _proposal("gnoland-7")); // canonical
+    }
+
     function test_attestedClient_sameChain_usableAtExecution() public {
         lc.setStatus(true, false);
         attested.setChainId("other-chain");

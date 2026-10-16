@@ -135,6 +135,23 @@ library IBCAdminStorage {
 
     // -------------------------------------------------------------------------------------------- the kinds --
 
+    /// @notice gno.land's IBC store and key prefix: the only counterparty merkle prefix a client may be given.
+    bytes internal constant GNO_STORE = "main";
+    bytes internal constant GNO_KEY_PREFIX = "/pv/vm:gno.land/r/aib/ibc/core:";
+
+    /// @notice A counterparty in canonical form: gno.land's exact merkle prefix, and a client id of 1 to 64
+    /// characters in [a-z0-9-].
+    function canonicalCounterparty(string memory clientId, bytes[] memory prefix) internal pure returns (bool) {
+        bytes memory b = bytes(clientId);
+        if (b.length == 0 || b.length > 64) return false;
+        for (uint256 i = 0; i < b.length; i++) {
+            bytes1 c = b[i];
+            if (!((c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "-")) return false;
+        }
+        return prefix.length == 2 && keccak256(prefix[0]) == keccak256(GNO_STORE)
+            && keccak256(prefix[1]) == keccak256(GNO_KEY_PREFIX);
+    }
+
     function knownKind(uint8 kind) internal pure returns (bool) {
         return kind >= KIND_CANCEL && kind <= KIND_REOPEN;
     }

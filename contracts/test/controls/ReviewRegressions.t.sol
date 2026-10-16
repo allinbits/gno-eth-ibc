@@ -1374,6 +1374,40 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.sendRecord("gnoland-9", owed.sequence).refunded, 100);
     }
 
+    /// @notice Round 5 sweep (b): kind 6 stores a counterparty only in canonical form: gno.land's exact merkle
+    /// prefix (spent at recording otherwise) and a well-formed client id; a verifier swap keeps the client's
+    /// counterparty (spent at execution otherwise).
+    function test_r5_b_kind6_canonicalCounterpartyOnly() public {
+        MockLightClient x = new MockLightClient();
+        bytes[] memory evil = _prefix();
+        evil[1] = "/pv/vm:gno.land/r/evil/ibc/core:";
+        bytes[] memory three = new bytes[](3);
+        (three[0], three[1], three[2]) = ("main", "/pv/vm:gno.land/r/aib/ibc/core:", "x");
+        bytes[] memory store = _prefix();
+        store[0] = "acc";
+        bytes[][3] memory bad = [evil, three, store];
+        for (uint256 i = 0; i < 3; i++) {
+            uint64 seq = admin.lastSeq() + 1;
+            bytes memory params = P.client(1, "gnoland-5", "ethereum-5", bad[i], address(x), address(x).codehash);
+            assertEq(_status(_recvGov(_env(seq, S.KIND_CLIENT, params))), S.STATUS_SPENT);
+        }
+        string[3] memory ids = ["", "Ethereum-5", "ethereum/5"];
+        for (uint256 i = 0; i < 3; i++) {
+            uint64 seq = admin.lastSeq() + 1;
+            bytes memory params = P.client(1, "gnoland-5", ids[i], _prefix(), address(x), address(x).codehash);
+            assertEq(_status(_recvGov(_env(seq, S.KIND_CLIENT, params))), S.STATUS_SPENT);
+        }
+        uint64 swap =
+            _decide(S.KIND_CLIENT, P.client(2, clientId, "ethereum-5", _prefix(), address(x), address(x).codehash));
+        uint64 add =
+            _decide(S.KIND_CLIENT, P.client(1, "gnoland-5", "ethereum-5", _prefix(), address(x), address(x).codehash));
+        _skip(7 days);
+        admin.execute(swap);
+        admin.execute(add);
+        assertEq(_state(swap), S.SPENT, "a swap keeps the counterparty");
+        assertEq(_state(add), S.EXECUTED);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {

@@ -70,6 +70,7 @@ contract IBCAdminRecovery is IIBCAdmin {
     function _usableClient(S.Layout storage l, RecoveryProposal memory rp) private view returns (bool) {
         address lc = rp.lightClient;
         if (!_isCode(lc) || lc.codehash != rp.codeHash) return false;
+        if (!S.canonicalCounterparty(rp.counterpartyClientId, rp.merklePrefix)) return false;
         (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSignature("getClientState()"));
         if (!ok) return false;
         IGnoLightClientMsgs.ClientState memory cs =
