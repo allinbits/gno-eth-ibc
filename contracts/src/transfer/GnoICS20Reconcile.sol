@@ -8,6 +8,7 @@ import { IIBCStore } from "@eureka/interfaces/IIBCStore.sol";
 import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { ILightClient } from "@eureka/interfaces/ILightClient.sol";
 import { ILightClientMsgs } from "@eureka/msgs/ILightClientMsgs.sol";
+import { IGnoLightClientStatus } from "../interfaces/IGnoLightClientStatus.sol";
 import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
 import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
@@ -103,6 +104,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(g.retired[clientId], GnoBadSettlement(type(uint256).max));
         bytes32 clientHash = keccak256(bytes(clientId));
         bytes32 route = GnoTransferStorage.routeHash(clientId);
+        // an outcome counts only while the client that proved it is still the route's active replacement
+        address active = _activeClient(clientId);
         for (uint256 i = 0; i < items.length; i++) {
             SettleItem calldata it = items[i];
             if (it.action == 5) {
@@ -111,7 +114,10 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             }
             SendRecord storage rec = g.records[clientHash][it.sequence];
             // a record (authenticated: written by the send or backfilled), settled at most once
-            require(rec.commitment != bytes32(0) && rec.settlement == 0, GnoBadSettlement(i));
+            require(
+                rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active,
+                GnoBadSettlement(i)
+            );
             // a record processed in the suspected compromise interval: one fewer to settle
             if (rec.processedBlock != 0 && rec.processedIndex >= g.routes[route].suspectStart) {
                 --g.routes[route].suspectOpen;
@@ -313,16 +319,18 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     {
         GnoTransferStorage.Layout storage g = _g();
         SendRecord storage rec = g.records[keccak256(bytes(packet.sourceClient))][packet.sequence];
-        require(
-            g.retired[packet.sourceClient] && rec.commitment != bytes32(0)
-                && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && rec.settlement == 0
-                && rec.proven == Proven.None,
-            GnoBadProof()
-        );
-        // through the route's replacement: its current client and that client's counterparty prefix
+        require(g.retired[packet.sourceClient], GnoBadProof());
+        // through the route's replacement: its current client, active, and that client's counterparty prefix
         string memory current = g.currentOf[GnoTransferStorage.routeKey(packet.sourceClient)];
         IICS02Client router = IICS02Client(GnoTransferStorage.ics20Router());
-        ILightClient lc = router.getClient(current);
+        ILightClient lc = ILightClient(_activeClient(packet.sourceClient));
+        // final once proven, unless its verifier is no longer the active replacement (the outcome is then void)
+        require(
+            address(lc) != address(0) && rec.commitment != bytes32(0)
+                && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && rec.settlement == 0
+                && (rec.proven == Proven.None || rec.provenBy != address(lc)),
+            GnoBadProof()
+        );
         bytes memory receiptPath = ICS24Host.packetReceiptCommitmentPathCalldata(packet.destClient, packet.sequence);
         if (proof.receipt == bytes32(0)) {
             uint256 time = lc.verifyNonMembership(
@@ -366,7 +374,16 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             }
         }
         rec.proven = proven;
+        rec.provenBy = address(lc);
         emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
+    }
+
+    /// @notice The route's replacement client if active (neither frozen nor expired), else zero.
+    function _activeClient(string memory clientId) private view returns (address) {
+        string memory current = _g().currentOf[GnoTransferStorage.routeKey(clientId)];
+        address lc = address(IICS02Client(GnoTransferStorage.ics20Router()).getClient(current));
+        if (IGnoLightClientStatus(lc).isFrozen() || IGnoLightClientStatus(lc).isExpired()) return address(0);
+        return lc;
     }
 
     /// @notice See IGnoICS20Controls.

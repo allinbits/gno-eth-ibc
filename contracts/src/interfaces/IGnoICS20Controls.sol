@@ -99,8 +99,11 @@ interface IGnoICS20ControlsTypes {
         uint8 settlement;
         /// Still open: an outstanding packet, or a refund owed (queued, parked) not settled by kind 12.
         bool open;
-        /// The destination outcome `proveOutcome` verified, which kind 12's actions 1-4 must match.
+        /// The destination outcome `proveOutcome` verified, which kind 12's actions 1-4 must match, and the light
+        /// client that verified it: void once that client is no longer the route's active one (frozen, expired, or
+        /// replaced), when kind 12 refuses it and a new proof may replace it.
         Proven proven;
+        address provenBy;
     }
 
     /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.

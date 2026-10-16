@@ -36,10 +36,9 @@ contract ProvenOutcomesTest is ControlsFixture {
     }
 
     function _receiptPath(IICS26RouterMsgs.Packet memory pkt) internal pure returns (bytes[] memory) {
-        return
-            ICS24Host.prefixedPath(
-                _prefix(), ICS24Host.packetReceiptCommitmentPathCalldata(pkt.destClient, pkt.sequence)
-            );
+        return ICS24Host.prefixedPath(
+            _prefix(), ICS24Host.packetReceiptCommitmentPathCalldata(pkt.destClient, pkt.sequence)
+        );
     }
 
     /// @notice The destination's state: `receipt` at the packet's receipt path and, if `ack` is not empty, its ack
@@ -251,5 +250,62 @@ contract ProvenOutcomesTest is ControlsFixture {
         assertEq(admin.decision(admin.epoch(), refund).state, S.SPENT);
         assertEq(admin.decision(admin.epoch(), delivered).state, S.EXECUTED);
         assertEq(usdc.balanceOf(alice), before);
+    }
+
+    /// @notice A non-receipt proven before the packet's timeout is refused; the packet is then received and proven
+    /// delivered. Final once proven: a later proof does not overwrite it.
+    function test_r4_4_absenceBeforeDelivery_thenDelivery() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        _replace();
+        bytes32 receipt = ctl.gnoReceipt(pkt);
+        lc9.setTimestamp(pkt.timeoutTimestamp - 1); // the destination's time at the proof height
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.proveOutcome(pkt, _proof(bytes32(0), ""));
+        _destination(pkt, receipt, OK); // received before its timeout
+        assertEq(uint8(ctl.proveOutcome(pkt, _proof(receipt, OK))), uint8(T.Proven.Delivered));
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.proveOutcome(pkt, _proof(receipt, OK));
+        _settleReverts(pkt.sequence, 1, 100);
+        _settle(pkt.sequence, 3, 0);
+    }
+
+    /// @notice The replacement client freezing between the proof and the settlement voids the outcome: kind 12 is
+    /// refused for it, all or nothing (spent through IBCAdmin), until a proof through an active client replaces it.
+    function test_r4_4_verifierFrozenBeforeSettlement_voidsTheOutcome() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 200, clientId);
+        _replace();
+        lc9.setTimestamp(b.timeoutTimestamp);
+        ctl.proveOutcome(a, _proof(bytes32(0), ""));
+        ctl.proveOutcome(b, _proof(bytes32(0), ""));
+        uint64 seq = admin.lastSeq() + 1;
+        P.SettleItem[] memory items = new P.SettleItem[](2);
+        items[0] = P.SettleItem(a.sequence, 1, 100);
+        items[1] = P.SettleItem(b.sequence, 1, 200);
+        assertEq(_status(_recvGov(_env(seq, S.KIND_SETTLE, P.settle(clientId, items)))), 1);
+        _skip(7 days);
+        lc9.setStatus(true, false); // frozen
+        uint256 before = usdc.balanceOf(alice);
+        admin.execute(seq);
+        assertEq(admin.decision(admin.epoch(), seq).state, S.SPENT);
+        assertEq(usdc.balanceOf(alice), before, "all or nothing");
+        // a frozen client proves nothing new either
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.proveOutcome(a, _proof(bytes32(0), ""));
+        // an expired one alike
+        lc9.setStatus(false, true);
+        _settleReverts(a.sequence, 1, 100);
+        // a verifier swap to an active client (kind 6 migrate): the void outcome is proven again through it
+        MockLightClient fresh = new MockLightClient();
+        IICS02ClientMsgs.CounterpartyInfo memory cp9 = router.getCounterparty("gnoland-9");
+        vm.prank(address(admin));
+        router.migrateClient("gnoland-9", cp9, address(fresh));
+        fresh.setTimestamp(a.timeoutTimestamp);
+        _settleReverts(a.sequence, 1, 100); // proven by the old verifier: void
+        ctl.proveOutcome(a, _proof(bytes32(0), ""));
+        _settle(a.sequence, 1, 100);
+        assertEq(usdc.balanceOf(alice), before + 100);
     }
 }
