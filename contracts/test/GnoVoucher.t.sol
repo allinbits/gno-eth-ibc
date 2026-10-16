@@ -10,6 +10,7 @@ import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 
 import { GnoVoucher } from "../src/GnoVoucher.sol";
+import { IGnoICS20ControlsTypes } from "../src/interfaces/IGnoICS20Controls.sol";
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 import { DeployGnoIBC } from "../script/DeployGnoIBC.s.sol";
 import { Fixtures } from "./utils/Fixtures.sol";
@@ -17,7 +18,16 @@ import { Fixtures } from "./utils/Fixtures.sol";
 /// @notice Exposes DeployGnoIBC's deployment, run with this contract as the deployer.
 contract DeployHarness is DeployGnoIBC {
     function deploy(Msgs.ClientState memory cs, Msgs.ConsensusState memory cons) external returns (Deployed memory) {
-        return _deploy(address(this), address(0), cs, cons, "ethereum-1");
+        Params memory p;
+        p.deployer = address(this);
+        p.clientState = cs;
+        p.consensusState = cons;
+        p.counterparty = "ethereum-1";
+        p.guardians = [address(0x1001), address(0x1002), address(0x1003), address(0x1004)];
+        p.watch = [address(0x1005), address(0x1006)];
+        p.gnotLimits = IGnoICS20ControlsTypes.Limits(25_000e6, 100_000e6, 100_000e6, 0, 0);
+        p.quarantineSeconds = 7 days;
+        return _deploy(p);
     }
 }
 
@@ -100,11 +110,35 @@ contract GnoVoucherTest is Fixtures {
         assertEq(IERC20Metadata(d.ugnotVoucher).totalSupply(), 500_000);
     }
 
-    function test_otherDenomsStillGetAnIBCERC20() public {
-        _recv("gno.land/r/demo/foo", 7);
-        address token = ics20.ibcERC20Contract("transfer/client-0/gno.land/r/demo/foo");
-        assertTrue(token != address(0) && token != d.ugnotVoucher);
-        assertEq(IERC20Metadata(token).balanceOf(RECEIVER), 7);
+    /// @notice Default deny (ADR E6): a gno.land denom without a registered voucher is refused, so no stock
+    /// 18-decimal IBCERC20 is ever created for it.
+    function test_otherDenomsAreRefused() public {
+        bytes memory data = abi.encode(
+            IICS20TransferMsgs.FungibleTokenPacketData({
+                denom: "gno.land/r/demo/foo", sender: GNO_ADDRESS, receiver: vm.toString(RECEIVER), amount: 7, memo: ""
+            })
+        );
+        vm.prank(d.ics26Router);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IGnoICS20ControlsTypes.GnoDenomNotRegistered.selector, "transfer/client-0/gno.land/r/demo/foo"
+            )
+        );
+        ics20.onRecvPacket(
+            IIBCAppCallbacks.OnRecvPacketCallback({
+                sourceClient: "ethereum-1",
+                destinationClient: d.clientId,
+                sequence: 1,
+                payload: IICS26RouterMsgs.Payload({
+                    sourcePort: ICS20Lib.DEFAULT_PORT_ID,
+                    destPort: ICS20Lib.DEFAULT_PORT_ID,
+                    version: ICS20Lib.ICS20_VERSION,
+                    encoding: ICS20Lib.ICS20_ENCODING,
+                    value: data
+                }),
+                relayer: address(this)
+            })
+        );
     }
 
     function test_onlyICS20MintsAndBurns() public {
