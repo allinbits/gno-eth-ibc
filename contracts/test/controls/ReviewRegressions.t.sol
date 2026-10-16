@@ -8,6 +8,8 @@ import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessMa
 import { ISignatureTransfer } from "@uniswap/permit2/src/interfaces/ISignatureTransfer.sol";
 
 import { IICS20Transfer } from "@eureka/interfaces/IICS20Transfer.sol";
+import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
+import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
@@ -389,7 +391,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         }
         // paid in full: the notification is due; anyone delivers it with its bytes (only its hash is stored)
         assertEq(adapter.notices(), 0);
-        assertTrue(ctl.retryNotification(clientId, seq, _errorNotice(pkt)));
+        assertTrue(ctl.retryNotification(clientId, seq, _errorNotice(pkt), 0));
         assertEq(adapter.notices(), 1);
         assertEq(usdc.balanceOf(bob), 500, "the adapter forwarded the paid refund");
     }
@@ -529,20 +531,20 @@ contract ReviewRegressionsTest is ControlsFixture {
         adapter.send(500, clientId);
         IICS26RouterMsgs.Packet memory pkt = _sentPacket();
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
-        ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt)); // nothing kept yet
+        ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt), 0); // nothing kept yet
         _timeout(pkt); // refund paid, notification refused
         assertEq(usdc.balanceOf(address(adapter)), 500);
-        assertFalse(ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt))); // still refusing: kept
+        assertFalse(ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt), 0)); // still refusing: kept
         adapter.setRefuse(false);
         bytes memory wrong = _errorNotice(pkt);
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
-        ctl.retryNotification(clientId, pkt.sequence, wrong); // not the notification kept
+        ctl.retryNotification(clientId, pkt.sequence, wrong, 0); // not the notification kept
         vm.prank(alice); // anyone
-        assertTrue(ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt)));
+        assertTrue(ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt), 0));
         assertEq(adapter.notices(), 1);
         assertEq(usdc.balanceOf(bob), 500, "forwarded the refund it was paid once");
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
-        ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt));
+        ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt), 0);
         assertEq(ctl.sendRecord(clientId, pkt.sequence).refunded, 500);
     }
 
@@ -808,10 +810,10 @@ contract ReviewRegressionsTest is ControlsFixture {
         adapter.setBurn(false);
         adapter.setRefuse(true);
         uint256 g = gasleft();
-        assertFalse(ctl.retryNotification(clientId, pkt.sequence, _errorNotice(pkt)));
+        assertFalse(ctl.retryNotification(clientId, pkt.sequence, _errorNotice(pkt), 0));
         assertLt(g - gasleft(), 1_000_000, "kept, not rewritten");
         adapter.setRefuse(false);
-        assertTrue(ctl.retryNotification(clientId, pkt.sequence, _errorNotice(pkt)));
+        assertTrue(ctl.retryNotification(clientId, pkt.sequence, _errorNotice(pkt), 0));
         assertEq(usdc.balanceOf(bob), 500);
     }
 
@@ -1053,7 +1055,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         for (uint256 i = 0; i < 6; i++) {
             assertEq(usdc.balanceOf(address(adapters[i])), 100, "refunded");
             assertEq(adapters[i].notices(), 0, "nothing delivered by the settlement");
-            assertTrue(ctl.retryNotification(clientId, seqs[i], _errorNotice(pkts[i])));
+            assertTrue(ctl.retryNotification(clientId, seqs[i], _errorNotice(pkts[i]), 0));
             assertEq(adapters[i].notices(), 1);
             assertEq(usdc.balanceOf(address(adapters[i])), 0, "forwarded on its notification");
         }
@@ -1076,22 +1078,22 @@ contract ReviewRegressionsTest is ControlsFixture {
         _settle(_item(pkt.sequence, 1, 100));
         assertEq(usdc.balanceOf(address(adapter)), 100);
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
-        ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt));
+        ctl.retryNotification(clientId, pkt.sequence, _timeoutNotice(pkt), 0);
         // a packet that is not the record's is refused
         IICS26RouterMsgs.Packet memory other = _sentPacketCopy(pkt);
         other.timeoutTimestamp += 1;
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
-        ctl.notifySettled(other);
+        ctl.notifySettled(other, "", 0);
         adapter.setRefuse(true);
         vm.prank(makeAddr("anyone"));
-        assertFalse(ctl.notifySettled(pkt));
+        assertFalse(ctl.notifySettled(pkt, "", 0));
         adapter.setRefuse(false);
         vm.prank(makeAddr("anyone"));
-        assertTrue(ctl.notifySettled(pkt));
+        assertTrue(ctl.notifySettled(pkt, "", 0));
         assertEq(adapter.notices(), 1);
         assertEq(usdc.balanceOf(bob), 100, "forwarded on the notification");
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
-        ctl.notifySettled(pkt); // once
+        ctl.notifySettled(pkt, "", 0); // once
     }
 
     function _sentPacketCopy(IICS26RouterMsgs.Packet memory p) internal pure returns (IICS26RouterMsgs.Packet memory) {
@@ -1327,7 +1329,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.claim{ gas: cap }(clientId, address(usdc), 1);
         assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Claimed));
         bytes memory notice = _errorNotice(pkt);
-        assertTrue(ctl.retryNotification{ gas: cap }(clientId, pkt.sequence, notice));
+        assertTrue(ctl.retryNotification{ gas: cap }(clientId, pkt.sequence, notice, 0));
         assertEq(adapter.notices(), 1);
         assertEq(usdc.balanceOf(bob), 100);
     }
@@ -1740,6 +1742,82 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(admin.drain(), 1);
         assertEq(admin.decision(admin.epoch(), tight).state, S.EXECUTED);
         assertEq(ctl.limits(clientId, address(usdc)).limits.maxPerMessage, 500);
+    }
+
+    /// @notice Round 7 #5: a sender whose callback needs more than the automatic 100,000 gas (it books six fresh
+    /// slots) is notified by a caller-funded retry with a larger budget; a caller sending too little reverts.
+    function test_r7_5_costlyCallback_retriedWithALargerBudget() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        adapter.setCost(6);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        _timeout(pkt); // paid at once; the automatic notification runs out of gas: kept
+        assertEq(adapter.notices(), 0);
+        bytes memory notice = _timeoutNotice(pkt);
+        assertFalse(ctl.retryNotification(clientId, pkt.sequence, notice, 0));
+        vm.expectRevert(T.GnoNotificationStarved.selector);
+        ctl.retryNotification{ gas: 300_000 }(clientId, pkt.sequence, notice, 400_000);
+        assertTrue(ctl.retryNotification(clientId, pkt.sequence, notice, 400_000));
+        assertEq(adapter.notices(), 1);
+        assertEq(usdc.balanceOf(bob), 100);
+    }
+
+    /// @notice Round 7 #6: a forged success ack whose notification failed is superseded when reconciliation proves
+    /// the packet refundable and pays it: the stale success can never be delivered; the refund is, once.
+    function test_r7_6_supersededSuccessNotification_neverDelivered() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        adapter.setRefuse(true);
+        bytes memory ok = bytes("{\"result\":\"AQ==\"}");
+        _ack(pkt, ok); // a forged success ack; its notification fails and is kept
+        adapter.setRefuse(false);
+        _retire();
+        _proveRefundable(pkt);
+        _settle(_item(pkt.sequence, 1, 100));
+        bytes memory stale = abi.encodeCall(
+            IIBCSenderCallbacks.onAckPacket,
+            (
+                true,
+                IIBCAppCallbacks.OnAcknowledgementPacketCallback(
+                    pkt.sourceClient, pkt.destClient, pkt.sequence, pkt.payloads[0], ok, address(this)
+                )
+            )
+        );
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence, stale, 0);
+        assertTrue(ctl.notifySettled(pkt, "", 0)); // the refund, the record's terminal notification
+        assertEq(adapter.notices(), 1);
+        assertEq(adapter.successes(), 0);
+        assertEq(usdc.balanceOf(bob), 100);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, "", 0);
+    }
+
+    /// @notice Round 7 #7: an outstanding packet that was delivered, settled by action 3, notifies its sender of the
+    /// success, with the ack proven for it, once.
+    function test_r7_7_deliveredOutstandingPacket_notifiedOfSuccess() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        _retire();
+        _proveDelivered(pkt);
+        _settle(_item(pkt.sequence, 3, 0));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, bytes("{\"result\":\"AA==\"}"), 0); // not the proven ack
+        assertTrue(ctl.notifySettled(pkt, bytes("{\"result\":\"AQ==\"}"), 0));
+        assertEq(adapter.successes(), 1);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, bytes("{\"result\":\"AQ==\"}"), 0);
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

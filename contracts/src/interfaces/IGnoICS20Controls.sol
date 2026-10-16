@@ -132,6 +132,8 @@ interface IGnoICS20ControlsTypes {
     error GnoBadModule();
     /// @notice Less gas left than a bounded refund payment needs: the caller starves it (retry with more gas).
     error GnoPaymentStarved();
+    /// @notice Less gas left than a caller-funded notification's budget and reserve.
+    error GnoNotificationStarved();
     error GnoRouteReopening(string clientId);
     error GnoRecordsOpen(string clientId, uint64 open);
     error GnoSuspectUnsettled(string clientId, uint64 open);
@@ -231,13 +233,30 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// the router's callback carried (`onAckPacket(success, msg)` or `onTimeoutPacket(msg)`, the router's message
     /// with the relayer of that ack or timeout), authenticated against it. Permissionless; it only calls the sender,
     /// never pays. Returns whether the sender took it (if not, it stays kept).
-    function retryNotification(string calldata clientId, uint64 sequence, bytes calldata call) external returns (bool);
+    /// `gasBudget`: the callback's gas, at least the automatic 100,000 (0: exactly that); the caller sends enough
+    /// for it and a reserve, or it reverts (`GnoNotificationStarved`).
+    function retryNotification(
+        string calldata clientId,
+        uint64 sequence,
+        bytes calldata call,
+        uint256 gasBudget
+    )
+        external
+        returns (bool);
 
-    /// @notice Permissionless: notifies the sender of a refund kind 12 paid (action 1, paid in full) for a packet
-    /// whose ack or timeout brought no refund notification (still outstanding, or a success ack). The packet is
-    /// authenticated against its send record's commitment; the notification is `onTimeoutPacket` (the packet was
-    /// not delivered), delivered once with capped gas; false if the sender reverted, and anyone calls again.
-    function notifySettled(IICS26RouterMsgs.Packet calldata packet) external returns (bool);
+    /// @notice Permissionless: delivers a settled record's terminal notification when kind 12 decided another kind
+    /// than its ack or timeout brought (or none): one terminal notification per record, decided by its final
+    /// outcome. Action 1 is a refund (`onTimeoutPacket`, once paid in full); actions 2-4 a success (`onAckPacket`
+    /// with `ack`, the success ack `proveOutcome` proved). The transport's notification is superseded at settlement.
+    /// The packet is authenticated against the record's commitment; delivered once, with `gasBudget` as in
+    /// `retryNotification`; false if the sender reverted, and anyone calls again.
+    function notifySettled(
+        IICS26RouterMsgs.Packet calldata packet,
+        bytes calldata ack,
+        uint256 gasBudget
+    )
+        external
+        returns (bool);
     /// @notice Makes the send record of a packet sent before the fork was installed, while the router still holds
     /// its commitment (which authenticates the packet). Permissionless.
     function backfill(IICS26RouterMsgs.Packet calldata packet) external;

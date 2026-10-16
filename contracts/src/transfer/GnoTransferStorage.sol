@@ -116,6 +116,9 @@ library GnoTransferStorage {
         /// Every receive, per (destination client id, inbound sequence), in one slot: the token released or minted
         /// (low 160 bits) and the amount (high 96 bits; zero once kind 12 booked it as a forged receive).
         mapping(bytes32 clientHash => mapping(uint64 sequence => uint256)) receives;
+        /// The hash of the success ack `proveOutcome` proved for a delivered record (the success notification a
+        /// reconciliation owes is built with it).
+        mapping(bytes32 clientHash => mapping(uint64 sequence => bytes32)) provenAck;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))
@@ -342,7 +345,23 @@ library GnoTransferStorage {
         private
         returns (bool ok)
     {
-        if (gasleft() >= CALLBACK_GAS * 64 / 63 + CALLBACK_RESERVE) (ok,) = sender.call{ gas: CALLBACK_GAS }(call);
+        return _deliverWith(sender, call, clientId, sequence, 0);
+    }
+
+    /// @notice As `_deliver`, with `budget` gas when non-zero (a caller-funded retry: at least CALLBACK_GAS, and
+    /// the caller must send enough for all of it and the reserve, or it reverts as starved).
+    function _deliverWith(
+        address sender,
+        bytes memory call,
+        string memory clientId,
+        uint64 sequence,
+        uint256 budget
+    )
+        private
+        returns (bool ok)
+    {
+        uint256 g = _budget(budget);
+        if (gasleft() >= g * 64 / 63 + CALLBACK_RESERVE) (ok,) = sender.call{ gas: g }(call);
         bytes32 h = keccak256(bytes(clientId));
         if (ok) layout().noticeDone[h][sequence] = true;
         else layout().notices[h][sequence] = keccak256(call);
@@ -355,7 +374,8 @@ library GnoTransferStorage {
         address sender,
         bytes memory call,
         string memory clientId,
-        uint64 sequence
+        uint64 sequence,
+        uint256 budget
     )
         internal
         returns (bool ok)
@@ -365,7 +385,8 @@ library GnoTransferStorage {
             layout().settledNoticeDone[h][sequence]
                 || !ERC165Checker.supportsInterface(sender, type(IIBCSenderCallbacks).interfaceId)
         ) revert IGnoICS20ControlsTypes.GnoNoNotification(clientId, sequence);
-        if (gasleft() >= CALLBACK_GAS * 64 / 63 + CALLBACK_RESERVE) (ok,) = sender.call{ gas: CALLBACK_GAS }(call);
+        uint256 g = _budget(budget);
+        (ok,) = sender.call{ gas: g }(call);
         if (ok) layout().settledNoticeDone[h][sequence] = true;
         emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
     }
@@ -377,7 +398,8 @@ library GnoTransferStorage {
         IGnoICS20ControlsTypes.SendRecord storage rec,
         string memory clientId,
         uint64 sequence,
-        bytes calldata call
+        bytes calldata call,
+        uint256 budget
     )
         internal
         returns (bool)
@@ -390,7 +412,31 @@ library GnoTransferStorage {
         if (kept == bytes32(0) || kept != keccak256(call) || layout().noticeDone[h][sequence] || !due) {
             revert IGnoICS20ControlsTypes.GnoNoNotification(clientId, sequence);
         }
-        return _deliver(rec.sender, call, clientId, sequence);
+        _budget(budget); // starved callers revert before anything
+        return _deliverWith(rec.sender, call, clientId, sequence, budget);
+    }
+
+    /// @notice A caller-funded notification's gas: `budget`, at least CALLBACK_GAS; reverts if the caller did not
+    /// send enough for it and the reserve (zero: the automatic CALLBACK_GAS, never reverting).
+    function _budget(uint256 budget) private view returns (uint256) {
+        if (budget == 0) return CALLBACK_GAS;
+        if (budget < CALLBACK_GAS) budget = CALLBACK_GAS;
+        if (gasleft() < budget * 64 / 63 + CALLBACK_RESERVE) revert IGnoICS20ControlsTypes.GnoNotificationStarved();
+        return budget;
+    }
+
+    /// @notice A record's transport notification kind (0 none, 1 success, 2 refund) and the terminal kind its
+    /// settlement decides (0 not settled; action 1 a refund, actions 2-4 a success: the packet was delivered).
+    function noticeKinds(IGnoICS20ControlsTypes.SendRecord storage rec)
+        internal
+        view
+        returns (uint8 transport, uint8 terminal)
+    {
+        IGnoICS20ControlsTypes.Outcome o = rec.outcome;
+        transport =
+            o == IGnoICS20ControlsTypes.Outcome.Success ? 1 : (o == IGnoICS20ControlsTypes.Outcome.Pending ? 0 : 2);
+        uint8 s = rec.settlement;
+        terminal = s == 0 ? 0 : (s == 1 ? 2 : 1);
     }
 
     /// @notice What a record may still be refunded: its amount less what was refunded.

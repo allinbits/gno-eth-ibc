@@ -180,6 +180,13 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             } else {
                 revert GnoBadSettlement(i);
             }
+            // one terminal notification per record: a settlement deciding another kind than the transport's
+            // supersedes the transport's (never delivered after); `notifySettled` delivers the settlement's
+            (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+            if (transport != terminal) {
+                if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
+                if (terminal == 1 || rec.payment == Payment.Claimed) emit GnoNotificationDue(clientId, it.sequence);
+            }
             GnoTransferStorage.closeRecord(rec, route);
             GnoTransferStorage.syncReserve(route, rec, reservedBefore);
             emit GnoSettled(clientId, it.sequence, action, it.amount);
@@ -418,6 +425,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         }
         rec.proven = proven;
         rec.provenBy = address(lc);
+        if (proven == Proven.Delivered) {
+            g.provenAck[keccak256(bytes(packet.sourceClient))][packet.sequence] = keccak256(proof.ack);
+        }
         rec.provenGen = g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen;
         emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
     }
@@ -445,32 +455,54 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     }
 
     /// @notice See IGnoICS20Controls.
-    function notifySettled(IICS26RouterMsgs.Packet calldata packet) external delegated nonReentrant returns (bool) {
-        SendRecord storage rec = _g().records[keccak256(bytes(packet.sourceClient))][packet.sequence];
+    function notifySettled(
+        IICS26RouterMsgs.Packet calldata packet,
+        bytes calldata ack,
+        uint256 gasBudget
+    )
+        external
+        delegated
+        nonReentrant
+        returns (bool)
+    {
+        bytes32 h = keccak256(bytes(packet.sourceClient));
+        SendRecord storage rec = _g().records[h][packet.sequence];
+        (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+        // the settlement's terminal outcome, when the transport brought another kind (or none): a refund once paid in
+        // full, or a success with the ack proven for it
         require(
-            rec.commitment != bytes32(0) && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment
-                && rec.settlement == 1 && rec.payment == Payment.Claimed
-                && (rec.outcome == Outcome.Pending || rec.outcome == Outcome.Success),
+            rec.commitment != bytes32(0) && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && terminal != 0
+                && terminal != transport
+                && (terminal == 2
+                        ? rec.payment == Payment.Claimed
+                        : keccak256(ack) == _g().provenAck[h][packet.sequence]),
             GnoNoNotification(packet.sourceClient, packet.sequence)
         );
-        return GnoTransferStorage.deliverSettled(
-            rec.sender,
-            abi.encodeCall(
+        bytes memory call = terminal == 2
+            ? abi.encodeCall(
                 IIBCSenderCallbacks.onTimeoutPacket,
                 (IIBCAppCallbacks.OnTimeoutPacketCallback(
                         packet.sourceClient, packet.destClient, packet.sequence, packet.payloads[0], msg.sender
                     ))
-            ),
-            packet.sourceClient,
-            packet.sequence
-        );
+            )
+            : abi.encodeCall(
+                IIBCSenderCallbacks.onAckPacket,
+                (
+                    true,
+                    IIBCAppCallbacks.OnAcknowledgementPacketCallback(
+                        packet.sourceClient, packet.destClient, packet.sequence, packet.payloads[0], ack, msg.sender
+                    )
+                )
+            );
+        return GnoTransferStorage.deliverSettled(rec.sender, call, packet.sourceClient, packet.sequence, gasBudget);
     }
 
     /// @notice See IGnoICS20Controls.
     function retryNotification(
         string calldata clientId,
         uint64 sequence,
-        bytes calldata call
+        bytes calldata call,
+        uint256 gasBudget
     )
         external
         delegated
@@ -478,6 +510,6 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         returns (bool)
     {
         SendRecord storage rec = _g().records[keccak256(bytes(clientId))][sequence];
-        return GnoTransferStorage.retryNotice(rec, clientId, sequence, call);
+        return GnoTransferStorage.retryNotice(rec, clientId, sequence, call, gasBudget);
     }
 }

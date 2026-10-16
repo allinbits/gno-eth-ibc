@@ -85,18 +85,37 @@ contract SenderAdapter is IIBCSenderCallbacks {
         );
     }
 
+    /// @notice Fresh storage slots each callback writes (a bookkeeping adapter needing more than 100,000 gas).
+    uint256 public cost;
+    uint256 public successes;
+    mapping(uint256 => uint256) internal book;
+
+    function setCost(uint256 c) external {
+        cost = c;
+    }
+
+    function _book() private {
+        uint256 base = notices << 32;
+        for (uint256 i = 0; i < cost; i++) {
+            book[base + i] = i + 1;
+        }
+    }
+
     function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external {
         while (burn) { } // burns all the gas it is given
         require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
+        _book();
         notices++;
-        if (!success) _forward();
+        if (success) successes++;
+        else _forward();
     }
 
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {
         while (burn) { }
         require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
+        _book();
         notices++;
         _forward();
     }
