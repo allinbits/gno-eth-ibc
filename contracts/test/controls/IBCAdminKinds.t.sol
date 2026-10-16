@@ -14,6 +14,7 @@ import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
 import { GnoVoucher } from "../../src/GnoVoucher.sol";
 import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
+import { GnoICS20Reconcile } from "../../src/transfer/GnoICS20Reconcile.sol";
 import { IGnoICS20Controls, IGnoICS20ControlsTypes as T } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IGuardians } from "../../src/interfaces/IGuardians.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
@@ -340,7 +341,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     // =============================================================================================== kind 7 ==
 
     function test_kind7_upgradesTheTransferApp() public {
-        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
+        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
         uint64 seq = _decidePending(S.KIND_UPGRADE, P.upgrade(address(ics20), impl, impl.codehash, ""));
         _executeAfterWeek(seq);
         assertEq(_state(seq), S.EXECUTED);
@@ -370,7 +371,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     }
 
     function test_kind7_checks() public {
-        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
+        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
         uint64 notAProxy = _decidePending(S.KIND_UPGRADE, P.upgrade(address(usdc), impl, impl.codehash, ""));
         uint64 wrongHash = _decidePending(S.KIND_UPGRADE, P.upgrade(address(ics20), impl, bytes32(uint256(7)), ""));
         // a call that reverts (re-running the one-time initializer): the upgrade rolls back whole and is spent
@@ -396,8 +397,8 @@ contract IBCAdminKindsTest is ControlsFixture {
     }
 
     function test_kind7_nestedUpgradeRefused() public {
-        address a = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
-        address b = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
+        address a = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
+        address b = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
         bytes memory nested = abi.encodeWithSignature("upgradeToAndCall(address,bytes)", b, "");
         bytes[] memory calls = new bytes[](1);
         calls[0] = nested;

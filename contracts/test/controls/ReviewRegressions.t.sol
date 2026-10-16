@@ -16,6 +16,7 @@ import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
 import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
+import { GnoICS20Reconcile } from "../../src/transfer/GnoICS20Reconcile.sol";
 import { IGnoICS20ControlsTypes as T } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IGuardians } from "../../src/interfaces/IGuardians.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
@@ -173,7 +174,7 @@ contract ReviewRegressionsTest is ControlsFixture {
     }
 
     function test_r2_gasSweep_upgradeSelfStep() public {
-        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
+        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
         uint64 seq = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), impl, impl.codehash, ""));
         _skip(7 days);
         for (uint256 g = 100_000; g < 6_000_000; g += 100_000) {

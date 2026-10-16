@@ -19,6 +19,7 @@ import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { GnoLightClient } from "../src/GnoLightClient.sol";
 import { GnoICS20Transfer } from "../src/GnoICS20Transfer.sol";
 import { GnoICS20Controls } from "../src/transfer/GnoICS20Controls.sol";
+import { GnoICS20Reconcile } from "../src/transfer/GnoICS20Reconcile.sol";
 import { IGnoICS20Controls, IGnoICS20ControlsTypes } from "../src/interfaces/IGnoICS20Controls.sol";
 import { IIBCAdmin } from "../src/interfaces/IIBCAdmin.sol";
 import { IBCAdmin } from "../src/admin/IBCAdmin.sol";
@@ -228,7 +229,7 @@ contract DeployGnoIBC is Script {
         );
         _setRoles(am, d, p.relayer);
 
-        d.ics20Controls = address(new GnoICS20Controls());
+        d.ics20Controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
         d.ics20Implementation = address(new GnoICS20Transfer(d.ics20Controls));
         address[6] memory keys =
             [p.guardians[0], p.guardians[1], p.guardians[2], p.guardians[3], p.watch[0], p.watch[1]];

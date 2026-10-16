@@ -205,4 +205,37 @@ library GnoTransferStorage {
         uint256 cap = rec.settlement == 1 ? rec.entitlement : rec.amount;
         return cap > rec.refunded ? cap - rec.refunded : 0;
     }
+
+    // ------------------------------------------------------------------------- eureka's ICS20Transfer state --
+
+    /// @notice eureka ICS20Transfer's ERC-7201 namespace (`ibc.storage.ICS20Transfer`): `_escrows`,
+    /// `_ibcERC20Contracts`, `_ibcERC20Denoms`, `_ics26`, ...
+    uint256 internal constant ICS20_SLOT = 0x823f7a8ea9ae6df0eb03ec5e1682d7a2839417ad8a91774118e6acf2e8d2f800;
+
+    /// @notice `_ics26`, the router.
+    function ics20Router() internal view returns (address router) {
+        uint256 slot = ICS20_SLOT + 3;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            router := sload(slot)
+        }
+    }
+
+    /// @notice `_ibcERC20Contracts[denom]`.
+    function ics20Registered(string memory denom) internal view returns (address token) {
+        bytes32 slot = keccak256(abi.encodePacked(denom, ICS20_SLOT + 1));
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            token := sload(slot)
+        }
+    }
+
+    /// @notice `_escrows[key]`.
+    function ics20Escrow(string memory key) internal view returns (address escrow) {
+        bytes32 slot = keccak256(abi.encodePacked(key, ICS20_SLOT));
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            escrow := sload(slot)
+        }
+    }
 }
