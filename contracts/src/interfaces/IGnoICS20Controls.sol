@@ -127,6 +127,7 @@ interface IGnoICS20ControlsTypes {
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
     error GnoBadProof();
+    error GnoRouteReopening(string clientId);
     error GnoRecordsOpen(string clientId, uint64 open);
     error GnoSuspectUnsettled(string clientId, uint64 open);
     error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
@@ -168,6 +169,9 @@ interface IGnoICS20ControlsTypes {
     /// @notice Kind 13 accepted a recorded loss not recapitalized as a deficit of the route (ADR §7.9).
     event GnoDeficitAccepted(string routeKey, address indexed token, uint256 amount);
     event GnoBackfilled(string clientId, uint64 indexed sequence, bytes32 commitment);
+    /// @notice A reopening found a prerequisite broken at its last batch (a record opened meanwhile): the route
+    /// stays closed, for kind 12 and a new kind 13.
+    event GnoReopenAborted(string routeKey);
     event GnoOutcomeProven(string clientId, uint64 indexed sequence, Proven proven);
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).

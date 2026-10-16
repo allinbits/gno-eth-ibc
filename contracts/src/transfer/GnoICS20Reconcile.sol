@@ -104,6 +104,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(g.retired[clientId], GnoBadSettlement(type(uint256).max));
         bytes32 clientHash = keccak256(bytes(clientId));
         bytes32 route = GnoTransferStorage.routeHash(clientId);
+        // sealed while a reopening accepts the deficits: the loss ledger it walks never changes behind it
+        require(!g.routes[route].reopening, GnoRouteReopening(clientId));
         // an outcome counts only while the client that proved it is still the route's active replacement
         address active = _activeClient(clientId);
         for (uint256 i = 0; i < items.length; i++) {
@@ -253,6 +255,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         r.deficitCursor = uint64(i);
         if (i == r.lossTokens.length) {
             r.reopening = false;
+            // every prerequisite again before the route opens: nothing opened or became suspect meanwhile
+            if (r.openRecords != 0 || r.suspectOpen != 0) {
+                emit GnoReopenAborted(key);
+                return;
+            }
             r.closed = false;
             emit GnoRouteReopened(key);
         }

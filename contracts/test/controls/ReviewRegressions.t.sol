@@ -1126,6 +1126,108 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 100);
     }
 
+    // ====================================================================================== round 5 ==
+
+    /// @notice Round 5 #4: losses in 17 tokens; kind 13 accepts 16, then a matured kind 12 would add a loss to the
+    /// first token behind the cursor. Reconciliation is sealed while the route reopens: that kind 12 is spent, and
+    /// the route opens with every loss accepted.
+    function test_r5_4_settlementSealedWhileReopening() public {
+        uint256 n = 17;
+        T.SettleItem[] memory items = new T.SettleItem[](n);
+        ERC20Mock[] memory tokens = new ERC20Mock[](n);
+        IICS26RouterMsgs.Packet[] memory pkts = new IICS26RouterMsgs.Packet[](n);
+        for (uint256 i = 0; i < n; i++) {
+            tokens[i] = new ERC20Mock();
+            tokens[i].mint(alice, 20);
+            vm.prank(alice);
+            tokens[i].approve(address(ics20), type(uint256).max);
+            _setLimits(address(tokens[i]), 100, 100, 100);
+            pkts[i] = _send(alice, address(tokens[i]), 10, clientId);
+            _errorAck(pkts[i]); // a forged refund, paid at once
+            items[i] = T.SettleItem(pkts[i].sequence, 4, 10);
+        }
+        IICS26RouterMsgs.Packet memory late = _send(alice, address(tokens[0]), 10, clientId);
+        _errorAck(late); // another forged refund of the first token, settled late
+        _retire();
+        for (uint256 i = 0; i < n; i++) {
+            _proveDelivered(pkts[i]);
+        }
+        _proveDelivered(late);
+        _settle(items);
+        uint64 reopen = _decide(S.KIND_REOPEN, P.reopen("gnoland-9"));
+        uint64 settleLate = _decide(S.KIND_SETTLE, P.settle1(clientId, late.sequence, 4, 10));
+        _skip(7 days);
+        admin.execute(reopen);
+        assertTrue(ctl.routeReopening(clientId));
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRouteReopening.selector, clientId));
+        ctl.settleRecords(clientId, _item(late.sequence, 4, 10));
+        admin.execute(settleLate);
+        assertEq(_state(settleLate), S.SPENT, "sealed while reopening");
+        ctl.continueReopen(clientId, 16);
+        assertFalse(ctl.routeClosed(clientId));
+        for (uint256 i = 0; i < n; i++) {
+            assertEq(ctl.acceptedDeficit(clientId, address(tokens[i])), ctl.losses(clientId, address(tokens[i])));
+        }
+    }
+
+    /// @notice Round 5 #4: a prerequisite broken during the reopening (a legacy packet backfilled on the retired id
+    /// opens a record) is found again before the route opens: it stays closed, for kind 12 and a new kind 13.
+    function test_r5_4_reopeningRechecksBeforeOpening() public {
+        uint256 n = 17;
+        T.SettleItem[] memory items = new T.SettleItem[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ERC20Mock t = new ERC20Mock();
+            t.mint(alice, 10);
+            vm.prank(alice);
+            t.approve(address(ics20), type(uint256).max);
+            _setLimits(address(t), 100, 100, 100);
+            IICS26RouterMsgs.Packet memory pkt = _send(alice, address(t), 10, clientId);
+            _errorAck(pkt);
+            items[i] = T.SettleItem(pkt.sequence, 4, 10);
+            _retireLater(pkt);
+        }
+        _retire();
+        for (uint256 i = 0; i < n; i++) {
+            _proveDelivered(_later[i]);
+        }
+        _settle(items);
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertTrue(ctl.routeReopening(clientId));
+        // a packet the router holds without a record (sent before the fork) is backfilled on the retired id
+        IICS20TransferMsgs.FungibleTokenPacketData memory data = IICS20TransferMsgs.FungibleTokenPacketData({
+            denom: Strings.toHexString(address(usdc)),
+            sender: Strings.toHexString(alice),
+            receiver: GNO_SENDER,
+            amount: 5,
+            memo: ""
+        });
+        IICS26RouterMsgs.Payload memory pl = IICS26RouterMsgs.Payload(
+            ICS20Lib.DEFAULT_PORT_ID,
+            ICS20Lib.DEFAULT_PORT_ID,
+            ICS20Lib.ICS20_VERSION,
+            ICS20Lib.ICS20_ENCODING,
+            abi.encode(data)
+        );
+        uint64 timeout = uint64(_now() + 600);
+        vm.prank(address(ics20));
+        uint64 seq = router.sendPacket(IICS26RouterMsgs.MsgSendPacket(clientId, timeout, pl));
+        IICS26RouterMsgs.Payload[] memory pls = new IICS26RouterMsgs.Payload[](1);
+        pls[0] = pl;
+        ctl.backfill(IICS26RouterMsgs.Packet(seq, clientId, CP, timeout, pls));
+        assertEq(ctl.openRecords(clientId), 1);
+        ctl.continueReopen(clientId, 16);
+        assertFalse(ctl.routeReopening(clientId));
+        assertTrue(ctl.routeClosed(clientId), "stays closed");
+    }
+
+    IICS26RouterMsgs.Packet[] internal _later;
+
+    function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {
+        _later.push(pkt);
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {
