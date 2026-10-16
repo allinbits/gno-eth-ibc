@@ -526,6 +526,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         uint64 early = _decidePending(S.KIND_REOPEN, P.reopen("gnoland-2"));
         _executeAfterWeek(early);
         assertEq(_state(early), S.SPENT);
+        _proveDelivered(out);
         uint64 settle = _decidePending(S.KIND_SETTLE, P.settle1(clientId, out.sequence, 3, 0));
         uint64 reopen = _decidePending(S.KIND_REOPEN, P.reopen("gnoland-2"));
         _skip(7 days);

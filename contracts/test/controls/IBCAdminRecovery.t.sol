@@ -260,6 +260,7 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertTrue(ctl.routeClosed("gnoland-7"));
         assertTrue(_isErrorAck(_transferIn("gnoland-7", "ugnot", 5, bob)));
         uint256 before = usdc.balanceOf(alice);
+        _proveRefundable(inFlight);
         assertEq(
             _status(_recvGov(_env(1, S.KIND_SETTLE, P.settle1(clientId, inFlight.sequence, 1, 100)))), S.STATUS_RECORDED
         );

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IGuardians } from "./IGuardians.sol";
 
 /// @title The types, errors and events of the controls GnoICS20Transfer adds to eureka's ICS20Transfer (ADR pr6375
@@ -34,6 +35,27 @@ interface IGnoICS20ControlsTypes {
         Success,
         ErrorAck,
         Timeout
+    }
+
+    /// @notice A send record's destination outcome, proven through the route's replacement client (`proveOutcome`,
+    /// ADR §7.12): delivered (its receipt and a success ack), refundable (an error ack, or no receipt once it can no
+    /// longer be received), or a collision (another packet's receipt at its sequence: the honest one is refundable).
+    enum Proven {
+        None,
+        Delivered,
+        Refundable,
+        Collision
+    }
+
+    /// @notice The destination's state for one packet at `proofHeight`: its receipt with a membership proof and its
+    /// app acknowledgement with a membership proof of the ack commitment; or `receipt` zero and a non-membership
+    /// proof of the receipt (`ack`, `ackProof` unused). A receipt other than the packet's needs no ack.
+    struct OutcomeProof {
+        IICS02ClientMsgs.Height proofHeight;
+        bytes32 receipt;
+        bytes receiptProof;
+        bytes ack;
+        bytes ackProof;
     }
 
     /// @notice The refund state of a send record: none owed, paid at once, queued under the refund meter or the
@@ -77,6 +99,8 @@ interface IGnoICS20ControlsTypes {
         uint8 settlement;
         /// Still open: an outstanding packet, or a refund owed (queued, parked) not settled by kind 12.
         bool open;
+        /// The destination outcome `proveOutcome` verified, which kind 12's actions 1-4 must match.
+        Proven proven;
     }
 
     /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.
@@ -99,6 +123,7 @@ interface IGnoICS20ControlsTypes {
     error GnoBadSettlement(uint256 item);
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
+    error GnoBadProof();
     error GnoRecordsOpen(string clientId, uint64 open);
     error GnoSuspectUnsettled(string clientId, uint64 open);
     error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
@@ -140,6 +165,7 @@ interface IGnoICS20ControlsTypes {
     /// @notice Kind 13 accepted a recorded loss not recapitalized as a deficit of the route (ADR §7.9).
     event GnoDeficitAccepted(string routeKey, address indexed token, uint256 amount);
     event GnoBackfilled(string clientId, uint64 indexed sequence, bytes32 commitment);
+    event GnoOutcomeProven(string clientId, uint64 indexed sequence, Proven proven);
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).
     event GnoSenderNotified(string clientId, uint64 indexed sequence, bool ok);
@@ -199,6 +225,21 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice Makes the send record of a packet sent before the fork was installed, while the router still holds
     /// its commitment (which authenticates the packet). Permissionless.
     function backfill(IICS26RouterMsgs.Packet calldata packet) external;
+
+    /// @notice Permissionless: proves a send record's destination outcome through its route's replacement client
+    /// (the route's current client id; the record's client id must be retired). The packet is authenticated against
+    /// the record's commitment; gno.land's receipt is recomputed from it (R19: sha256(0x03 | uint64be(sequence) |
+    /// sha256(sourceClient) | packet commitment)) and compared with the proven one. A non-receipt counts only once
+    /// the proven time reaches the packet's timeout (it can then never be received). Proven once, before kind 12.
+    function proveOutcome(
+        IICS26RouterMsgs.Packet calldata packet,
+        OutcomeProof calldata proof
+    )
+        external
+        returns (Proven);
+
+    /// @notice gno.land's receipt value for `packet` (ADR R19; `types.CommitPacketReceipt` in gno-realms).
+    function gnoReceipt(IICS26RouterMsgs.Packet calldata packet) external pure returns (bytes32);
 
     // ------------------------------------------------------------------------------------------- guardians --
 

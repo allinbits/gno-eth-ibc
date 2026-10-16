@@ -598,6 +598,7 @@ contract GnoICS20TransferTest is ControlsFixture {
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, "gnoland-9", 1));
         ctl.reopenRoute("gnoland-9");
+        _proveDelivered(out);
         T.SettleItem[] memory items = new T.SettleItem[](1);
         items[0] = T.SettleItem(out.sequence, 3, 0); // reconciled: delivered
         vm.startPrank(address(admin));

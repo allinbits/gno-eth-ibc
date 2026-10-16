@@ -38,11 +38,28 @@ contract MockLightClient is ILightClient {
         return ILightClientMsgs.UpdateResult.Update;
     }
 
-    function verifyMembership(ILightClientMsgs.MsgVerifyMembership calldata) external view returns (uint256) {
+    /// @notice Strict mode: proves only the (path, value) pairs set, and the absence of every other path.
+    bool public strict;
+    mapping(bytes32 path => bytes32 value) internal members;
+
+    function setStrict(bool s) external {
+        strict = s;
+    }
+
+    function setMember(bytes[] memory path, bytes memory value) external {
+        members[keccak256(abi.encode(path))] = keccak256(value);
+    }
+
+    function verifyMembership(ILightClientMsgs.MsgVerifyMembership calldata m) external view returns (uint256) {
+        if (strict) {
+            bytes32 v = members[keccak256(abi.encode(m.path))];
+            require(v != bytes32(0) && v == keccak256(m.value), "membership not proven");
+        }
         return timestamp == 0 ? block.timestamp : timestamp;
     }
 
-    function verifyNonMembership(ILightClientMsgs.MsgVerifyNonMembership calldata) external view returns (uint256) {
+    function verifyNonMembership(ILightClientMsgs.MsgVerifyNonMembership calldata m) external view returns (uint256) {
+        if (strict) require(members[keccak256(abi.encode(m.path))] == bytes32(0), "non-membership not proven");
         return timestamp == 0 ? block.timestamp : timestamp;
     }
 

@@ -5,6 +5,9 @@ import { ReentrancyGuardTransient } from "@openzeppelin-contracts/utils/Reentran
 import { AccessManagedUpgradeable } from "@openzeppelin-upgradeable/access/manager/AccessManagedUpgradeable.sol";
 
 import { IIBCStore } from "@eureka/interfaces/IIBCStore.sol";
+import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
+import { ILightClient } from "@eureka/interfaces/ILightClient.sol";
+import { ILightClientMsgs } from "@eureka/msgs/ILightClientMsgs.sol";
 import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
 import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
@@ -120,7 +123,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 // a genuine refund: its whole remainder, never cut short (ADR §7.9); zero when it was already paid in
                 // full, which only settles the record
                 uint256 left = rec.amount - rec.refunded;
-                require(it.amount == left, GnoBadSettlement(i));
+                // proven not delivered: an error ack, never receivable, or another packet at its sequence
+                require(
+                    it.amount == left && (rec.proven == Proven.Refundable || rec.proven == Proven.Collision),
+                    GnoBadSettlement(i)
+                );
                 rec.settlement = 1;
                 if (left != 0) {
                     if (GnoTransferStorage.tryPayRefund(rec, left)) {
@@ -136,14 +143,17 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             } else if (action == 2 || action == 3) {
                 // a refund already (partly) paid can only be settled as forged (action 4, which books the loss) or
                 // genuine (action 1)
-                require((action == 3 || owed) && rec.refunded == 0, GnoBadSettlement(i));
+                require(
+                    (action == 3 || owed) && rec.refunded == 0 && rec.proven == Proven.Delivered, GnoBadSettlement(i)
+                );
                 rec.settlement = action;
                 if (owed) _reject(rec, clientId, it.sequence);
             } else if (action == 4) {
                 // a forged refund (of a packet that was delivered): its unpaid remainder is rejected and what was
                 // already paid is the loss, at once
                 require(
-                    (rec.outcome == Outcome.ErrorAck || rec.outcome == Outcome.Timeout) && it.amount == rec.refunded,
+                    (rec.outcome == Outcome.ErrorAck || rec.outcome == Outcome.Timeout) && it.amount == rec.refunded
+                        && rec.proven == Proven.Delivered,
                     GnoBadSettlement(i)
                 );
                 rec.settlement = 4;
@@ -280,6 +290,83 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         rec.legacy = true;
         GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function gnoReceipt(IICS26RouterMsgs.Packet calldata packet) public pure returns (bytes32) {
+        return sha256(
+            abi.encodePacked(
+                uint8(3), packet.sequence, sha256(bytes(packet.sourceClient)), ICS24Host.packetCommitmentBytes32(packet)
+            )
+        );
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function proveOutcome(
+        IICS26RouterMsgs.Packet calldata packet,
+        OutcomeProof calldata proof
+    )
+        external
+        delegated
+        nonReentrant
+        returns (Proven proven)
+    {
+        GnoTransferStorage.Layout storage g = _g();
+        SendRecord storage rec = g.records[keccak256(bytes(packet.sourceClient))][packet.sequence];
+        require(
+            g.retired[packet.sourceClient] && rec.commitment != bytes32(0)
+                && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && rec.settlement == 0
+                && rec.proven == Proven.None,
+            GnoBadProof()
+        );
+        // through the route's replacement: its current client and that client's counterparty prefix
+        string memory current = g.currentOf[GnoTransferStorage.routeKey(packet.sourceClient)];
+        IICS02Client router = IICS02Client(GnoTransferStorage.ics20Router());
+        ILightClient lc = router.getClient(current);
+        bytes memory receiptPath = ICS24Host.packetReceiptCommitmentPathCalldata(packet.destClient, packet.sequence);
+        if (proof.receipt == bytes32(0)) {
+            uint256 time = lc.verifyNonMembership(
+                ILightClientMsgs.MsgVerifyNonMembership(
+                    proof.receiptProof,
+                    proof.proofHeight,
+                    ICS24Host.prefixedPath(router.getCounterparty(current).merklePrefix, receiptPath)
+                )
+            );
+            // not received, and past its timeout: never receivable
+            require(time >= packet.timeoutTimestamp, GnoBadProof());
+            proven = Proven.Refundable;
+        } else {
+            lc.verifyMembership(
+                ILightClientMsgs.MsgVerifyMembership(
+                    proof.receiptProof,
+                    proof.proofHeight,
+                    ICS24Host.prefixedPath(router.getCounterparty(current).merklePrefix, receiptPath),
+                    abi.encodePacked(proof.receipt)
+                )
+            );
+            if (proof.receipt != gnoReceipt(packet)) {
+                proven = Proven.Collision;
+            } else {
+                bytes[] memory acks = new bytes[](1);
+                acks[0] = proof.ack;
+                lc.verifyMembership(
+                    ILightClientMsgs.MsgVerifyMembership(
+                        proof.ackProof,
+                        proof.proofHeight,
+                        ICS24Host.prefixedPath(
+                            router.getCounterparty(current).merklePrefix,
+                            ICS24Host.packetAcknowledgementCommitmentPathCalldata(packet.destClient, packet.sequence)
+                        ),
+                        abi.encodePacked(ICS24Host.packetAcknowledgementCommitmentBytes32(acks))
+                    )
+                );
+                proven = keccak256(proof.ack) == ICS24Host.KECCAK256_UNIVERSAL_ERROR_ACK
+                    ? Proven.Refundable
+                    : Proven.Delivered;
+            }
+        }
+        rec.proven = proven;
+        emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
     }
 
     /// @notice See IGnoICS20Controls.

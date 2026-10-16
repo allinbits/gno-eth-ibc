@@ -93,6 +93,8 @@ contract IntegrationTest is ControlsFixture {
         ctl.claim("gnoland-2", address(usdc), 10);
         assertTrue(_isErrorAck(_transferIn("gnoland-2", "ugnot", 5e6, bob)));
         // reconciliation (kind 12): b and c were never delivered, their refunds are paid by decision; then kind 13
+        _proveRefundable(b);
+        _proveRefundable(c);
         P.SettleItem[] memory items = new P.SettleItem[](2);
         items[0] = P.SettleItem(b.sequence, 1, 50e6);
         items[1] = P.SettleItem(c.sequence, 1, 30e6);

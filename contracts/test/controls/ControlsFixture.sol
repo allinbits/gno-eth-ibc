@@ -242,6 +242,24 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
         );
     }
 
+    /// @notice Proves a packet's destination outcome through its route's replacement client (a permissive mock in
+    /// these tests): its own receipt and `ack`.
+    function _prove(IICS26RouterMsgs.Packet memory pkt, bytes memory ack) internal {
+        ctl.proveOutcome(
+            pkt, IGnoICS20ControlsTypes.OutcomeProof(IICS02ClientMsgs.Height(0, 1), ctl.gnoReceipt(pkt), "", ack, "")
+        );
+    }
+
+    /// @notice Proven refundable: received with an error ack.
+    function _proveRefundable(IICS26RouterMsgs.Packet memory pkt) internal {
+        _prove(pkt, ICS24Host.UNIVERSAL_ERROR_ACK);
+    }
+
+    /// @notice Proven delivered: received with a success ack.
+    function _proveDelivered(IICS26RouterMsgs.Packet memory pkt) internal {
+        _prove(pkt, bytes("{\"result\":\"AQ==\"}"));
+    }
+
     function _ack(IICS26RouterMsgs.Packet memory pkt, bytes memory ack) internal {
         router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, ack, "", IICS02ClientMsgs.Height(0, 1)));
     }

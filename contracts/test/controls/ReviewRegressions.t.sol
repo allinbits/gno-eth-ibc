@@ -95,6 +95,10 @@ contract ReviewRegressionsTest is ControlsFixture {
         _ack(delivered, bytes("{\"result\":\"AQ==\"}"));
         _ack(honest, bytes("{\"result\":\"AQ==\"}")); // a forged success ack of an undelivered packet
         _retire();
+        _proveDelivered(forged);
+        _proveDelivered(delivered);
+        _proveRefundable(honest);
+        _proveRefundable(inFlight);
         uint256 before = usdc.balanceOf(alice);
 
         // not for an id still in use
@@ -149,6 +153,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _setLimits(address(r), 1000, 1000, 1000);
         IICS26RouterMsgs.Packet memory pkt = _send(alice, address(r), 500, clientId);
         _retire();
+        _proveRefundable(pkt);
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
         ctl.settleRecords(clientId, _item(pkt.sequence, 1, 200)); // a haircut is refused
@@ -167,6 +172,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _setLimits(address(usdc), 1000, 1000, 1000);
         pkt = _send(alice, address(usdc), 100, clientId);
         _retire();
+        _proveRefundable(pkt);
         uint64 settle = _decide(S.KIND_SETTLE, P.settle1(clientId, pkt.sequence, 1, 100));
         uint64 reopen = _decide(S.KIND_REOPEN, P.reopen("gnoland-9"));
         uint8 spent = _status(_recvGov(_env(admin.lastSeq() + 1, S.KIND_SETTLE, P.settle1(clientId, 1, 9, 1))));
@@ -184,6 +190,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _setLimits(address(usdc), 1000, 1000, 1000);
         IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
         _retire();
+        _proveRefundable(pkt);
         _settle(_item(pkt.sequence, 1, 100)); // not delivered: refunded by reconciliation
         assertEq(usdc.balanceOf(alice), 1_000_000e6);
         MockLightClient live = new MockLightClient();
@@ -217,6 +224,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         _errorAck(forged); // queued
         ctl.claim(clientId, address(usdc), 1); // 10 paid of it
         _retire();
+        _proveDelivered(forged);
+        _proveDelivered(inFlight);
         assertEq(ctl.openRecords(clientId), 2);
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, clientId, 2));
@@ -251,6 +260,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.prank(escrow);
         r.transfer(address(0xdead), 100); // an incident: 100 of the backing is gone
         _retire();
+        _proveRefundable(pa);
+        _proveDelivered(pb);
         r.setBlocked(alice, true);
         T.SettleItem[] memory items = new T.SettleItem[](2);
         items[0] = T.SettleItem(pa.sequence, 1, 100); // refunded in full: parked (alice refuses for now)
@@ -630,6 +641,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _errorAck(pkt);
         ctl.claim(clientId, address(usdc), 1); // 10 of it paid
         _retire();
+        _proveDelivered(pkt);
         vm.startPrank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
         ctl.settleRecords(clientId, _item(pkt.sequence, 2, 0));
@@ -647,6 +659,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
         _timeout(pkt); // refunded in full at once
         _retire();
+        _proveRefundable(pkt);
         uint256 before = usdc.balanceOf(alice);
         vm.startPrank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
@@ -746,6 +759,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _errorAck(pkt); // queued, its notification held
         adapter.setBurn(true);
         _retire();
+        _proveRefundable(pkt);
         uint64 seq = _decide(S.KIND_SETTLE, P.settle1(clientId, pkt.sequence, 1, 500));
         _skip(7 days);
         admin.execute(seq);
@@ -769,6 +783,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         uint256 n = 70;
         T.SettleItem[] memory items = new T.SettleItem[](n);
         address[] memory tokens = new address[](n);
+        IICS26RouterMsgs.Packet[] memory pkts = new IICS26RouterMsgs.Packet[](n);
         for (uint256 i = 0; i < n; i++) {
             ERC20Mock t = new ERC20Mock();
             t.mint(alice, 10);
@@ -779,8 +794,12 @@ contract ReviewRegressionsTest is ControlsFixture {
             _errorAck(pkt); // a forged refund, paid at once
             items[i] = T.SettleItem(pkt.sequence, 4, 10);
             tokens[i] = address(t);
+            pkts[i] = pkt;
         }
         _retire();
+        for (uint256 i = 0; i < n; i++) {
+            _proveDelivered(pkts[i]);
+        }
         _settle(items);
         uint64 seq = _decide(S.KIND_REOPEN, P.reopen("gnoland-9"));
         _skip(7 days);
@@ -834,6 +853,10 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(open, 3);
         assertEq(ctl.openRecords(clientId), 0, "nothing outstanding: the old gate alone would reopen");
 
+        _proveDelivered(before);
+        _proveRefundable(forgedOk);
+        _proveDelivered(forgedRefund);
+        _proveRefundable(genuine);
         vm.startPrank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-2", 3));
         ctl.reopenRoute("gnoland-2");
@@ -875,6 +898,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _errorAck(pkt); // queued: the route is closed
         (, open) = ctl.suspectRecords(clientId);
         assertEq(open, 1);
+        _proveDelivered(pkt);
         vm.startPrank(address(admin));
         ctl.settleRecords(clientId, _item(pkt.sequence, 2, 0));
         ctl.reopenRoute("gnoland-9");
@@ -897,6 +921,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.migrateRoute(clientId, "gnoland-9", uint64(block.number)); // the same block as the ack
         (, uint64 open) = ctl.suspectRecords(clientId);
         assertEq(open, 1);
+        _proveDelivered(pkt);
         ctl.settleRecords(clientId, _item(pkt.sequence, 3, 0));
         ctl.reopenRoute("gnoland-9");
         assertFalse(ctl.routeClosed(clientId));
@@ -960,6 +985,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         string memory memo = string(new bytes(100_000));
         SenderAdapter[6] memory adapters;
         uint64[6] memory seqs;
+        IICS26RouterMsgs.Packet[6] memory pkts;
         for (uint256 i = 0; i < 6; i++) {
             adapters[i] = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
             usdc.mint(address(adapters[i]), 100);
@@ -967,9 +993,13 @@ contract ReviewRegressionsTest is ControlsFixture {
             adapters[i].sendWithMemo(100, clientId, memo);
             IICS26RouterMsgs.Packet memory pkt = _sentPacket();
             seqs[i] = pkt.sequence;
+            pkts[i] = pkt;
             _errorAck(pkt); // queued under the refund meter, its 100,000-byte notification held
         }
         _retire();
+        for (uint256 i = 0; i < 6; i++) {
+            _proveRefundable(pkts[i]);
+        }
         uint64 single = _decide(S.KIND_SETTLE, P.settle1(clientId, seqs[0], 1, 100));
         P.SettleItem[] memory items = new P.SettleItem[](5);
         for (uint256 i = 0; i < 5; i++) {
@@ -1004,6 +1034,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         adapter.send(100, clientId);
         IICS26RouterMsgs.Packet memory pkt = _sentPacket(); // never acknowledged nor timed out
         _retire();
+        _proveRefundable(pkt);
         _settle(_item(pkt.sequence, 1, 100));
         assertEq(usdc.balanceOf(address(adapter)), 100);
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
@@ -1050,6 +1081,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _skip(7 days);
         admin.execute(add);
         admin.execute(replace);
+        _proveDelivered(sent);
         vm.startPrank(address(admin));
         ctl.settleRecords(clientId, _item(sent.sequence, 3, 0)); // the honest send was delivered
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
