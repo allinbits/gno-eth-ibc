@@ -333,6 +333,13 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
 
     /// @notice The incidents of `clientId`'s route, and how many of them (from the first) are resolved.
     function incidents(string calldata clientId) external view returns (Incident[] memory, uint64 resolvedUpTo);
+
+    /// @notice A client id's reconciliation counters: open records, the incident covering it (1-based, 0 while
+    /// live), its first suspect index and suspect count, and how many acks and timeouts it processed.
+    function clientRecon(string calldata clientId)
+        external
+        view
+        returns (uint64 open, uint32 incident, uint64 suspectStart, uint64 suspectOpen, uint64 processed);
     /// @notice The part of the route's losses of the token kind 13 accepted as a deficit.
     function acceptedDeficit(string calldata clientId, address token) external view returns (uint256);
     function refundsHeld(string calldata clientId) external view returns (bool);

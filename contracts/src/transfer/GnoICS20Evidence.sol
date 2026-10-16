@@ -186,6 +186,17 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
+    function clientRecon(string calldata clientId)
+        external
+        view
+        delegated
+        returns (uint64, uint32, uint64, uint64, uint64)
+    {
+        GnoTransferStorage.ClientRecon storage c = _g().clients[keccak256(bytes(clientId))];
+        return (c.open, c.incident, c.suspectStart, c.suspectOpen, uint64(c.processed.length));
+    }
+
+    /// @notice See IGnoICS20Controls.
     function receiveRecord(
         string calldata clientId,
         uint64 sequence
