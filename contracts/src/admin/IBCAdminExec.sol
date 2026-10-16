@@ -353,6 +353,8 @@ contract IBCAdminExec is IIBCAdmin {
         bytes memory call = op == 1
             ? abi.encodeCall(IICS02ClientAccessControlled.addClient, (clientId, info, lc))
             : abi.encodeCall(IICS02ClientAccessControlled.migrateClient, (clientId, info, lc));
+        // a verifier swap never drops the route's running quarantine (ADR §7.10)
+        if (op == 2) IGnoICS20Controls(ics20).checkpointQuarantine(clientId);
         if (!_call(router, call)) return "client";
         if (address(IICS02Client(router).getClient(clientId)) != lc) revert AuthorityLost(router);
         // a client a governed decision added: the only kind a route replacement may move to
@@ -484,6 +486,7 @@ contract IBCAdminExec is IIBCAdmin {
         if (keccak256(bytes(oldId)) != keccak256(bytes(l.govClient))) return "client";
         // only a custom id a kind 6 enrolled (its verifier code-hash pinned), never one the router generated
         if (!l.enrolled[keccak256(bytes(newId))]) return "client";
+        IGnoICS20Controls(ics20).checkpointQuarantine(oldId);
         if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId)))) return "route";
         S.replaceRoute(l, router, frozenClient, oldId, newId);
         return "";

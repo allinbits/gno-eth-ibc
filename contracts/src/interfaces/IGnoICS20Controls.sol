@@ -152,6 +152,9 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function setGuardianKeys(address[6] calldata keys) external;
     function setLimits(string calldata clientId, address token, Limits calldata limits) external;
     function setQuarantine(string calldata clientId, uint64 quarantineSeconds) external;
+    /// @notice Stores the route's quarantine deadline so far (its current client's transitions): IBCAdmin calls it
+    /// before any verifier swap (kind 6 migrate, kind 10, the emergency recovery), so a swap never drops it.
+    function checkpointQuarantine(string calldata clientId) external;
     /// @notice Clears the route's flags and refunds flags set at a block before `beforeBlock`; refused while either
     /// set holds (IGuardians.HoldStands).
     function unpauseRoute(string calldata clientId, uint64 beforeBlock) external returns (uint256 cleared);

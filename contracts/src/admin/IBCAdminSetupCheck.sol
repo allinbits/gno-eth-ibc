@@ -110,7 +110,7 @@ contract IBCAdminSetupCheck {
 
     function _checkTransfer(IAccessManager am, address ics20, address router) private view {
         _check(!am.isTargetClosed(ics20) && am.getTargetAdminDelay(ics20) == 0, 6);
-        bytes4[11] memory gov = [
+        bytes4[12] memory gov = [
             IICS20TransferAccessControlled.setCustomERC20.selector,
             IICS20TransferAccessControlled.upgradeEscrowTo.selector,
             IICS20TransferAccessControlled.upgradeIBCERC20To.selector,
@@ -121,7 +121,8 @@ contract IBCAdminSetupCheck {
             IGnoICS20Controls.setQuarantine.selector,
             IGnoICS20Controls.unpauseRoute.selector,
             IGnoICS20Controls.setRecoveryBlock.selector,
-            IGnoICS20Controls.migrateRoute.selector
+            IGnoICS20Controls.migrateRoute.selector,
+            IGnoICS20Controls.checkpointQuarantine.selector
         ];
         for (uint256 i = 0; i < gov.length; i++) {
             _check(am.getTargetFunctionRole(ics20, gov[i]) == IBCRolesLib.ADMIN_ROLE, 6);

@@ -292,12 +292,23 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         require(seconds_ <= MAX_QUARANTINE, GnoBadLimits());
         GnoTransferStorage.Route storage r = _route(clientId);
         // the transitions accepted so far keep the deadline the old duration gave them
+        _checkpoint(r, clientId);
+        r.quarantineSeconds = seconds_;
+        emit GnoQuarantineSet(GnoTransferStorage.routeKey(clientId), seconds_);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function checkpointQuarantine(string calldata clientId) external delegated restricted {
+        _checkpoint(_route(clientId), clientId);
+    }
+
+    /// @notice Stores the deadline the route's current client's transitions set so far (each with the duration in
+    /// force), so neither a duration change nor a verifier swap can drop it.
+    function _checkpoint(GnoTransferStorage.Route storage r, string calldata clientId) private {
         (address lc, uint64 id, uint64 time) = _lastTransition(clientId);
         uint256 until = GnoTransferStorage.quarantineUntil(r, lc, id, time);
         r.quarantineDeadline = until > type(uint64).max ? type(uint64).max : uint64(until);
         (r.seenClient, r.seenTransition) = (lc, id);
-        r.quarantineSeconds = seconds_;
-        emit GnoQuarantineSet(GnoTransferStorage.routeKey(clientId), seconds_);
     }
 
     /// @notice See IGnoICS20Controls.

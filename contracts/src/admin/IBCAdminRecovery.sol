@@ -142,6 +142,7 @@ contract IBCAdminRecovery is IIBCAdmin {
         IICS02ClientMsgs.CounterpartyInfo memory info =
             IICS02ClientMsgs.CounterpartyInfo(rp.counterpartyClientId, rp.merklePrefix);
         IICS02ClientAccessControlled(router).addClient(rp.newClientId, info, rp.lightClient);
+        IGnoICS20Controls(ics20).checkpointQuarantine(oldId);
         IGnoICS20Controls(ics20).migrateRoute(oldId, rp.newClientId);
         // the route (now the new id's) was blocked while the proposal was open
         IGnoICS20Controls(ics20).setRecoveryBlock(rp.newClientId, false);

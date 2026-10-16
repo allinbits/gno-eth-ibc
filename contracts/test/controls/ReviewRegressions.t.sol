@@ -690,6 +690,41 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(vm.load(address(ics20), implSlot), before);
     }
 
+    /// @notice Round 3 #5: a verifier swap (kind 6 migrate, scheduled before the transition) keeps the quarantine the
+    /// old client's transition started; so does a route replacement.
+    function test_r3_5_verifierSwapKeepsTheQuarantine() public {
+        MockLightClient fresh = new MockLightClient();
+        uint64 swap =
+            _decide(S.KIND_CLIENT, P.client(2, clientId, CP, _prefix(), address(fresh), address(fresh).codehash));
+        _skip(7 days);
+        lc.setTransitionTime(uint64(_now()));
+        uint256 t = _now();
+        _skip(1 hours);
+        admin.execute(swap);
+        assertEq(address(router.getClient(clientId)), address(fresh));
+        assertTrue(_isErrorAck(_gnotIn(1, bob)), "the started quarantine survives the swap");
+        vm.warp(t + 7 days);
+        assertTrue(_isSuccessAck(_gnotIn(1, bob)));
+    }
+
+    function test_r3_5_routeReplacementKeepsTheQuarantine() public {
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        uint64 replace = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-2"));
+        _skip(7 days);
+        admin.execute(add);
+        lc.setTransitionTime(uint64(_now()));
+        uint256 t = _now();
+        admin.execute(replace);
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-2");
+        assertTrue(_isErrorAck(_transferIn("gnoland-2", "ugnot", 1, bob)), "kept across the replacement");
+        vm.warp(t + 7 days);
+        assertTrue(_isSuccessAck(_transferIn("gnoland-2", "ugnot", 1, bob)));
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {
