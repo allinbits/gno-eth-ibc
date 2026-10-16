@@ -67,6 +67,7 @@ interface IIBCAdmin {
     error RecoveryState();
     error NotGuardian();
     error AuthorityLost(address target);
+    error NotSelf();
 
     // ---------------------------------------------------------------------------------------------------- events --
 

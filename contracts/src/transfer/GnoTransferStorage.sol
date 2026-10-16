@@ -7,6 +7,9 @@ import { IEscrow } from "@eureka/interfaces/IEscrow.sol";
 import { IMintableAndBurnable } from "@eureka/interfaces/IMintableAndBurnable.sol";
 import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 
+import { ERC165Checker } from "@openzeppelin-contracts/utils/introspection/ERC165Checker.sol";
+import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
+
 import { IGnoICS20ControlsTypes } from "../interfaces/IGnoICS20Controls.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { LeakyBucket } from "../lib/LeakyBucket.sol";
@@ -25,6 +28,14 @@ library GnoTransferStorage {
         Guardians.Flags refundFlags;
         uint64 quarantineSeconds;
         bool recoveryBlocked;
+        /// Closed by a route replacement (kind 10 or the emergency recovery) until reopened by kind 13: no receive,
+        /// no send, no claim.
+        bool closed;
+        /// The deadline the transitions already seen set, each with the duration in force when it was accepted, and
+        /// the latest transition seen (client and time) when a duration last changed.
+        uint64 quarantineDeadline;
+        address seenClient;
+        uint64 seenTransition;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.
@@ -47,7 +58,7 @@ library GnoTransferStorage {
     /// @custom:storage-location erc7201:gno.storage.GnoICS20Transfer
     struct Layout {
         /// The guardian keys (seats 0-3, watch keys 4-5): IBCAdmin's list, set by it.
-        address[6] keys;
+        Guardians.Keys keys;
         /// A client id's route key; empty: the client id is its own route key.
         mapping(string clientId => string routeKey) routeOf;
         /// A route key's current client id; empty: the route key itself.
@@ -57,6 +68,10 @@ library GnoTransferStorage {
         mapping(bytes32 route => Route) routes;
         mapping(bytes32 route => mapping(address token => TokenControls)) tokens;
         mapping(bytes32 clientHash => mapping(uint64 sequence => IGnoICS20ControlsTypes.SendRecord)) records;
+        /// A sender's notification (IIBCSenderCallbacks calldata) held until its refund is paid.
+        mapping(bytes32 clientHash => mapping(uint64 sequence => bytes)) notices;
+        /// Losses recorded by kind 12, per route and token.
+        mapping(bytes32 route => mapping(address token => uint256)) losses;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))
@@ -109,6 +124,22 @@ library GnoTransferStorage {
         return (false, "", 0);
     }
 
+    // ----------------------------------------------------------------------------------------- quarantine --
+
+    /// @notice When the route's quarantine ends (ADR §7.10, kind 11): the deadline the transitions seen when the
+    /// duration last changed set, and for a later transition of the client (`lastTransition`), its time plus the
+    /// duration in force now. A duration applies only to transitions accepted after it; one already started keeps
+    /// its deadline.
+    function quarantineUntil(Route storage r, address client, uint64 lastTransition) internal view returns (uint256) {
+        uint256 until = r.quarantineDeadline;
+        uint64 q = r.quarantineSeconds;
+        if (q != 0 && lastTransition != 0 && (client != r.seenClient || lastTransition != r.seenTransition)) {
+            uint256 end = uint256(lastTransition) + q;
+            if (end > until) until = end;
+        }
+        return until;
+    }
+
     // -------------------------------------------------------------------------------------------- refunds --
 
     /// @notice Whether the refunds hold stands on a route: any one key's refunds flag (§7.13).
@@ -135,5 +166,43 @@ library GnoTransferStorage {
         }
         rec.refunded += amount;
         return true;
+    }
+
+    // ---------------------------------------------------------------------------------------- notifications --
+
+    /// @notice Delivers a sender's IIBCSenderCallbacks notification, if it takes them; its failure is recorded and
+    /// never rolls a refund back.
+    function notify(address sender, bytes memory call, string memory clientId, uint64 sequence) internal {
+        if (!ERC165Checker.supportsInterface(sender, type(IIBCSenderCallbacks).interfaceId)) return;
+        (bool ok,) = sender.call(call);
+        emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
+    }
+
+    /// @notice Holds a notification until the refund it announces is paid (only for senders that take them).
+    function holdNotice(address sender, bytes memory call, string memory clientId, uint64 sequence) internal {
+        if (!ERC165Checker.supportsInterface(sender, type(IIBCSenderCallbacks).interfaceId)) return;
+        layout().notices[keccak256(bytes(clientId))][sequence] = call;
+    }
+
+    /// @notice Delivers a held notification once its refund is paid in full.
+    function releaseNotice(
+        IGnoICS20ControlsTypes.SendRecord storage rec,
+        string memory clientId,
+        uint64 sequence
+    )
+        internal
+    {
+        mapping(uint64 => bytes) storage n = layout().notices[keccak256(bytes(clientId))];
+        bytes memory call = n[sequence];
+        if (call.length == 0) return;
+        delete n[sequence];
+        (bool ok,) = rec.sender.call(call);
+        emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
+    }
+
+    /// @notice What a record may still be refunded: its entitlement (kind 12) or its amount, less what was refunded.
+    function refundable(IGnoICS20ControlsTypes.SendRecord storage rec) internal view returns (uint256) {
+        uint256 cap = rec.settlement == 1 ? rec.entitlement : rec.amount;
+        return cap > rec.refunded ? cap - rec.refunded : 0;
     }
 }

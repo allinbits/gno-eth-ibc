@@ -5,6 +5,9 @@ pragma solidity ^0.8.28;
 // (`noteHoldEnd`, the hold history) and HlAdmin.sol (`_addCancelled`, the bounded merged ranges).
 // Copyright (C) 2026 NewTendermint, LLC. GNO Network General Public License: see contracts/licenses/.
 
+import { IICS02Client, IICS02ClientAccessControlled } from "@eureka/interfaces/IICS02Client.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
+
 import { IIBCAdmin } from "../interfaces/IIBCAdmin.sol";
 import { IGuardians } from "../interfaces/IGuardians.sol";
 import { Guardians } from "../lib/Guardians.sol";
@@ -59,6 +62,8 @@ library IBCAdminStorage {
     uint8 internal constant KIND_HANDOVER = 9;
     uint8 internal constant KIND_ROUTE = 10;
     uint8 internal constant KIND_SETTINGS = 11;
+    uint8 internal constant KIND_SETTLE = 12;
+    uint8 internal constant KIND_REOPEN = 13;
 
     // atRecording's answer
     uint8 internal constant WAIT = 0;
@@ -112,6 +117,8 @@ library IBCAdminStorage {
         /// The number of the decision that last set a setting (limits of a route and token, a route's quarantine),
         /// keyed by (epoch, setting): an older decision maturing later never overwrites a newer one.
         mapping(bytes32 setting => uint64 seq) appliedSeq;
+        /// gno.land's chain id (an emergency recovery's client must follow it).
+        string gnoChainId;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.IBCAdmin")) - 1)) & ~bytes32(uint256(0xff))
@@ -127,7 +134,7 @@ library IBCAdminStorage {
     // -------------------------------------------------------------------------------------------- the kinds --
 
     function knownKind(uint8 kind) internal pure returns (bool) {
-        return kind >= KIND_CANCEL && kind <= KIND_SETTINGS;
+        return kind >= KIND_CANCEL && kind <= KIND_REOPEN;
     }
 
     /// @notice Kinds suspended while an emergency recovery is open: those that change authority (§7.12; kind 10,
@@ -140,11 +147,11 @@ library IBCAdminStorage {
 
     /// @notice A flag or a hold stands on IBCAdmin, or a conflict's flag.
     function flagged(Layout storage l) internal view returns (bool) {
-        return l.conflictBlock != 0 || Guardians.anyFlag(l.g.keys, l.g.f);
+        return l.conflictBlock != 0 || Guardians.anyFlag(l.g.k, l.g.f);
     }
 
     function hold(Layout storage l) internal view returns (bool stands, uint64 startBlock, uint64 startTime) {
-        return Guardians.hold(l.g.keys, l.g.f, uint64(block.timestamp), DAY);
+        return Guardians.hold(l.g.k, l.g.f, uint64(block.timestamp), DAY);
     }
 
     /// @notice Notes in the hold history a hold a change of the guardians ended: by a dip of the grace's length, at
@@ -190,6 +197,29 @@ library IBCAdminStorage {
         if (l.appliedSeq[key] > seq) return false;
         l.appliedSeq[key] = seq;
         return true;
+    }
+
+    /// @notice Freezes the old client id (migrated to `frozen`) and opens the next epoch over the new one: every
+    /// unexecuted decision, buffered entry and tombstone of the old epoch is dropped with it (they are keyed by
+    /// epoch). Kind 10 and the emergency recovery.
+    function replaceRoute(
+        Layout storage l,
+        address router,
+        address frozen,
+        string memory oldId,
+        string memory newId
+    )
+        internal
+    {
+        IICS02ClientMsgs.CounterpartyInfo memory info = IICS02Client(router).getCounterparty(oldId);
+        IICS02ClientAccessControlled(router).migrateClient(oldId, info, frozen);
+        uint32 e = l.epoch + 1;
+        l.epoch = e;
+        l.govClient = newId;
+        l.lastSeq = 0;
+        l.conflictBlock = 0;
+        l.lastRecordTime = uint64(block.timestamp);
+        emit IIBCAdmin.EpochOpened(e, newId);
     }
 
     // ---------------------------------------------------------------------------------------- tombstones --

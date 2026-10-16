@@ -16,6 +16,7 @@ import { IGuardians } from "../interfaces/IGuardians.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
 import { IBCAdminExec } from "./IBCAdminExec.sol";
+import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 
 /// @title IBCAdmin: the permanent governance app on port `ibcgov` (gno.land's `gov`)
 /// @notice Plain code, never behind a proxy, so immutable from its deployment; router ports can never be registered
@@ -64,6 +65,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         address ics20;
         address exec;
         string govClientId;
+        /// gno.land's chain id: an emergency recovery's client must follow this chain.
+        string gnoChainId;
         address[4] seats;
         address[2] watch;
         RecoveryConfig recovery;
@@ -89,10 +92,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         (address r, address am, address t) = IBCAdminExec(c.exec).bindings();
         if (r != c.router || am != c.accessManager || t != c.ics20) revert ForeignExec();
         RecoveryConfig memory rc = c.recovery;
-        if (
-            rc.delay != 0
-                && (rc.threshold == 0 || rc.threshold > 4 || rc.cancelThreshold == 0 || rc.cancelThreshold > 4)
-        ) {
+        if (rc.delay != 0 && (rc.threshold < 3 || rc.threshold > 4 || rc.cancelThreshold < 2 || rc.cancelThreshold > 4))
+        {
             revert RecoveryState();
         }
         router = c.router;
@@ -104,6 +105,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
         S.Layout storage l = S.layout();
         if (bytes(c.govClientId).length == 0) revert WrongClient(c.govClientId);
+        if (bytes(c.gnoChainId).length == 0) revert RecoveryState();
+        l.gnoChainId = c.gnoChainId;
         Guardians.init(l.g, [c.seats[0], c.seats[1], c.seats[2], c.seats[3], c.watch[0], c.watch[1]]);
         l.epoch = 1;
         l.govClient = c.govClientId;
@@ -166,12 +169,16 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     {
         uint64 last = l.lastSeq;
         Decision storage d = l.decisions[ep][seq];
-        if (seq <= last || d.state == S.BUFFERED) {
-            if (d.hash == hash) return (S.STATUS_DUPLICATE, false);
-            // the first bytes stand and these are never applied; the flag defers every 7-day decision
-            if (l.conflictBlock == 0) l.conflictBlock = uint64(block.number);
-            emit Conflict(ep, seq, d.hash, hash);
-            return (S.STATUS_CONFLICT, false);
+        bool prebound; // a cancel seen beyond the window: its number is bound to its hash, not yet held
+        if (seq <= last || d.hash != bytes32(0)) {
+            if (d.hash != hash) {
+                // the first bytes stand and these are never applied; the flag defers every 7-day decision
+                if (l.conflictBlock == 0) l.conflictBlock = uint64(block.number);
+                emit Conflict(ep, seq, d.hash, hash);
+                return (S.STATUS_CONFLICT, false);
+            }
+            if (d.state != S.NONE) return (S.STATUS_DUPLICATE, false);
+            prebound = true;
         }
         bool bad = e.length > S.MAX_ENVELOPE;
         bool cancel;
@@ -179,10 +186,13 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (kind == S.KIND_CANCEL && !bad) (cancel, ranges) = _parseCancel(e[S.HEADER:]);
         if (uint256(seq) > uint256(last) + S.WINDOW) {
             if (!cancel) revert BeyondWindow(seq, last);
-            _tombstone(l, ep, seq, ranges);
+            // bound to its hash at once: another cancel at this number is a conflict, never a second set of targets
+            d.hash = hash;
+            d.kind = kind;
+            if (!prebound) _tombstone(l, ep, ranges);
             return (S.STATUS_BUFFERED, true);
         }
-        if (cancel) _tombstone(l, ep, seq, ranges);
+        if (cancel && !prebound) _tombstone(l, ep, ranges);
         d.hash = hash;
         d.kind = kind;
         // an oversize envelope, or a cancel whose ranges do not parse, is spent when recorded
@@ -211,14 +221,12 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return (true, ranges);
     }
 
-    /// @notice Tombstones a cancel's targets, each clamped below the cancel's own number: a cancel withdraws only
-    /// decisions numbered before it.
-    function _tombstone(S.Layout storage l, uint32 ep, uint64 seq, uint64[2][] memory ranges) private {
+    /// @notice Tombstones a cancel's targets, the inclusive ranges as given (numbers start at 1), whatever the
+    /// cancel's own number.
+    function _tombstone(S.Layout storage l, uint32 ep, uint64[2][] memory ranges) private {
         for (uint256 i = 0; i < ranges.length; i++) {
-            uint64 from = ranges[i][0];
-            uint64 to = ranges[i][1] < seq ? ranges[i][1] : seq - 1;
-            if (from == 0) from = 1;
-            if (from <= to) S.addTombstone(l, ep, from, to);
+            uint64 from = ranges[i][0] == 0 ? 1 : ranges[i][0];
+            if (from <= ranges[i][1]) S.addTombstone(l, ep, from, ranges[i][1]);
         }
     }
 
@@ -236,7 +244,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (d.bad || !S.knownKind(kind)) return _close(ep, seq, d, S.SPENT, d.bad ? "params" : "unknown kind");
         if (kind == S.KIND_CANCEL) return _close(ep, seq, d, S.EXECUTED, "");
         if (S.isTombstoned(l, ep, seq)) return _close(ep, seq, d, S.CANCELLED, "");
-        (uint8 action, string memory reason) = _atRecording(l, kind, seq, d.params);
+        // while an emergency recovery is open, an authority change waits even where it would act at recording
+        bool suspended = l.recovery.openedAt != 0 && S.suspendedByRecovery(kind);
+        (uint8 action, string memory reason) = _atRecording(l, kind, seq, d.params, suspended);
         if (action == S.DONE_NOW) return _close(ep, seq, d, S.EXECUTED, "");
         if (action == S.SPEND) return _close(ep, seq, d, S.SPENT, reason);
         d.state = S.PENDING;
@@ -274,15 +284,17 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         S.Layout storage l,
         uint8 kind,
         uint64 seq,
-        bytes memory params
+        bytes memory params,
+        bool suspended
     )
         private
         returns (uint8, string memory)
     {
         address x = _exec(l);
         if (gasleft() < S.RECORD_FLOOR) revert ExecutionStarved();
-        (bool ok, bytes memory ret) =
-            x.delegatecall{ gas: S.RECORD_GAS }(abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params)));
+        (bool ok, bytes memory ret) = x.delegatecall{ gas: S.RECORD_GAS }(
+            abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params, suspended))
+        );
         if (!ok) return (S.SPEND, "params");
         return abi.decode(ret, (uint8, string));
     }
@@ -322,7 +334,12 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (l.recovery.openedAt != 0 && S.suspendedByRecovery(kind)) revert Suspended();
         (bool holdStands,, uint64 holdStart) = S.hold(l);
         uint64 matureAt = d.recordedTime + _delay(kind);
-        if (kind == S.KIND_SEATS) {
+        bytes memory params = d.params;
+        bool revoke = kind == S.KIND_ROLE && params.length >= 32 && uint256(bytes32(params)) == 0;
+        if (revoke) {
+            // a revocation an open recovery held back: due at once, never deferred (it tightens)
+            matureAt = d.recordedTime;
+        } else if (kind == S.KIND_SEATS) {
             if (holdStands) {
                 uint64 floor = _replacementFloor(l, d.recordedTime, holdStart);
                 if (floor > matureAt) matureAt = floor;
@@ -333,7 +350,6 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (block.timestamp < matureAt) revert NotMature(matureAt);
         // effects first: a call below that reverts reverts this, and the decision stays pending for a retry
         d.state = S.EXECUTED;
-        bytes memory params = d.params;
         delete d.params;
         string memory spent =
             abi.decode(_delegate(l, abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))), (string));
@@ -367,7 +383,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     function setFlag() external {
         S.Layout storage l = S.layout();
         (uint64 hb, uint64 ht, uint64 db, uint64 dt) = S.moments(l);
-        uint256 i = Guardians.setFlag(l.g.keys, l.g.f, msg.sender, uint64(block.number), uint64(block.timestamp), S.DAY);
+        uint256 i = Guardians.setFlag(l.g.k, l.g.f, msg.sender, uint64(block.number), uint64(block.timestamp), S.DAY);
         S.noteHoldEnd(l, hb, ht, db, dt);
         // forge-lint: disable-next-line(unsafe-typecast)
         emit FlagSet(msg.sender, uint8(i));
@@ -376,8 +392,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     function clearFlag() external {
         S.Layout storage l = S.layout();
         (uint64 hb, uint64 ht, uint64 db, uint64 dt) = S.moments(l);
-        uint256 i =
-            Guardians.clearFlag(l.g.keys, l.g.f, msg.sender, uint64(block.number), uint64(block.timestamp), S.DAY);
+        uint256 i = Guardians.clearFlag(l.g.k, l.g.f, msg.sender, uint64(block.number), uint64(block.timestamp), S.DAY);
         S.noteHoldEnd(l, hb, ht, db, dt);
         // forge-lint: disable-next-line(unsafe-typecast)
         emit FlagCleared(msg.sender, uint8(i));
@@ -396,19 +411,27 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// the same proposal while the route is eligible. Calling again re-checks the eligibility.
     function approveRecovery(RecoveryProposal calldata p) external {
         RecoveryConfig memory c = _recoveryConfig();
-        _delegate(S.layout(), abi.encodeCall(IBCAdminExec.approveRecovery, (msg.sender, abi.encode(p), c)));
+        _delegateRecovery(abi.encodeCall(IBCAdminRecovery.approveRecovery, (msg.sender, abi.encode(p), c)));
     }
 
     /// @notice A guardian withdraws its approval, or votes to cancel the open proposal.
     function cancelRecovery() external {
         RecoveryConfig memory c = _recoveryConfig();
-        _delegate(S.layout(), abi.encodeCall(IBCAdminExec.cancelRecovery, (msg.sender, c)));
+        _delegateRecovery(abi.encodeCall(IBCAdminRecovery.cancelRecovery, (msg.sender, c)));
     }
 
     /// @notice Executes the open proposal after its delay. Permissionless.
     function executeRecovery() external {
         RecoveryConfig memory c = _recoveryConfig();
-        _delegate(S.layout(), abi.encodeCall(IBCAdminExec.executeRecovery, (c)));
+        _delegateRecovery(abi.encodeCall(IBCAdminRecovery.executeRecovery, (c)));
+    }
+
+    /// @notice Runs the executor as this contract from the executor itself, in a call frame of its own, so that a
+    /// step whose failure spends a decision (an upgrade with its after-checks, a hand-over's migration call) rolls
+    /// back whole. Only this contract may call it.
+    function selfDelegate(bytes calldata call) external returns (bytes memory) {
+        if (msg.sender != address(this)) revert NotSelf();
+        return _delegate(S.layout(), call);
     }
 
     // ================================================================================================ setup ==
@@ -433,6 +456,18 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (x.codehash != l.execHash) revert ForeignExec();
     }
 
+    /// @notice Runs the recovery module of the pinned executor as this contract.
+    function _delegateRecovery(bytes memory call) private {
+        address m = IBCAdminExec(_exec(S.layout())).recoveryModule();
+        (bool ok, bytes memory ret) = m.delegatecall(call);
+        if (!ok) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+    }
+
     /// @notice Runs the executor's code as this contract; a revert there reverts here with its own reason.
     function _delegate(S.Layout storage l, bytes memory call) private returns (bytes memory) {
         (bool ok, bytes memory ret) = _exec(l).delegatecall(call);
@@ -453,6 +488,10 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     function lastSeq() external view returns (uint64) {
         return S.layout().lastSeq;
+    }
+
+    function gnoChainId() external view returns (string memory) {
+        return S.layout().gnoChainId;
     }
 
     function govClient() external view returns (string memory) {
@@ -476,17 +515,17 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     }
 
     function keys() external view returns (address[6] memory) {
-        return S.layout().g.keys;
+        return S.layout().g.k.keys;
     }
 
     function flags() external view returns (IGuardians.Flag[6] memory) {
         S.Layout storage l = S.layout();
-        return Guardians.flags(l.g.keys, l.g.f);
+        return Guardians.flags(l.g.k, l.g.f);
     }
 
     function hold() external view returns (IGuardians.Flag memory) {
         S.Layout storage l = S.layout();
-        return Guardians.holdView(l.g.keys, l.g.f, uint64(block.timestamp), S.DAY);
+        return Guardians.holdView(l.g.k, l.g.f, uint64(block.timestamp), S.DAY);
     }
 
     function holds() external view returns (IGuardians.Hold[] memory) {

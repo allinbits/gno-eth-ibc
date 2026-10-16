@@ -34,7 +34,7 @@ import { Bytes } from "@openzeppelin-contracts/utils/Bytes.sol";
 import { UUPSUpgradeable } from "@openzeppelin-contracts/proxy/utils/UUPSUpgradeable.sol";
 import { BeaconProxy } from "@openzeppelin-contracts/proxy/beacon/BeaconProxy.sol";
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
-import { IBCSenderCallbacksLib } from "@eureka/utils/IBCSenderCallbacksLib.sol";
+import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol"; // GNO: was IBCSenderCallbacksLib
 import { PausableUpgradeable } from "@openzeppelin-upgradeable/utils/PausableUpgradeable.sol";
 import { AccessManagedUpgradeable } from "@openzeppelin-upgradeable/access/manager/AccessManagedUpgradeable.sol";
 
@@ -265,6 +265,9 @@ contract GnoICS20Transfer is
     {
         // GNO: no send on a retired client id: its sends could never be acknowledged or timed out
         require(!_gno().retired[msg_.sourceClient], GnoClientRetired(msg_.sourceClient));
+        require(
+            !_gno().routes[GnoTransferStorage.routeHash(msg_.sourceClient)].closed, GnoRouteClosed(msg_.sourceClient)
+        );
         bool burned; // GNO: a voucher returning to its source: never paused or limited
         string memory fullDenomPath = _getICS20TransferStorage()._ibcERC20Denoms[msg_.denom];
         if (bytes(fullDenomPath).length == 0) {
@@ -425,14 +428,24 @@ contract GnoICS20Transfer is
 
         if (keccak256(msg_.acknowledgement) == ICS24Host.KECCAK256_UNIVERSAL_ERROR_ACK) {
             // if the acknowledgement is an error, we must refund the tokens to the sender
-            // GNO: paid at once, or queued under the refund meter or the refunds hold
-            address sender =
+            // GNO: paid at once, or queued under the refund meter or the refunds hold; the sender is notified
+            // when its refund is paid, and its notification failing never rolls the refund back
+            (address sender, bool paid) =
                 _refundTokens(msg_.payload.sourcePort, msg_.sourceClient, msg_.sequence, packetData, Outcome.ErrorAck);
-            IBCSenderCallbacksLib.ackPacketCallback(sender, false, msg_);
+            _notice(
+                sender,
+                abi.encodeCall(IIBCSenderCallbacks.onAckPacket, (false, msg_)),
+                msg_.sourceClient,
+                msg_.sequence,
+                paid
+            );
         } else {
             address sender = ICS20Lib.mustHexStringToAddress(packetData.sender);
             _recordOutcome(msg_.sourceClient, msg_.sequence, Outcome.Success); // GNO
-            IBCSenderCallbacksLib.ackPacketCallback(sender, true, msg_);
+            // GNO: a notification failing never rolls the outcome back
+            GnoTransferStorage.notify(
+                sender, abi.encodeCall(IIBCSenderCallbacks.onAckPacket, (true, msg_)), msg_.sourceClient, msg_.sequence
+            );
         }
     }
 
@@ -441,10 +454,18 @@ contract GnoICS20Transfer is
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata msg_) external onlyRouter nonReentrant {
         IICS20TransferMsgs.FungibleTokenPacketData memory packetData =
             abi.decode(msg_.payload.value, (IICS20TransferMsgs.FungibleTokenPacketData));
-        // GNO: paid at once, or queued under the refund meter or the refunds hold
-        address sender =
+        // GNO: paid at once, or queued under the refund meter or the refunds hold; notified when paid
+        (address sender, bool paid) =
             _refundTokens(msg_.payload.sourcePort, msg_.sourceClient, msg_.sequence, packetData, Outcome.Timeout);
-        IBCSenderCallbacksLib.timeoutPacketCallback(sender, msg_);
+        _notice(
+            sender, abi.encodeCall(IIBCSenderCallbacks.onTimeoutPacket, (msg_)), msg_.sourceClient, msg_.sequence, paid
+        );
+    }
+
+    /// @notice GNO: a refund's notification, delivered now if it was paid, else held until it is.
+    function _notice(address sender, bytes memory call, string calldata clientId, uint64 sequence, bool paid) private {
+        if (paid) GnoTransferStorage.notify(sender, call, clientId, sequence);
+        else GnoTransferStorage.holdNotice(sender, call, clientId, sequence);
     }
 
     /// @notice Refund the tokens to the sender
@@ -453,7 +474,8 @@ contract GnoICS20Transfer is
     /// @param packetData The packet data
     /// @return The address that received the refunded tokens, i.e. sender of the packet
     /// GNO: also takes the sequence and outcome; the refund is attached to the packet's send record and paid by
-    /// `_settleRefund` (at once, or queued). Upstream's first return value (the token) was unused and is dropped.
+    /// `_settleRefund` (at once, or queued). Returns the refundee and whether the refund was paid now (upstream's
+    /// first return value, the token, was unused).
     function _refundTokens(
         string calldata sourcePort,
         string calldata sourceClient,
@@ -462,7 +484,7 @@ contract GnoICS20Transfer is
         Outcome outcome
     )
         private
-        returns (address)
+        returns (address, bool)
     {
         ICS20TransferStorage storage $ = _getICS20TransferStorage();
         IEscrow escrow = $._escrows[_routeKey(sourceClient)]; // GNO: by route key
@@ -493,10 +515,8 @@ contract GnoICS20Transfer is
         }
 
         // GNO: instead of `escrow.send(IERC20(erc20Address), refundee, packetData.amount)`
-        _settleRefund(
-            sourceClient, sequence, outcome, address(escrow), erc20Address, refundee, packetData.amount, isDestSource
-        );
-        return refundee;
+        bool paid = _settleRefund(sourceClient, sequence, outcome, erc20Address, refundee, packetData.amount);
+        return (refundee, paid);
     }
 
     /// @notice Transfer tokens from sender to receiver
@@ -688,15 +708,16 @@ contract GnoICS20Transfer is
         GnoTransferStorage.Route storage r = g.routes[route];
         require(!r.recoveryBlocked, GnoRouteRecovering(clientId));
         require(!Guardians.anyFlag(g.keys, r.flags), GnoRoutePaused(clientId));
-        uint64 q = r.quarantineSeconds;
-        if (q != 0) {
+        require(!r.closed, GnoRouteClosed(clientId));
+        if (r.quarantineSeconds != 0 || r.quarantineDeadline != 0) {
             address lc = address(IICS02Client(address(_getICS26Router())).getClient(clientId));
-            uint256 until;
-            try IGnoLightClientStatus(lc).quarantineEnd(q) returns (uint256 end) {
-                until = end;
+            uint64 last;
+            try IGnoLightClientStatus(lc).lastTransitionTime() returns (uint64 t) {
+                last = t;
             } catch {
                 revert GnoQuarantineUnknown(clientId);
             }
+            uint256 until = GnoTransferStorage.quarantineUntil(r, lc, last);
             // forge-lint: disable-next-line(block-timestamp)
             require(block.timestamp >= until, GnoQuarantined(clientId, until));
         }
@@ -764,6 +785,9 @@ contract GnoICS20Transfer is
         returns (SendRecord storage rec)
     {
         rec = _gno().records[keccak256(bytes(clientId))][sequence];
+        // a packet sent before the fork was installed is processed only once `backfill` authenticated its record
+        // against the router's commitment, which stays until this callback succeeds
+        require(rec.commitment != bytes32(0), GnoNoSendRecord(clientId, sequence));
         rec.outcome = outcome;
         rec.processedBlock = uint64(block.number);
     }
@@ -774,37 +798,37 @@ contract GnoICS20Transfer is
     }
 
     /// @notice Attaches an error ack or a timeout to the send record and pays the refund at once when the refund
-    /// meter has room, no refunds hold stands and nothing is queued before it; otherwise queues it for `claim`
-    /// (§7.13). Never reverts for the meter, the hold or a token refusing the payment (parked for `claimParked`): a
-    /// refund is delayed, never refused.
+    /// meter has room, no refunds hold stands, the route is open and nothing is queued before it; otherwise queues it
+    /// for `claim` (§7.13). Never reverts for the meter, the hold or a token refusing the payment (parked for
+    /// `claimParked`): a refund is delayed, never refused. Returns whether it was paid now.
     function _settleRefund(
         string calldata clientId,
         uint64 sequence,
         Outcome outcome,
-        address escrow,
         address token,
         address refundee,
-        uint256 amount,
-        bool mintBack
+        uint256 amount
     )
         private
+        returns (bool paid)
     {
         SendRecord storage rec = _processed(clientId, sequence, outcome);
-        if (rec.sendBlock == 0) {
-            // a packet sent before the upgrade: the record is made here, without a commitment
-            (rec.sender, rec.token, rec.escrow, rec.amount, rec.burned) = (refundee, token, escrow, amount, mintBack);
-        }
+        // the record is the send's (or the backfill's, authenticated): it must name this refund
+        require(
+            rec.token == token && rec.sender == refundee && rec.amount == amount, GnoNoSendRecord(clientId, sequence)
+        );
         bytes32 route = GnoTransferStorage.routeHash(clientId);
         GnoTransferStorage.TokenControls storage t = _gno().tokens[route][token];
         uint64 now_ = uint64(block.timestamp);
         if (
-            t.head == t.tail && !GnoTransferStorage.refundsHeld(route)
+            t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !_gno().routes[route].closed
                 && amount <= LeakyBucket.available(t.refunded, t.limits.refundCap, now_)
         ) {
             // a payment the token refuses never blocks the acknowledgement: the refund is parked
             if (GnoTransferStorage.tryPayRefund(rec, amount)) {
                 LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_);
                 rec.payment = Payment.Paid;
+                paid = true;
                 emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
             } else {
                 rec.payment = Payment.Parked;

@@ -40,10 +40,17 @@ library Guardians {
         uint64 dipTime;
     }
 
+    /// @notice The keys: seats 0-3 (guardians) then watch keys 4-5, and the block each seat's key was set at. A flag
+    /// stands only if the seat's current key set it at or after that block, so a key that is replaced and later put
+    /// back never revives its old flags.
+    struct Keys {
+        address[6] keys;
+        uint64[6] since;
+    }
+
     /// @notice The keys and one object's flags.
     struct State {
-        /// Seats 0-3 (guardians) then watch keys 4-5.
-        address[6] keys;
+        Keys k;
         Flags f;
     }
 
@@ -62,18 +69,30 @@ library Guardians {
     /// @notice The launch lists: every key non-zero, no key twice; no flag, no hold.
     function init(State storage g, address[6] memory keys) internal {
         checkKeys(keys);
-        g.keys = keys;
+        g.k.keys = keys;
         for (uint256 i = 0; i < KEYS; i++) {
             (g.f.flagBlock[i], g.f.flagTime[i], g.f.flagKey[i]) = (0, 0, address(0));
         }
         _endHold(g.f);
     }
 
+    /// @notice Replaces the whole key list (a copy kept by another object): every seat whose key changes starts a
+    /// new generation at `nowBlock`, retiring the old key's flags on every flag set over this list.
+    function setKeys(Keys storage keys, address[6] memory next, uint64 nowBlock) internal {
+        checkKeys(next);
+        for (uint256 i = 0; i < KEYS; i++) {
+            if (keys.keys[i] != next[i]) {
+                keys.keys[i] = next[i];
+                keys.since[i] = nowBlock;
+            }
+        }
+    }
+
     /// @notice The index of a key, or KEYS when it holds no seat.
-    function position(address[6] storage keys, address key) internal view returns (uint256) {
+    function position(Keys storage keys, address key) internal view returns (uint256) {
         if (key == address(0)) return KEYS;
         for (uint256 i = 0; i < KEYS; i++) {
-            if (keys[i] == key) return i;
+            if (keys.keys[i] == key) return i;
         }
         return KEYS;
     }
@@ -85,18 +104,18 @@ library Guardians {
     // ------------------------------------------------------------------------------------------------ flags --
 
     /// @notice Whether seat i's flag stands: set, by the key that holds the seat now.
-    function standing(address[6] storage keys, Flags storage f, uint256 i) internal view returns (bool) {
-        return f.flagBlock[i] != 0 && f.flagKey[i] == keys[i];
+    function standing(Keys storage keys, Flags storage f, uint256 i) internal view returns (bool) {
+        return f.flagBlock[i] != 0 && f.flagKey[i] == keys.keys[i] && f.flagBlock[i] >= keys.since[i];
     }
 
-    function anyFlag(address[6] storage keys, Flags storage f) internal view returns (bool) {
+    function anyFlag(Keys storage keys, Flags storage f) internal view returns (bool) {
         for (uint256 i = 0; i < KEYS; i++) {
             if (standing(keys, f, i)) return true;
         }
         return false;
     }
 
-    function guardianFlags(address[6] storage keys, Flags storage f) internal view returns (uint256 n) {
+    function guardianFlags(Keys storage keys, Flags storage f) internal view returns (uint256 n) {
         for (uint256 i = 0; i < SEATS; i++) {
             if (standing(keys, f, i)) n++;
         }
@@ -105,7 +124,7 @@ library Guardians {
     /// @notice The hold standing at `nowTime`, if any, and its start: a pure function of the stored moments and the
     /// clock, so a dip that has run its course reads as the hold's end before anything is written.
     function hold(
-        address[6] storage keys,
+        Keys storage keys,
         Flags storage f,
         uint64 nowTime,
         uint64 grace
@@ -125,7 +144,7 @@ library Guardians {
     /// @notice Brings the stored moments up to date before a change: a dip that reached the grace ended the hold,
     /// and so did a hold left with fewer than two standing guardian flags and no dip (its keys were replaced on
     /// another flag set's key list, which retires their flags without touching this set's moments).
-    function settle(address[6] storage keys, Flags storage f, uint64 nowTime, uint64 grace) internal {
+    function settle(Keys storage keys, Flags storage f, uint64 nowTime, uint64 grace) internal {
         if (f.holdBlock == 0) return;
         if (f.dipBlock != 0) {
             if (nowTime >= f.dipTime && nowTime - f.dipTime >= grace) _endHold(f);
@@ -135,7 +154,7 @@ library Guardians {
     }
 
     /// @notice After a change: two standing guardian flags start a hold (or end a dip); fewer start a dip.
-    function recompute(address[6] storage keys, Flags storage f, uint64 nowBlock, uint64 nowTime) internal {
+    function recompute(Keys storage keys, Flags storage f, uint64 nowBlock, uint64 nowTime) internal {
         if (guardianFlags(keys, f) >= 2) {
             if (f.holdBlock == 0) (f.holdBlock, f.holdTime) = (nowBlock, nowTime);
             (f.dipBlock, f.dipTime) = (0, 0);
@@ -146,7 +165,7 @@ library Guardians {
 
     /// @notice A key sets its own flag at now (fresh on every set). Returns its seat.
     function setFlag(
-        address[6] storage keys,
+        Keys storage keys,
         Flags storage f,
         address key,
         uint64 nowBlock,
@@ -165,7 +184,7 @@ library Guardians {
 
     /// @notice A key clears its own flag. Returns its seat.
     function clearFlag(
-        address[6] storage keys,
+        Keys storage keys,
         Flags storage f,
         address key,
         uint64 nowBlock,
@@ -185,7 +204,7 @@ library Guardians {
     /// @notice An unpause: clears every flag last set at a block before `beforeBlock`, refused while a hold stands.
     /// Returns how many standing flags it cleared.
     function unpause(
-        address[6] storage keys,
+        Keys storage keys,
         Flags storage f,
         uint64 beforeBlock,
         uint64 nowBlock,
@@ -204,7 +223,7 @@ library Guardians {
     /// @notice Clears every flag last set at a block before `beforeBlock`, whatever stands (for a flag set whose
     /// holds mean nothing, like a route's refunds flags). Returns how many standing flags it cleared.
     function clearBefore(
-        address[6] storage keys,
+        Keys storage keys,
         Flags storage f,
         uint64 beforeBlock,
         uint64 nowBlock,
@@ -218,7 +237,7 @@ library Guardians {
         for (uint256 i = 0; i < KEYS; i++) {
             uint64 b = f.flagBlock[i];
             if (b != 0 && b < beforeBlock) {
-                if (f.flagKey[i] == keys[i]) n++;
+                if (standing(keys, f, i)) n++;
                 (f.flagBlock[i], f.flagTime[i], f.flagKey[i]) = (0, 0, address(0));
             }
         }
@@ -229,9 +248,9 @@ library Guardians {
 
     /// @notice Why a replacement would be refused, or zero: one to four pairs of (seat 0-5, key); no seat twice; no
     /// zero key; never a seat's current key; at most two guardian seats; no key in two places afterwards.
-    function checkReplace(address[6] storage keys, IGuardians.SeatKey[] memory pairs) internal view returns (bytes4) {
+    function checkReplace(Keys storage keys, IGuardians.SeatKey[] memory pairs) internal view returns (bytes4) {
         if (pairs.length == 0 || pairs.length > 4) return IGuardians.BadSeat.selector;
-        address[6] memory next = keys;
+        address[6] memory next = keys.keys;
         bool[6] memory replaced;
         uint256 guardians;
         uint256 watch;
@@ -240,7 +259,7 @@ library Guardians {
             address key = pairs[p].key;
             if (i >= KEYS || replaced[i]) return IGuardians.BadSeat.selector;
             if (key == address(0)) return IGuardians.UnknownKey.selector;
-            if (keys[i] == key) return IGuardians.CurrentKey.selector;
+            if (keys.keys[i] == key) return IGuardians.CurrentKey.selector;
             if (isGuardian(i)) guardians++;
             else watch++;
             next[i] = key;
@@ -267,7 +286,7 @@ library Guardians {
     )
         internal
     {
-        bytes4 err = checkReplace(g.keys, pairs);
+        bytes4 err = checkReplace(g.k, pairs);
         if (err != bytes4(0)) {
             assembly ("memory-safe") {
                 mstore(0, err)
@@ -275,18 +294,19 @@ library Guardians {
             }
         }
         Flags storage f = g.f;
-        settle(g.keys, f, nowTime, grace);
+        settle(g.k, f, nowTime, grace);
         bool clearedGuardian;
         for (uint256 p = 0; p < pairs.length; p++) {
             uint256 i = pairs[p].seat;
-            if (isGuardian(i) && standing(g.keys, f, i)) clearedGuardian = true;
+            if (isGuardian(i) && standing(g.k, f, i)) clearedGuardian = true;
             (f.flagBlock[i], f.flagTime[i], f.flagKey[i]) = (0, 0, address(0));
-            g.keys[i] = pairs[p].key;
+            g.k.keys[i] = pairs[p].key;
+            g.k.since[i] = nowBlock;
         }
         // the 24-hour grace is for a holder's own clearing, never for GovDAO's replacement of the holders; a
         // replacement of nobody holding (a watch key, a seat whose flag is down) during a dip ends nothing
-        if (clearedGuardian && guardianFlags(g.keys, f) < 2) _endHold(f);
-        else recompute(g.keys, f, nowBlock, nowTime);
+        if (clearedGuardian && guardianFlags(g.k, f) < 2) _endHold(f);
+        else recompute(g.k, f, nowBlock, nowTime);
     }
 
     /// @notice No hold stands, and no dip.
@@ -300,7 +320,7 @@ library Guardians {
     // ------------------------------------------------------------------------------------------------ views --
 
     /// @notice The standing flags (a flag whose key no longer holds the seat reads as none).
-    function flags(address[6] storage keys, Flags storage f) internal view returns (IGuardians.Flag[6] memory out) {
+    function flags(Keys storage keys, Flags storage f) internal view returns (IGuardians.Flag[6] memory out) {
         for (uint256 i = 0; i < KEYS; i++) {
             if (standing(keys, f, i)) out[i] = IGuardians.Flag(f.flagBlock[i], f.flagTime[i]);
         }
@@ -308,7 +328,7 @@ library Guardians {
 
     /// @notice The standing hold's start at `nowTime`, zero when none stands.
     function holdView(
-        address[6] storage keys,
+        Keys storage keys,
         Flags storage f,
         uint64 nowTime,
         uint64 grace

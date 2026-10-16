@@ -34,6 +34,13 @@ library LeakyBucket {
         return cap > l ? cap - l : 0;
     }
 
+    /// @notice Drains the bucket at `cap` up to `now_` and stores the level: done with the old cap before a cap
+    /// changes, so a new cap never rewrites how much drained before it.
+    function settle(Bucket storage b, uint256 cap, uint64 now_) internal {
+        b.used = level(b, cap, now_);
+        b.usedAt = now_;
+    }
+
     /// @notice Charges `amount` if it fits under `cap`; leaves the bucket untouched and returns false otherwise.
     function charge(Bucket storage b, uint256 cap, uint256 amount, uint64 now_) internal returns (bool) {
         uint256 l = level(b, cap, now_);
