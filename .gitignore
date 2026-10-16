@@ -6,3 +6,4 @@ contracts/broadcast/
 contracts/deployments/*.json
 testnet/.data-*/
 .env
+.env.*

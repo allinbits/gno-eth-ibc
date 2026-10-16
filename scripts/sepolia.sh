@@ -57,12 +57,35 @@ setup() {
 	step "deploying IBC on Sepolia"
 	# Sepolia's repriced gas (Glamsterdam) defeats forge's local simulation:
 	# take each estimate from the node instead.
-	docker run --rm -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
-		-e DEPLOYER_PRIVATE_KEY -e GNO_TRUST_FILE=deployments/sepolia-trust.json \
-		-e GNO_COUNTERPARTY_CLIENT_ID="$GNO_CLIENT" -e DEPLOYMENTS_FILE=deployments/sepolia.json \
-		--entrypoint forge "$FOUNDRY_IMAGE" script script/DeployGnoIBC.s.sol --rpc-url "$ETH_RPC_URL" \
-		--broadcast --slow --skip-simulation --gas-estimate-multiplier 130
+	deploy() {
+		local out="$1"
+		shift
+		docker run --rm -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
+			-e DEPLOYER_PRIVATE_KEY -e GNO_TRUST_FILE=deployments/sepolia-trust.json \
+			-e GNO_COUNTERPARTY_CLIENT_ID="$GNO_CLIENT" -e DEPLOYMENTS_FILE="$out" \
+			--entrypoint forge "$FOUNDRY_IMAGE" script script/DeployGnoIBC.s.sol --rpc-url "$ETH_RPC_URL" \
+			--broadcast --slow --skip-simulation --gas-estimate-multiplier 130 "$@"
+	}
+	# Load-balanced RPCs can report a stale nonce right after a receipt, which
+	# makes forge abort the broadcast; resume it from the transactions sent.
+	# A resumed run simulates the script again from the account's new nonce, so
+	# the addresses it computes are not the deployed ones: keep the first run's.
+	if ! deploy deployments/sepolia.json; then
+		for i in 1 2 3 4 5; do
+			step "a lagging RPC node interrupted the broadcast; resuming it ($i)"
+			sleep 12
+			deploy deployments/.sepolia-resumed.json --resume && break
+			[[ $i == 5 ]] && exit 1
+		done
+	fi
 	cat "$DEP"
+	router=$(python3 -c "import json; print(json.load(open('$DEP'))['ics26Router'])")
+	code=$(curl -sf -X POST -H 'content-type: application/json' "$ETH_RPC_URL" \
+		--data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getCode\",\"params\":[\"$router\",\"latest\"]}")
+	if [[ "$code" == *'"result":"0x"'* || -z "$code" ]]; then
+		echo "no contract at the deployed router $router" >&2
+		exit 1
+	fi
 
 	step "creating gno's Ethereum client from a beacon bootstrap"
 	"$RELAYER" gno-create-eth-client-live -gno-rpc "$GNO_RPC" -deployment "$DEP"
