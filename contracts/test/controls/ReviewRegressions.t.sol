@@ -611,6 +611,44 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertFalse(ctl.isRetired(clientId));
     }
 
+    /// @notice Round 3 #6: a refund already partly paid cannot be rejected (2) or called delivered (3): only a
+    /// forged refund (4, booking the paid loss) or a genuine one (1) settles it.
+    function test_r3_6_partlyPaidRefund_onlyForgedOrGenuine() public {
+        _setLimits(address(usdc), 1000, 1000, 10);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        _errorAck(pkt);
+        ctl.claim(clientId, address(usdc), 1); // 10 of it paid
+        _retire();
+        vm.startPrank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 2, 0));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 3, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 4, 10));
+        vm.stopPrank();
+        assertEq(ctl.losses(clientId, address(usdc)), 10);
+    }
+
+    /// @notice The amended kind 12: a genuine refund already paid in full is settled with action 1 and amount zero,
+    /// which moves nothing; the settlement cannot be replayed.
+    function test_r3_fullyRefunded_settledWithZero_noReplay() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        _timeout(pkt); // refunded in full at once
+        _retire();
+        uint256 before = usdc.balanceOf(alice);
+        vm.startPrank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 1, 100)); // nothing is owed any more
+        ctl.settleRecords(clientId, _item(pkt.sequence, 1, 0));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 1, 0)); // a replay
+        vm.stopPrank();
+        assertEq(usdc.balanceOf(alice), before);
+        assertEq(ctl.sendRecord(clientId, pkt.sequence).settlement, 1);
+        assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Paid));
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

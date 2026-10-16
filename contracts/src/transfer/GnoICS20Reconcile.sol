@@ -107,20 +107,25 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
             uint256 reservedBefore = GnoTransferStorage.reservation(rec);
             if (action == 1) {
-                // the refund's whole remainder: a refund is never cut short (ADR §7.9)
+                // a genuine refund: its whole remainder, never cut short (ADR §7.9); zero when it was already paid in
+                // full, which only settles the record
                 uint256 left = rec.amount - rec.refunded;
-                require(it.amount != 0 && it.amount == left, GnoBadSettlement(i));
+                require(it.amount == left, GnoBadSettlement(i));
                 rec.settlement = 1;
-                if (GnoTransferStorage.tryPayRefund(rec, left)) {
-                    rec.payment = Payment.Claimed;
-                    emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
-                    GnoTransferStorage.releaseNotice(rec, clientId, it.sequence);
-                } else {
-                    rec.payment = Payment.Parked;
-                    emit GnoRefundParked(clientId, it.sequence, rec.token, left);
+                if (left != 0) {
+                    if (GnoTransferStorage.tryPayRefund(rec, left)) {
+                        rec.payment = Payment.Claimed;
+                        emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
+                        GnoTransferStorage.releaseNotice(rec, clientId, it.sequence);
+                    } else {
+                        rec.payment = Payment.Parked;
+                        emit GnoRefundParked(clientId, it.sequence, rec.token, left);
+                    }
                 }
             } else if (action == 2 || action == 3) {
-                require(action == 3 || owed, GnoBadSettlement(i));
+                // a refund already (partly) paid can only be settled as forged (action 4, which books the loss) or
+                // genuine (action 1)
+                require((action == 3 || owed) && rec.refunded == 0, GnoBadSettlement(i));
                 rec.settlement = action;
                 if (owed) _reject(g, rec, clientHash, clientId, it.sequence);
             } else if (action == 4) {

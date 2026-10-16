@@ -164,8 +164,9 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// every recorded loss not yet accepted becomes an accepted deficit.
     function reopenRoute(string calldata clientId) external;
     /// @notice Kind 12: applies reconciliation outcomes to send records of a retired client id, each at most once:
-    /// 1 pay the refund's remainder (`amount` must equal the amount less what was refunded; parked if the token
-    /// refuses), 2 reject a queued or parked refund, 3 settled as delivered (a queued or parked refund is rejected),
+    /// 1 genuine refund: pay its remainder (`amount` must equal the amount less what was refunded, zero when it was
+    /// paid in full, which only settles the record; parked if the token refuses), 2 reject a queued or parked refund,
+    /// 3 settled as delivered (a queued or parked refund is rejected), 2 and 3 only when nothing was refunded yet,
     /// 4 forged refund: reject the unpaid remainder and record what was already paid as a loss (`amount` must equal
     /// what was paid). All or nothing.
     function settleRecords(string calldata clientId, SettleItem[] calldata items) external;
