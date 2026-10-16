@@ -120,6 +120,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 rec.settlement = action;
                 if (owed) {
                     rec.payment = Payment.Rejected;
+                    delete g.notices[clientHash][it.sequence];
                     emit GnoRefundRejected(clientId, it.sequence);
                 }
             } else if (action == 4) {
@@ -179,5 +180,16 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         rec.amount = data.amount;
         rec.legacy = true;
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function retryNotification(string calldata clientId, uint64 sequence)
+        external
+        delegated
+        nonReentrant
+        returns (bool)
+    {
+        SendRecord storage rec = _g().records[keccak256(bytes(clientId))][sequence];
+        return GnoTransferStorage.retryNotice(rec, clientId, sequence);
     }
 }

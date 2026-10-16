@@ -95,6 +95,7 @@ interface IGnoICS20ControlsTypes {
     error GnoBadBackfill();
     error GnoBadSettlement(uint256 item);
     error GnoNotClosed(string clientId);
+    error GnoNoNotification(string clientId, uint64 sequence);
     error GnoQuarantined(string clientId, uint256 until);
     error GnoQuarantineUnknown(string clientId);
     error GnoDenomNotRegistered(string denom);
@@ -159,6 +160,10 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// 2 reject a queued or parked refund, 3 settled as delivered (a queued or parked refund is rejected), 4 record
     /// a loss of `amount`. All or nothing.
     function settleRecords(string calldata clientId, SettleItem[] calldata items) external;
+    /// @notice Delivers a sender notification kept after it failed, once its outcome is final for the sender (a
+    /// success ack, or a refund paid in full). Permissionless; it only calls the sender, never pays. Returns whether
+    /// the sender took it (if not, it stays kept).
+    function retryNotification(string calldata clientId, uint64 sequence) external returns (bool);
     /// @notice Makes the send record of a packet sent before the fork was installed, while the router still holds
     /// its commitment (which authenticates the packet). Permissionless.
     function backfill(IICS26RouterMsgs.Packet calldata packet) external;

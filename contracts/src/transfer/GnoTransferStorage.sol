@@ -179,12 +179,11 @@ library GnoTransferStorage {
 
     // ---------------------------------------------------------------------------------------- notifications --
 
-    /// @notice Delivers a sender's IIBCSenderCallbacks notification, if it takes them; its failure is recorded and
-    /// never rolls a refund back.
+    /// @notice Delivers a sender's IIBCSenderCallbacks notification, if it takes them. A failure never rolls a refund
+    /// back: the notification is kept for `retryNotification`.
     function notify(address sender, bytes memory call, string memory clientId, uint64 sequence) internal {
         if (!ERC165Checker.supportsInterface(sender, type(IIBCSenderCallbacks).interfaceId)) return;
-        (bool ok,) = sender.call(call);
-        emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
+        _deliver(sender, call, clientId, sequence);
     }
 
     /// @notice Holds a notification until the refund it announces is paid (only for senders that take them).
@@ -193,7 +192,7 @@ library GnoTransferStorage {
         layout().notices[keccak256(bytes(clientId))][sequence] = call;
     }
 
-    /// @notice Delivers a held notification once its refund is paid in full.
+    /// @notice Delivers a held notification once its refund is paid in full (kept if it fails).
     function releaseNotice(
         IGnoICS20ControlsTypes.SendRecord storage rec,
         string memory clientId,
@@ -201,12 +200,43 @@ library GnoTransferStorage {
     )
         internal
     {
+        bytes memory call = layout().notices[keccak256(bytes(clientId))][sequence];
+        if (call.length != 0) _deliver(rec.sender, call, clientId, sequence);
+    }
+
+    /// @notice Calls the sender; on success the stored copy (if any) is dropped, on failure the notification is kept.
+    function _deliver(
+        address sender,
+        bytes memory call,
+        string memory clientId,
+        uint64 sequence
+    )
+        private
+        returns (bool ok)
+    {
+        (ok,) = sender.call(call);
         mapping(uint64 => bytes) storage n = layout().notices[keccak256(bytes(clientId))];
-        bytes memory call = n[sequence];
-        if (call.length == 0) return;
-        delete n[sequence];
-        (bool ok,) = rec.sender.call(call);
+        if (ok) delete n[sequence];
+        else n[sequence] = call;
         emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
+    }
+
+    /// @notice Retries a kept notification of a record whose outcome is final for the sender (a success ack, or a
+    /// refund paid in full); it only calls the sender, so it can never pay twice.
+    function retryNotice(
+        IGnoICS20ControlsTypes.SendRecord storage rec,
+        string memory clientId,
+        uint64 sequence
+    )
+        internal
+        returns (bool)
+    {
+        bytes memory call = layout().notices[keccak256(bytes(clientId))][sequence];
+        IGnoICS20ControlsTypes.Payment pay = rec.payment;
+        bool due = rec.outcome == IGnoICS20ControlsTypes.Outcome.Success || pay == IGnoICS20ControlsTypes.Payment.Paid
+            || pay == IGnoICS20ControlsTypes.Payment.Claimed;
+        if (call.length == 0 || !due) revert IGnoICS20ControlsTypes.GnoNoNotification(clientId, sequence);
+        return _deliver(rec.sender, call, clientId, sequence);
     }
 
     /// @notice What a record may still be refunded: its entitlement (kind 12) or its amount, less what was refunded.

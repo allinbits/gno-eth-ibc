@@ -357,6 +357,31 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(_isSuccessAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
     }
 
+    /// @notice Round 2 #8: a notification that failed is kept; once the sender takes callbacks again anyone retries
+    /// it, and the retry never pays a second time.
+    function test_r2_8_failedNotification_retried() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 500);
+        adapter.setRefuse(true);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(500, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence); // nothing kept yet
+        _timeout(pkt); // refund paid, notification refused
+        assertEq(usdc.balanceOf(address(adapter)), 500);
+        assertFalse(ctl.retryNotification(clientId, pkt.sequence)); // still refusing: kept
+        adapter.setRefuse(false);
+        vm.prank(alice); // anyone
+        assertTrue(ctl.retryNotification(clientId, pkt.sequence));
+        assertEq(adapter.notices(), 1);
+        assertEq(usdc.balanceOf(bob), 500, "forwarded the refund it was paid once");
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence);
+        assertEq(ctl.sendRecord(clientId, pkt.sequence).refunded, 500);
+    }
+
     // ================================================================ #16, #18 port and envelope boundary ==
 
     function test_r18_envelope1024Recorded_1025Spent() public {
