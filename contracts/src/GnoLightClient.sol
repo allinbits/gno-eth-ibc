@@ -36,7 +36,17 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
     /// @notice (votingPower << 160) | ethereumAddress of each validator, in set order.
     mapping(bytes32 valSetHash => mapping(uint256 index => uint256 entry)) private _valSetEntries;
 
+    /// @notice The live epoch: the (validatorsHash, nextValidatorsHash) pair of the latest accepted header. Before the
+    /// first update only the trusted next set is known, and the live set reads as zero.
+    bytes32 private _liveValidatorsHash;
+    bytes32 private _liveNextValidatorsHash;
+    /// @notice Block time at which the latest live transition was accepted (0: none yet). See `quarantineEnd`.
+    uint64 private _transitionTime;
+
     event ClientUpdated(uint64 indexed height, bytes32 blockHash, bytes32 appHash);
+    /// @notice An accepted update was a live transition (ADR pr6375 §7.10): token receives over this client are
+    /// quarantined from `transitionTime` for the route's governed duration.
+    event LiveTransition(uint64 indexed height, bytes32 validatorsHash, bytes32 nextValidatorsHash, uint64 transitionTime);
     event Frozen(uint64 indexed height);
     event ValidatorSetCached(bytes32 indexed valSetHash, uint256 size, uint256 totalPower);
 
@@ -71,6 +81,7 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         if (consensusState_.timestamp == 0) revert InvalidConsensusState();
         _clientState = clientState_;
         _consensusStates[clientState_.latestHeight] = consensusState_;
+        _liveNextValidatorsHash = consensusState_.nextValidatorsHash;
     }
 
     // ================================================================ views
@@ -106,6 +117,54 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         totalPower = uint128(meta);
     }
 
+    // ================================================================ quarantine (E9)
+
+    /// @notice The live epoch: the validator set and announced next set of the latest accepted header.
+    function liveEpoch() external view returns (bytes32 validatorsHash, bytes32 nextValidatorsHash) {
+        return (_liveValidatorsHash, _liveNextValidatorsHash);
+    }
+
+    /// @notice Block time of the latest accepted live transition, 0 if none.
+    function lastTransitionTime() external view returns (uint64) {
+        return _transitionTime;
+    }
+
+    /// @notice When a quarantine of `duration` seconds after the latest live transition ends (0 if none happened).
+    /// @dev Transition times only grow, so this is the max over every transition of (its time + duration): each
+    /// transition sets its own deadline once, and later headers of the established epoch do not extend it. The
+    /// duration is the route's governed setting (GnoICS20Transfer, decision kind 11); 0 disables it.
+    function quarantineEnd(uint256 duration) public view returns (uint256) {
+        uint256 t = _transitionTime;
+        return t == 0 || duration == 0 ? 0 : t + duration;
+    }
+
+    /// @notice Whether token receives over this client are quarantined under a `duration`-second quarantine.
+    function isQuarantined(uint256 duration) external view returns (bool) {
+        // forge-lint: disable-next-line(block-timestamp)
+        return block.timestamp < quarantineEnd(duration);
+    }
+
+    /// @notice Whether the client is frozen (misbehaviour).
+    function isFrozen() external view returns (bool) {
+        return _clientState.isFrozen;
+    }
+
+    /// @notice Whether the latest consensus state is past the trusting period, so nothing can be proven any more.
+    function isExpired() external view returns (bool) {
+        uint256 latestTs = _consensusStates[_clientState.latestHeight].timestamp;
+        // forge-lint: disable-next-line(block-timestamp)
+        return latestTs + uint256(_clientState.trustingPeriod) * NANOS <= block.timestamp * NANOS;
+    }
+
+    /// @notice Whether an accepted header is a live transition: it announces a next set other than the live epoch's,
+    /// or it is signed by a set that is neither the live set nor the live announced next set (a set the chain never
+    /// announced: a > 1/3 skip). The anchor the relayer chose plays no part.
+    function _isLiveTransition(Msgs.HeaderFields memory hf) private view returns (bool) {
+        bytes32 liveNext = _liveNextValidatorsHash;
+        return hf.nextValidatorsHash != liveNext
+            || (hf.validatorsHash != _liveValidatorsHash && hf.validatorsHash != liveNext);
+    }
+
     // ================================================================ update
 
     /// @inheritdoc ILightClient
@@ -138,6 +197,14 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
 
         _consensusStates[height] = v.consensusState;
         _clientState.latestHeight = height;
+        if (_isLiveTransition(header.signedHeader)) {
+            _transitionTime = uint64(block.timestamp);
+            emit LiveTransition(
+                height, header.signedHeader.validatorsHash, header.signedHeader.nextValidatorsHash, uint64(block.timestamp)
+            );
+        }
+        (_liveValidatorsHash, _liveNextValidatorsHash) =
+            (header.signedHeader.validatorsHash, header.signedHeader.nextValidatorsHash);
         // The next header's set is this one's next set; when it is this set, keep it for the updates to come.
         if (!v.vals.cached && v.vals.hash == v.consensusState.nextValidatorsHash) _cacheValSet(v.vals);
         emit ClientUpdated(height, v.blockHash, v.consensusState.appHash);
