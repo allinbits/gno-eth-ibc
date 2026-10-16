@@ -374,10 +374,14 @@ contract IBCAdminExec is IIBCAdmin {
             if (!escrow && proxy != IICS20Transfer(ics20).getIBCERC20Beacon()) return "params";
             if (call.length != 0) return "params";
         } else if (call.length >= 4) {
-            // the call runs in the new code as the proxy with IBCAdmin's authority: it must not upgrade again (to
-            // code no decision pinned), directly or through multicall
+            // the call runs in the new code as the proxy with IBCAdmin's authority: it must not set any other code (no
+            // decision pinned), directly or through multicall
             bytes4 sel = bytes4(call);
-            if (sel == UUPSUpgradeable.upgradeToAndCall.selector || sel == IMulticallLike.multicall.selector) {
+            if (
+                sel == UUPSUpgradeable.upgradeToAndCall.selector || sel == IMulticallLike.multicall.selector
+                    || sel == IICS20TransferAccessControlled.upgradeEscrowTo.selector
+                    || sel == IICS20TransferAccessControlled.upgradeIBCERC20To.selector
+            ) {
                 return "nested upgrade";
             }
         }
@@ -389,6 +393,11 @@ contract IBCAdminExec is IIBCAdmin {
     /// points at the implementation and is still the transfer app's.
     function applyUpgrade(address proxy, address impl, bytes calldata call) external delegated {
         _selfOnly();
+        // the beacons this decision does not upgrade keep their code (whatever the new code's call does)
+        address escrowBeacon = IICS20Transfer(ics20).getEscrowBeacon();
+        address tokenBeacon = IICS20Transfer(ics20).getIBCERC20Beacon();
+        address escrowImpl = UpgradeableBeacon(escrowBeacon).implementation();
+        address tokenImpl = UpgradeableBeacon(tokenBeacon).implementation();
         if (proxy == router || proxy == ics20) {
             UUPSUpgradeable(proxy).upgradeToAndCall{ gas: CALL_GAS }(impl, call);
             if (IAccessManaged(proxy).authority() != accessManager) revert AuthorityLost(proxy);
@@ -400,14 +409,18 @@ contract IBCAdminExec is IIBCAdmin {
             ) {
                 revert AuthorityLost(proxy);
             }
-            return;
-        }
-        if (proxy == IICS20Transfer(ics20).getEscrowBeacon()) {
+        } else if (proxy == escrowBeacon) {
             IICS20TransferAccessControlled(ics20).upgradeEscrowTo(impl);
+            escrowImpl = impl;
         } else {
             IICS20TransferAccessControlled(ics20).upgradeIBCERC20To(impl);
+            tokenImpl = impl;
         }
-        if (UpgradeableBeacon(proxy).implementation() != impl || UpgradeableBeacon(proxy).owner() != ics20) {
+        if (
+            UpgradeableBeacon(escrowBeacon).implementation() != escrowImpl
+                || UpgradeableBeacon(tokenBeacon).implementation() != tokenImpl
+                || UpgradeableBeacon(escrowBeacon).owner() != ics20 || UpgradeableBeacon(tokenBeacon).owner() != ics20
+        ) {
             revert AuthorityLost(proxy);
         }
     }

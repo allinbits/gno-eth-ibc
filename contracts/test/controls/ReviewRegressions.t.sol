@@ -27,7 +27,9 @@ import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
 import { RefusingToken } from "../utils/RefusingToken.sol";
-import { MockPermit2, SenderAdapter, ReentrantToken } from "../utils/ControlsMocks.sol";
+import { MockPermit2, SenderAdapter, ReentrantToken, BeaconSwappingFork } from "../utils/ControlsMocks.sol";
+import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
+import { Escrow } from "@eureka/utils/Escrow.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
 /// @notice Regression tests for the second review of the Ethereum controls (findings numbered as in that review).
@@ -647,6 +649,45 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(usdc.balanceOf(alice), before);
         assertEq(ctl.sendRecord(clientId, pkt.sequence).settlement, 1);
         assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Paid));
+    }
+
+    /// @notice Round 3 #2: a kind 7 call may not set any other code: neither beacon setter as the call, nor a call of
+    /// the new code that re-points a beacon (an after-check), and the upgrade rolls back whole.
+    function test_r3_2_upgradeCallNeverSwapsABeacon() public {
+        address controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
+        address a = address(new GnoICS20Transfer(controls));
+        address evil = address(new BeaconSwappingFork(controls));
+        address unpinned = address(new Escrow());
+        address escrowBeacon = IICS20Transfer(address(ics20)).getEscrowBeacon();
+        address tokenBeacon = IICS20Transfer(address(ics20)).getIBCERC20Beacon();
+        address escrowBefore = UpgradeableBeacon(escrowBeacon).implementation();
+        address tokenBefore = UpgradeableBeacon(tokenBeacon).implementation();
+        bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+        bytes32 before = vm.load(address(ics20), implSlot);
+        uint64 viaEscrow = _decide(
+            S.KIND_UPGRADE,
+            P.upgrade(address(ics20), a, a.codehash, abi.encodeWithSignature("upgradeEscrowTo(address)", unpinned))
+        );
+        uint64 viaToken = _decide(
+            S.KIND_UPGRADE,
+            P.upgrade(address(ics20), a, a.codehash, abi.encodeWithSignature("upgradeIBCERC20To(address)", unpinned))
+        );
+        uint64 viaCode = _decide(
+            S.KIND_UPGRADE,
+            P.upgrade(
+                address(ics20), evil, evil.codehash, abi.encodeWithSignature("swapEscrowBeacon(address)", unpinned)
+            )
+        );
+        _skip(7 days);
+        admin.execute(viaEscrow);
+        admin.execute(viaToken);
+        admin.execute(viaCode);
+        assertEq(_state(viaEscrow), S.SPENT);
+        assertEq(_state(viaToken), S.SPENT);
+        assertEq(_state(viaCode), S.SPENT);
+        assertEq(UpgradeableBeacon(escrowBeacon).implementation(), escrowBefore);
+        assertEq(UpgradeableBeacon(tokenBeacon).implementation(), tokenBefore);
+        assertEq(vm.load(address(ics20), implSlot), before);
     }
 
     // ============================================================== #20 send variants and reentrancy ==

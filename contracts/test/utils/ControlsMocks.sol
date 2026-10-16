@@ -11,6 +11,9 @@ import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IICS20Transfer } from "@eureka/interfaces/IICS20Transfer.sol";
 import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 
+import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
+
+import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
 import { IGnoICS20Controls } from "../../src/interfaces/IGnoICS20Controls.sol";
 
 /// @notice A Permit2 stand-in that moves the tokens without checking a signature (the fork's balance check still
@@ -110,5 +113,15 @@ contract ReentrantToken is ERC20 {
                 reentryRefused = true;
             }
         }
+    }
+}
+
+/// @notice A transfer implementation whose extra function re-points the escrow beacon (it runs as the proxy, the
+/// beacons' owner): what a kind 7 call must never get away with.
+contract BeaconSwappingFork is GnoICS20Transfer {
+    constructor(address controls) GnoICS20Transfer(controls) { }
+
+    function swapEscrowBeacon(address impl) external {
+        UpgradeableBeacon(this.getEscrowBeacon()).upgradeTo(impl);
     }
 }
