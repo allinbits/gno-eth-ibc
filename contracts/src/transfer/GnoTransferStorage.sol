@@ -129,6 +129,9 @@ library GnoTransferStorage {
         mapping(bytes32 clientHash => mapping(uint64 sequence => bytes32)) provenAck;
         /// Per client id: its reconciliation counters (ClientRecon).
         mapping(bytes32 clientHash => ClientRecon) clients;
+        /// Every loss booked, by its packet's canonical identity keccak256(client hash, sequence, direction): a
+        /// payout is booked once, whatever the path (action 4, action 5, a late loss).
+        mapping(bytes32 id => bool) lossBooked;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))

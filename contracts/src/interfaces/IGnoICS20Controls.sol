@@ -145,6 +145,8 @@ interface IGnoICS20ControlsTypes {
     /// @notice Less gas left than a caller-funded notification's budget and reserve.
     error GnoNotificationStarved();
     error GnoRouteReopening(string clientId);
+    /// @notice A loss of this packet (client id, sequence, direction 1 outbound, 2 inbound) is already booked.
+    error GnoLossBooked(string clientId, uint64 sequence, uint8 direction);
     /// @notice Kind 13 waits: `pending` unresolved incidents still have an open or unsettled suspect record.
     error GnoIncidentsPending(string clientId, uint64 pending);
     error GnoRecordsOpen(string clientId, uint64 open);
@@ -328,6 +330,9 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice A receive at an inbound `sequence` of `clientId`: the token released or minted and its amount (zero
     /// once kind 12 action 5 booked it as forged, or if there was none).
     function receiveRecord(string calldata clientId, uint64 sequence) external view returns (address, uint256);
+
+    /// @notice Whether a loss of a packet is booked, by its canonical identity (direction 1 a send, 2 a receive).
+    function lossBooked(string calldata clientId, uint64 sequence, uint8 direction) external view returns (bool);
     /// @notice Escrow of the token reserved for the route's owed refunds (queued, parked or decided but unpaid).
     function reserved(string calldata clientId, address token) external view returns (uint256);
     /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).

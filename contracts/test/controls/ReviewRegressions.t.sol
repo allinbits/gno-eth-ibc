@@ -1944,6 +1944,40 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertLt(used, 300_000, "constant work: no walk of the twelve incidents");
     }
 
+    /// @notice Round 8 sweep (a): a loss has one canonical identity (client id, sequence, direction): a send's forged
+    /// refund and a forged receive at the same sequence number are two packets, each booked once; neither is booked
+    /// again under any path, late ones included.
+    function test_r8_a_lossIdentity_oncePerPacketAndDirection() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        string memory usdcBack = string.concat("transfer/", CP, "/", Strings.toHexString(address(usdc)));
+        IICS26RouterMsgs.Packet memory out = _send(alice, address(usdc), 30, clientId);
+        IICS26RouterMsgs.Packet memory base = _send(alice, address(usdc), 50, clientId);
+        _ack(base, bytes("{\"result\":\"AQ==\"}")); // delivered: backing for the receive
+        _errorAck(out); // a forged refund, paid
+        assertTrue(_isSuccessAck(_transferIn(clientId, usdcBack, 20, bob))); // a forged receive
+        uint64 inbound = nextRecvSeq[keccak256(bytes(clientId))];
+        assertEq(inbound, out.sequence, "the same number, two directions");
+        _retire();
+        _proveDelivered(out);
+        _proveDelivered(base);
+        _settle(_item(base.sequence, 3, 0));
+        _settle(_item(out.sequence, 4, 30));
+        assertTrue(ctl.lossBooked(clientId, out.sequence, 1));
+        assertFalse(ctl.lossBooked(clientId, inbound, 2));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        _settle(_item(inbound, 5, 20)); // a late loss, the other direction
+        assertTrue(ctl.lossBooked(clientId, inbound, 2));
+        assertEq(ctl.losses(clientId, address(usdc)), 50);
+        vm.startPrank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(out.sequence, 4, 30));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(inbound, 5, 20));
+        vm.stopPrank();
+        assertEq(ctl.losses(clientId, address(usdc)), 50);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {

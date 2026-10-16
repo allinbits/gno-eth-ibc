@@ -218,7 +218,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             );
             rec.settlement = 4;
             if (owed) _reject(rec, clientId, it.sequence);
-            if (it.amount != 0) _bookLoss(g, route, clientId, rec.token, it.sequence, it.amount);
+            if (it.amount != 0) _bookLoss(g, route, clientId, rec.token, it.sequence, it.amount, OUTBOUND);
         } else {
             revert GnoBadSettlement(i);
         }
@@ -251,7 +251,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(amount != 0 && amount == it.amount, GnoBadSettlement(i));
         address token = address(uint160(r));
         g.receives[clientHash][it.sequence] = uint160(token); // booked: never again
-        _bookLoss(g, route, clientId, token, it.sequence, amount);
+        _bookLoss(g, route, clientId, token, it.sequence, amount, INBOUND);
         emit GnoSettled(clientId, it.sequence, 5, amount);
     }
 
@@ -263,10 +263,15 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         string calldata clientId,
         address token,
         uint64 sequence,
-        uint256 amount
+        uint256 amount,
+        uint8 direction
     )
         private
     {
+        // one canonical identity per packet, whatever the booking path: (client id, sequence, direction)
+        bytes32 id = keccak256(abi.encode(keccak256(bytes(clientId)), sequence, direction));
+        require(!g.lossBooked[id], GnoLossBooked(clientId, sequence, direction));
+        g.lossBooked[id] = true;
         GnoTransferStorage.Route storage r = g.routes[route];
         // the loss ledger never changes while a reopening walks it
         require(!r.reopening, GnoRouteReopening(clientId));
@@ -288,6 +293,10 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         GnoTransferStorage.dropNotice(clientId, sequence);
         emit GnoRefundRejected(clientId, sequence);
     }
+
+    /// @notice A loss's direction: a send's forged refund (action 4), or a forged receive (action 5).
+    uint8 private constant OUTBOUND = 1;
+    uint8 private constant INBOUND = 2;
 
     /// @notice Deficits accepted per call: kind 13's first batch, and at most this per `continueReopen` call.
     uint256 private constant REOPEN_BATCH = 16;

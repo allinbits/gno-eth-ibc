@@ -201,6 +201,20 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
+    function lossBooked(
+        string calldata clientId,
+        uint64 sequence,
+        uint8 direction
+    )
+        external
+        view
+        delegated
+        returns (bool)
+    {
+        return _g().lossBooked[keccak256(abi.encode(keccak256(bytes(clientId)), sequence, direction))];
+    }
+
+    /// @notice See IGnoICS20Controls.
     function receiveRecord(
         string calldata clientId,
         uint64 sequence
