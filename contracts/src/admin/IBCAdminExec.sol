@@ -52,8 +52,8 @@ contract IBCAdminExec is IIBCAdmin {
     uint256 internal constant CALL_FLOOR = CALL_GAS * 64 / 63 + 10_000;
     /// @notice Gas a step's after-checks get past its call, and the gas a step (`_selfStep`) must have left to start.
     uint256 internal constant AFTER_GAS = 200_000;
-    /// @notice Kind 12's budget: an envelope holds at most about nine records, each with a payment and a sender
-    /// callback of capped gas.
+    /// @notice Kind 12's budget: an envelope holds at most about nine records, each with a payment (a settlement
+    /// never loads or delivers a sender notification: `retryNotification` does).
     uint256 internal constant SETTLE_GAS = 4_000_000;
     uint256 internal constant STEP_FLOOR = (CALL_FLOOR + AFTER_GAS + 50_000) * 64 / 63 + 50_000;
     uint64 internal constant MAX_QUARANTINE = 365 days;

@@ -953,6 +953,45 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(address(router.getClient(clientId)), clientBefore);
     }
 
+    /// @notice Round 4 #2: kind 12, through IBCAdmin.execute and its fixed budget, settles refunds whose held
+    /// notifications are 100,000 bytes each, alone and in a batch: it never loads them; anyone delivers them after.
+    function test_r4_2_hugeNotifications_neverLoadedBySettlement() public {
+        _setLimits(address(usdc), 1000, 1000, 1);
+        string memory memo = string(new bytes(100_000));
+        SenderAdapter[6] memory adapters;
+        uint64[6] memory seqs;
+        for (uint256 i = 0; i < 6; i++) {
+            adapters[i] = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+            usdc.mint(address(adapters[i]), 100);
+            vm.recordLogs();
+            adapters[i].sendWithMemo(100, clientId, memo);
+            IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+            seqs[i] = pkt.sequence;
+            _errorAck(pkt); // queued under the refund meter, its 100,000-byte notification held
+        }
+        _retire();
+        uint64 single = _decide(S.KIND_SETTLE, P.settle1(clientId, seqs[0], 1, 100));
+        P.SettleItem[] memory items = new P.SettleItem[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            items[i] = P.SettleItem(seqs[i + 1], 1, 100);
+        }
+        uint64 batch = _decide(S.KIND_SETTLE, P.settle(clientId, items));
+        _skip(7 days);
+        admin.execute{ gas: 8_000_000 }(single);
+        admin.execute{ gas: 8_000_000 }(batch);
+        assertEq(_state(single), S.EXECUTED, "settled, not spent");
+        assertEq(_state(batch), S.EXECUTED, "settled, not spent");
+        assertEq(ctl.openRecords(clientId), 0);
+        for (uint256 i = 0; i < 6; i++) {
+            assertEq(usdc.balanceOf(address(adapters[i])), 100, "refunded");
+            assertEq(adapters[i].notices(), 0, "nothing delivered by the settlement");
+            assertTrue(ctl.retryNotification(clientId, seqs[i]));
+            assertEq(adapters[i].notices(), 1);
+            assertEq(usdc.balanceOf(address(adapters[i])), 0, "forwarded on its notification");
+        }
+        assertEq(usdc.balanceOf(bob), 600);
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

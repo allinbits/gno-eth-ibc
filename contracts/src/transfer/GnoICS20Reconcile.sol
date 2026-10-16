@@ -120,7 +120,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                     if (GnoTransferStorage.tryPayRefund(rec, left)) {
                         rec.payment = Payment.Claimed;
                         emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
-                        GnoTransferStorage.releaseNotice(rec, clientId, it.sequence);
+                        // the notification is due, never loaded here: anyone delivers it by retryNotification
+                        emit GnoNotificationDue(clientId, it.sequence);
                     } else {
                         rec.payment = Payment.Parked;
                         emit GnoRefundParked(clientId, it.sequence, rec.token, left);

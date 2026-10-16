@@ -143,6 +143,9 @@ interface IGnoICS20ControlsTypes {
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).
     event GnoSenderNotified(string clientId, uint64 indexed sequence, bool ok);
+    /// @notice A refund paid by reconciliation (kind 12): its sender's notification is due, delivered by
+    /// `retryNotification` (a settlement never loads it).
+    event GnoNotificationDue(string clientId, uint64 indexed sequence);
 }
 
 /// @title The functions of the controls (served by GnoICS20Controls through GnoICS20Transfer's fallback)
