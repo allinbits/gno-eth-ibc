@@ -356,11 +356,18 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             revert Deferred();
         }
         if (block.timestamp < matureAt) revert NotMature(matureAt);
-        // effects first: a call below that reverts reverts this, and the decision stays pending for a retry
+        // the execution runs in a frame of its own with the kind's fixed gas: whatever fails inside it (a refused
+        // call, a revert, its own gas) fails deterministically and spends the decision; only a caller sending less
+        // gas than the frame needs is refused before it, and the decision pends
+        _exec(l); // a foreign executor pends every decision (ForeignExec), never spends one
+        uint256 budget = S.execGas(kind);
+        if (gasleft() < budget * 64 / 63 + 60_000) revert CallStarved();
         d.state = S.EXECUTED;
         delete d.params;
-        string memory spent =
-            abi.decode(_delegate(l, abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))), (string));
+        (bool ok, bytes memory ret) = address(this).call{ gas: budget }(
+            abi.encodeCall(this.selfDelegate, (abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))))
+        );
+        string memory spent = ok ? abi.decode(abi.decode(ret, (bytes)), (string)) : "reverted";
         if (bytes(spent).length != 0) {
             d.state = S.SPENT;
             emit DecisionSpent(ep, seq, kind, spent);

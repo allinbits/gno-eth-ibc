@@ -225,7 +225,8 @@ contract IBCAdminExec is IIBCAdmin {
     // ============================================================================================ execution ==
 
     /// @notice Carries out a matured decision IBCAdmin's `execute` closed; the reason it is spent, or "" when it
-    /// executed. A call that reverts reverts `execute` whole, and the decision stays pending for a retry.
+    /// executed. It runs in IBCAdmin's execution frame (the kind's fixed gas, `IBCAdminStorage.execGas`): anything
+    /// that reverts in it spends the decision too.
     function run(
         uint8 kind,
         uint64 seq,

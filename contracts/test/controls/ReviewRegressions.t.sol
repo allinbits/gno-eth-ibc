@@ -1640,6 +1640,76 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.claimParked(clientId, pkts[0].sequence), 100);
     }
 
+    /// @notice Round 6 #5: every kind's deterministic failure at execution spends the decision (its own frame:
+    /// a refused call, a revert or a reason), and it can never run later; only a caller starving the frame leaves it
+    /// pending. Kind 6 migrating a client that does not exist yet is spent, and stays spent once the client exists.
+    function test_r6_5_deterministicFailures_spendEveryKind() public {
+        uint64[] memory seqs = new uint64[](11);
+        uint256 n;
+        // kind 3: a key that holds a seat by execution (the second decision runs first)
+        IGuardians.SeatKey[] memory a = new IGuardians.SeatKey[](1);
+        a[0] = IGuardians.SeatKey(0, makeAddr("k"));
+        IGuardians.SeatKey[] memory b = new IGuardians.SeatKey[](1);
+        b[0] = IGuardians.SeatKey(1, makeAddr("k"));
+        seqs[n++] = _decide(S.KIND_SEATS, P.seats(a));
+        uint64 seatFirst = _decide(S.KIND_SEATS, P.seats(b));
+        // kind 4: a loosening a later tightening (applied at recording) supersedes
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        seqs[n++] = _decide(S.KIND_LIMITS, P.limits(clientId, address(usdc), 2000, 1000, 1000, 0, 0));
+        _decide(S.KIND_LIMITS, P.limits(clientId, address(usdc), 500, 1000, 1000, 0, 0));
+        // kind 5: a voucher whose code is not the decision's
+        seqs[n++] = _decide(S.KIND_VOUCHER, P.voucher(clientId, "ubar", address(usdc), bytes32(uint256(1))));
+        // kind 6: migrating a client that does not exist
+        MockLightClient x = new MockLightClient();
+        uint64 ghost =
+            _decide(S.KIND_CLIENT, P.client(2, "gnoland-6", "ethereum-6", _prefix(), address(x), address(x).codehash));
+        seqs[n++] = ghost;
+        // kind 7: a proxy that is none of the four
+        address impl = address(new ICS26Router());
+        seqs[n++] = _decide(S.KIND_UPGRADE, P.upgrade(address(usdc), impl, impl.codehash, ""));
+        // kind 9: an executor bound elsewhere
+        AllowingExec foreign = new AllowingExec(address(router), d.accessManager, address(usdc));
+        seqs[n++] = _decide(S.KIND_HANDOVER, P.handover(address(foreign), address(foreign).codehash, ""));
+        // kind 10: a client no kind 6 enrolled
+        seqs[n++] = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-77", 0));
+        // kind 11: a shortening a later lengthening (applied at recording) supersedes
+        seqs[n++] = _decide(S.KIND_SETTINGS, P.settings(clientId, 1 days));
+        _decide(S.KIND_SETTINGS, P.settings(clientId, 30 days));
+        // kind 12: a settlement of a record of an id still in use (the call reverts)
+        seqs[n++] = _decide(S.KIND_SETTLE, P.settle1(clientId, 1, 1, 1));
+        // kind 13: reopening an open route (the call reverts)
+        seqs[n++] = _decide(S.KIND_REOPEN, P.reopen(clientId));
+        _skip(7 days);
+        admin.execute(seatFirst);
+        for (uint256 i = 0; i < n; i++) {
+            admin.execute(seqs[i]);
+            assertEq(_state(seqs[i]), S.SPENT, vm.toString(i));
+            vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotPending.selector, seqs[i]));
+            admin.execute(seqs[i]);
+        }
+        // the client the failed kind 6 named now exists: the spent decision still never runs
+        uint64 add = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-6", "ethereum-6", _prefix(), address(lc), address(lc).codehash)
+        );
+        _skip(7 days);
+        admin.execute(add);
+        assertEq(_state(add), S.EXECUTED);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotPending.selector, ghost));
+        admin.execute(ghost);
+        assertEq(address(router.getClient("gnoland-6")), address(lc));
+    }
+
+    /// @notice Round 6 #5: a caller sending less gas than a kind's frame needs leaves the decision pending.
+    function test_r6_5_starvedCaller_leavesThePending() public {
+        uint64 seq = _decide(S.KIND_REOPEN, P.reopen(clientId));
+        _skip(7 days);
+        (bool ok,) = address(admin).call{ gas: 1_000_000 }(abi.encodeCall(admin.execute, (seq)));
+        assertFalse(ok);
+        assertEq(_state(seq), S.PENDING);
+        admin.execute(seq);
+        assertEq(_state(seq), S.SPENT);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {

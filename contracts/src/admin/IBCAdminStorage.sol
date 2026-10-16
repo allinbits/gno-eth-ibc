@@ -202,6 +202,16 @@ library IBCAdminStorage {
         return c >= "0" && c <= "9";
     }
 
+    /// @notice The gas a kind's execution frame gets (IBCAdmin.execute): enough for every step it takes, its fixed
+    /// call budgets included, so a failure inside the frame is the decision's, never the caller's (it is spent);
+    /// a caller sending less than the frame needs is refused before it (the decision pends).
+    function execGas(uint8 kind) internal pure returns (uint256) {
+        if (kind == KIND_SETTLE) return 7_000_000;
+        if (kind == KIND_UPGRADE || kind == KIND_HANDOVER) return 3_500_000;
+        if (kind == KIND_ROUTE || kind == KIND_CLIENT || kind == KIND_REOPEN) return 2_500_000;
+        return 1_500_000;
+    }
+
     function knownKind(uint8 kind) internal pure returns (bool) {
         return kind >= KIND_CANCEL && kind <= KIND_REOPEN;
     }
