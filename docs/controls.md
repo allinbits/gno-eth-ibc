@@ -9,7 +9,8 @@ built, where each rule lives, and where the implementation departs from the ADR.
 | Contract | File | What it is |
 |---|---|---|
 | `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); every change is marked `GNO:`. Installed by the ICS20 proxy's own UUPS upgrade. Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
-| `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim` and views. Runs only by delegatecall from `GnoICS20Transfer`'s `fallback` (EIP-170 keeps the two apart); its address is an immutable of the fork's implementation. |
+| `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim`, views, and `ackHook` (the fork's ack/timeout settlement, reachable only through the fork's own call: a consume-once transient flag). Runs only by delegatecall from `GnoICS20Transfer`'s `fallback` (EIP-170 keeps them apart); its address is an immutable of the fork's implementation. |
+| `GnoICS20Reconcile` | `contracts/src/transfer/GnoICS20Reconcile.sol` | Reconciliation: `claimParked`, `settleRecords` (kind 12), `reopenRoute` (kind 13), `backfill`, `retryNotification`. Reached through `GnoICS20Controls`' fallback; its address is an immutable of the controls. |
 | `GnoTransferStorage` | `contracts/src/transfer/GnoTransferStorage.sol` | The fork's ERC-7201 layout (`gno.storage.GnoICS20Transfer`) and the route-key helpers both halves use. |
 | `IBCAdmin` | `contracts/src/admin/IBCAdmin.sol` | Permanent, immutable IBC app on port `ibcgov`: the §5.4 delivery protocol, the decision ledger, flags on itself, execution scheduling, recovery entry points, `finishSetup`. Holds `ADMIN_ROLE`. |
 | `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: every kind at recording and at execution. Delegatecalled at a pinned code hash; replaced only by kind 9. |
@@ -33,8 +34,10 @@ attribution terms extend to works that use those files.
 - **`gno.storage.GnoICS20Transfer`** (`GnoTransferStorage.Layout`): guardian keys (IBCAdmin's copy), `routeOf`
   (client id → route key), `currentOf` (route key → current client id), `retired`, per route: pause flags, refunds
   flags, quarantine seconds and the deadline of transitions already seen, recovery block, `closed`; per (route,
-  token): limits, receive bucket, refund bucket, refund queue, recorded losses; per (client id, sequence): the send
-  record and a sender notification held until its refund is paid. Guardian keys carry the block each seat's key was
+  token): limits, receive bucket, refund bucket, refund queue, the escrow reserved for owed refunds, recorded losses
+  and the part accepted as a deficit; per route: its open-record count and the tokens with losses; per (client id,
+  sequence): the send record (open flag, settlement) and a sender notification held until its refund is paid, or
+  kept after a failed delivery. Guardian keys carry the block each seat's key was
   set at, so a flag stands only if the current key set it since then.
 - **`gno.storage.IBCAdmin`** (`IBCAdminStorage.Layout`): epoch, last seq, epoch client, last record time, conflict
   flag, executor and its code hash, decisions and tombstones keyed by epoch, guardian keys and flags, hold history,
@@ -73,22 +76,23 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 |---|---|
 | E5 receive limits per (route, token): max per message + leaky-bucket day cap, in `onRecvPacket` only, before minting or releasing | `GnoICS20Transfer._chargeReceive`; `LeakyBucket` |
 | a limits change settles both buckets at the old caps first, so a new cap never rewrites past drainage | `GnoICS20Controls.setLimits`; `LeakyBucket.settle` |
-| E5 refunds exempt from receive limits; `GnoVoucher.mint`/`Escrow.send` unlimited; eureka's escrow rate limit unset | refunds go through `_settleRefund`, never `_chargeReceive` |
+| E5 refunds exempt from receive limits; `GnoVoucher.mint`/`Escrow.send` unlimited; eureka's escrow rate limit unset | refunds go through `ackHook`, never `_chargeReceive` |
 | E6 default deny: a gno denom without a registered voucher (and limits) is refused, no IBCERC20 ever created | `onRecvPacket` (`GnoDenomNotRegistered`, `GnoLimitsNotSet`); `_getOrCreateIBCERC20` removed |
 | E6 expected refusals revert with non-empty custom errors (router → error ack) | `IGnoICS20ControlsTypes` errors |
 | E6 send limits for escrowed (Ethereum-native) tokens only (`sendMax`/`sendMin`, 0 = unset); returning vouchers never limited or paused | `_checkEscrowedSend`, skipped when `burned` |
 | E6/§7.13 send record in every send variant after `sendPacket` returns the sequence (`sendTransfer`, `…WithPermit2`, `…WithSender`) | `_recordSend` (all three go through `_sendTransferFromEscrowWithSender`) |
 | §7.13 records hold the router's commitment, not the packet bytes (bytes in `SendPacket`, authenticated against it); a packet sent before the fork is processed only after a permissionless `backfill(packet)` authenticated its record | `_recordSend`; `GnoICS20Controls.backfill`; `_processed` (`GnoNoSendRecord`) |
-| §7.13 ack/timeout attach outcome, local processing block and payment state | `_processed`, `_recordOutcome`, `_settleRefund` |
-| §7.13 refund meter per (route, token), queue beyond it, permissionless `claim` (installments) | `_settleRefund`; `GnoICS20Controls.claim` |
+| §7.13 ack/timeout attach outcome, local processing block and payment state | `GnoICS20Controls.ackHook` |
+| §7.13 refund meter per (route, token), queue beyond it, permissionless `claim` (installments) | `GnoICS20Controls.ackHook`, `claim` |
+| §7.12 owed refunds (queued, parked, decided but unpaid) reserve their escrow; a receive never releases escrow below the reservation (`GnoEscrowReserved`, an error ack); vouchers reserve nothing | `GnoTransferStorage.reservation/syncReserve`; `GnoICS20Transfer.onRecvPacket` |
 | a refund the token or escrow refuses (blacklisted sender, paused token) is parked, never blocking the ack or the queue; `claimParked` retries it | `GnoTransferStorage.tryPayRefund`; `claim`, `claimParked` |
-| a sender's `IIBCSenderCallbacks` notification of an error ack or timeout is delivered when its refund is paid (at once, at claim, or by kind 12); a failing notification is recorded and never rolls the refund back | `GnoICS20Transfer._notice`; `GnoTransferStorage.notify/holdNotice/releaseNotice` |
-| §7.13 refunds hold suspends proof-based refunds and claims, cancels nothing, follows the ordinary flag and hold rules | route `refundFlags`; `setRefundsFlag`/`clearRefundsFlag`; `unpauseRoute`; checked in `_settleRefund`, `claim`, `claimParked` |
+| a sender's `IIBCSenderCallbacks` notification of an error ack or timeout is delivered when its refund is paid (at once, at claim, or by kind 12); a failing notification never rolls the refund back, is kept, and anyone retries it (`retryNotification`, which never pays) | `GnoTransferStorage.notify/holdNotice/releaseNotice/retryNotice`; `GnoICS20Reconcile.retryNotification` |
+| §7.13 refunds hold suspends proof-based refunds and claims, cancels nothing, follows the ordinary flag and hold rules | route `refundFlags`; `setRefundsFlag`/`clearRefundsFlag`; `unpauseRoute`; checked in `ackHook`, `claim`, `claimParked` |
 | §7.3 a pause never blocks acks, timeouts or refunds; PAUSER_ROLE granted to nobody | `whenNotPaused` removed from the ack/timeout callbacks; deployment roles |
 | E7 4 guardian + 2 watch seats, flags, holds (two guardian flags), 24 h hold end, unpause clears earlier flags, refused under a hold | `Guardians`; per route in the fork, on IBCAdmin itself |
 | a replaced key's flags die on every flag set, and stay dead if the key returns (seat generations) | `Guardians.Keys.since`, `setKeys`, `standing` |
 | E7 route flags block receives and Ethereum-native sends only | `_checkReceiveRoute`, `_checkEscrowedSend` |
-| E9 live-epoch quarantine, anchor-independent; a duration applies to transitions accepted after it, a started quarantine keeps its deadline; governance not quarantined | `GnoLightClient._isLiveTransition`, `lastTransitionTime`; `GnoTransferStorage.quarantineUntil`; `setQuarantine` settles; never checked by IBCAdmin |
+| E9 live-epoch quarantine, anchor-independent; a duration applies to transitions accepted after it, a started quarantine keeps its deadline; transitions told apart by number; a duration change reads the route's current client, whichever id names it; governance not quarantined | `GnoLightClient._isLiveTransition`, `lastTransition`; `GnoTransferStorage.quarantineUntil`; `GnoICS20Controls.setQuarantine` settles; never checked by IBCAdmin |
 | §5.4 envelope, acks, statuses, window W = 64, drain D = 8 (every delivery and `drain()`), duplicates, conflicts | `IBCAdmin.onRecvPacket`, `_deliver`, `_record`, `_drain` |
 | §5.4 cancels anywhere: tombstones on arrival of the ranges as given (≤ 64 merged per epoch), a cancel beyond the window bound to its hash, redispatch | `IBCAdmin._deliver`, `_parseCancel`, `_tombstone`; `IBCAdminStorage.addTombstone` |
 | §5.4 epochs: another epoch refused, everything keyed by (epoch, seq) | `IBCAdmin.onRecvPacket`; `IBCAdminStorage.Layout` |
@@ -100,14 +104,14 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | kind 3 at most 2 guardian seats, never a current key; both key copies follow; a replaced seat loses its recovery approval | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule; an older decision maturing later never overwrites a newer setting (kinds 4, 11) | `IBCAdminExec._loosens`; `IBCAdminStorage.supersede` |
 | kind 5 voucher registration, code-hash pinned, bound to the fork | `IBCAdminExec._voucher` |
-| kind 6 add (custom id) / migrate a client, code-hash pinned | `IBCAdminExec._client` |
+| kind 6 add (custom id) / migrate a client, code-hash pinned; a retired client id is never migrated (spent) | `IBCAdminExec._client` |
 | kind 7 upgrades (router, transfer app, its two beacons), code-hash pinned, fixed call gas, after-checks, no nested `upgradeToAndCall`/`multicall` in the call, rolled back whole on failure | `IBCAdminExec._upgrade`, `applyUpgrade` |
 | kind 8 relayer role only; never ADMIN or any role that upgrades or re-points | `IBCAdminExec.atRecording`/`run` |
 | kind 9 hand-over: swap the pinned executor (same bindings), optional migration call, rolled back whole on failure | `IBCAdminExec._handover`, `applyHandover` |
 | kind 10 / E12 route replacement: retire + freeze the old id, `migrateRoute` (the route closes), next epoch over the new id | `IBCAdminExec._route`; `IBCAdminStorage.replaceRoute`; `GnoICS20Controls.migrateRoute` |
 | kind 11 route quarantine setting | `IBCAdminExec.atRecording`/`run`; `GnoICS20Controls.setQuarantine` |
-| kind 12 settle: per send record of a retired client id, at most once, all or nothing: 1 pay a refund ≤ entitlement − refunded (parked if refused), 2 reject a queued refund, 3 settled as delivered, 4 record a loss | `IBCAdminExec.run`; `GnoICS20Controls.settleRecords` |
-| kind 13 reopen a closed route; a closed route refuses receives, sends and claims | `GnoICS20Controls.reopenRoute`; `_checkReceiveRoute`, `_sendTransferFromEscrowWithSender`, `_openRoute` |
+| kind 12 settle: per send record of a retired client id, at most once, all or nothing: 1 pay the refund's whole remainder (parked if refused), 2 reject a queued refund, 3 settled as delivered, 4 forged refund (reject the unpaid remainder, book what was paid as the loss); an ack or timeout of a settled record pays nothing and notifies nobody | `IBCAdminExec.run`; `GnoICS20Reconcile.settleRecords`; `GnoICS20Controls.ackHook` |
+| kind 13 reopen a closed route only when none of its send records is open (an O(1) count: opened by a send or backfill, closed by a success ack, a refund paid in full or a settlement); every loss not recapitalized becomes an accepted deficit (`GnoDeficitAccepted`, `acceptedDeficit`); a closed route refuses receives, sends and claims | `GnoICS20Reconcile.reopenRoute`; `GnoTransferStorage.openRecord/closeRecord`; `_checkReceiveRoute`, `_sendTransferFromEscrowWithSender`, `_openRoute` |
 | E12 route keys, constant-work migration, wire translation | `GnoTransferStorage.routeKey/toRouteDenom/toWireDenom`; `migrateRoute` |
 | §7.12 emergency recovery, off unless enabled at deployment; approval ≥ 3 of 4 guardians, cancellation ≥ 2 of 4; eligibility; an attested client of gno.land's chain id, neither frozen nor expired at approval and at execution; long delay; suspends kinds 3, 6–10 at recording and at execution; blocks receives while open; the route stays closed after it | `IBCAdmin` constructor, `approveRecovery/cancelRecovery/executeRecovery`; `IBCAdminRecovery` |
 | E4/E11 hand-over of every authority, deployer roles removed, check list read back | `script/DeployGnoIBC.s.sol`; `IBCAdmin.finishSetup`; `IBCAdminSetupCheck` |
@@ -137,6 +141,8 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
    checked exactly.
 9. **Kind 12 pays refunds outside the refund meter** (a governed decision) and only for records of a retired client
    id.
+10. **No recapitalization decision exists yet** on Ethereum: kind 13 accepts every recorded loss as a deficit. A
+    packet sent before the fork that was never backfilled is not counted among a route's open records.
 
 ## Upgrade runbook (installing the fork on a live ICS20 proxy)
 
@@ -154,6 +160,8 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
 
 - **A newly added client starts unquarantined.** A client installed by kind 6, kind 10 or the emergency recovery
   has no transition until its first one. Marking construction as a transition would also quarantine the launch client.
+- **Unbackfilled legacy packets.** The open-record count only knows recorded packets; the upgrade runbook
+  backfills every outstanding one before relaying resumes.
 - **Parking under starvation.** A relayer giving an ack too little gas for the token transfer can make a refund be
   parked instead of paid; it stays owed and `claimParked` pays it.
 - **The deployer cannot be the relayer** (`RELAYER_ADDRESS`): check 2 refuses any role left with the deployer.
@@ -164,7 +172,8 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
 
 `contracts/test/controls/` drives the real `ICS26Router` (mock light client) through the full deployment of
 `DeployGnoIBC`: `GnoICS20Transfer.t.sol`, `UpgradeCompat.t.sol`, `IBCAdminDelivery.t.sol`, `IBCAdminKinds.t.sol`,
-`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol`,
+`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (both
+review rounds' regressions, `test_r…` and `test_r2_…`),
 `GovVectors.t.sol`. Library and client tests: `Guardians.t.sol` (differential fuzz against a model),
 `LeakyBucket.t.sol`, `Quarantine.t.sol`. Foundry runs in Docker, image `ghcr.io/foundry-rs/foundry:v1.7.1` (pinned:
 under 1.8.1 the pre-existing `GasScaling` test runs out of gas).
