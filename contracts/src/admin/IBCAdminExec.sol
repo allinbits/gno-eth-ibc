@@ -54,7 +54,10 @@ contract IBCAdminExec is IIBCAdmin {
     uint256 internal constant AFTER_GAS = 200_000;
     /// @notice Kind 12's budget: an envelope holds at most about nine records, each with a payment (a settlement
     /// never loads or delivers a sender notification: `retryNotification` does).
-    uint256 internal constant SETTLE_GAS = 4_000_000;
+    uint256 internal constant SETTLE_GAS = 6_000_000;
+    /// @notice Most records a kind 12 settles (an envelope holds at most eight): each payment's gas is bounded, so
+    /// SETTLE_GAS covers them all.
+    uint256 internal constant MAX_SETTLE_ITEMS = 8;
     uint256 internal constant STEP_FLOOR = (CALL_FLOOR + AFTER_GAS + 50_000) * 64 / 63 + 50_000;
     uint64 internal constant MAX_QUARANTINE = 365 days;
 
@@ -159,7 +162,7 @@ contract IBCAdminExec is IIBCAdmin {
         if (kind == S.KIND_SETTLE) {
             (string memory sid, IGnoICS20ControlsTypes.SettleItem[] memory items) =
                 abi.decode(p, (string, IGnoICS20ControlsTypes.SettleItem[]));
-            bool ok = bytes(sid).length != 0 && items.length != 0;
+            bool ok = bytes(sid).length != 0 && items.length != 0 && items.length <= MAX_SETTLE_ITEMS;
             for (uint256 i = 0; ok && i < items.length; i++) {
                 ok = items[i].action >= 1 && items[i].action <= 5;
             }

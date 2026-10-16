@@ -209,7 +209,8 @@ library GnoTransferStorage {
         IGnoICS20ControlsTypes.SendRecord storage rec,
         uint256 amount,
         bytes32 route,
-        uint256 own
+        uint256 own,
+        bool bounded
     )
         internal
         returns (bool)
@@ -217,25 +218,40 @@ library GnoTransferStorage {
         address token = rec.token;
         address escrow = rec.escrow;
         bool burned = rec.burned;
+        // a bounded payment gives the token PAY_GAS per call: one that runs out on its own is parked, never taking
+        // the transaction (or a settlement's batch) down; with less gas left than the payment needs, the caller is
+        // starving it, and the whole call reverts (to be retried) instead
+        uint256 g = bounded ? PAY_GAS : gasleft();
+        if (bounded && gasleft() < PAY_NEED) revert IGnoICS20ControlsTypes.GnoPaymentStarved();
         bool ok;
+        bytes memory ret;
         if (!burned) {
             // the escrow keeps the route's other reservations: subtractions only, each guarded
             uint256 others = layout().tokens[route][token].reserved - own;
-            uint256 balance = IERC20(token).balanceOf(escrow);
+            (ok, ret) = token.staticcall{ gas: BALANCE_GAS }(abi.encodeCall(IERC20.balanceOf, (escrow)));
+            if (!ok || ret.length != 32) return false;
+            uint256 balance = abi.decode(ret, (uint256));
             if (balance < amount || balance - amount < others) return false;
         }
         if (burned) {
-            (ok,) = token.call(abi.encodeCall(IMintableAndBurnable.mint, (escrow, amount)));
+            (ok,) = token.call{ gas: g }(abi.encodeCall(IMintableAndBurnable.mint, (escrow, amount)));
             if (!ok) return false;
         }
-        (ok,) = escrow.call(abi.encodeCall(IEscrow.send, (IERC20(token), rec.sender, amount)));
+        (ok,) = escrow.call{ gas: g }(abi.encodeCall(IEscrow.send, (IERC20(token), rec.sender, amount)));
         if (!ok) {
+            // the voucher is governance-pinned code: its burn undoing the mint is not bounded
             if (burned) IMintableAndBurnable(token).burn(escrow, amount);
             return false;
         }
         rec.refunded += amount;
         return true;
     }
+
+    /// @notice The gas a bounded payment gives each token or escrow call, the gas a balance read gets, and the gas a
+    /// bounded payment needs left to start (both calls in full, and what follows them).
+    uint256 internal constant PAY_GAS = 200_000;
+    uint256 internal constant BALANCE_GAS = 30_000;
+    uint256 internal constant PAY_NEED = (BALANCE_GAS + 2 * PAY_GAS) * 64 / 63 + 100_000;
 
     // ------------------------------------------------------------------------------------------ open records --
 

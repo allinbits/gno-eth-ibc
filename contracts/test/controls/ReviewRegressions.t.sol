@@ -35,7 +35,8 @@ import {
     BeaconSwappingFork,
     AllowingExec,
     HookToken,
-    OlderFork
+    OlderFork,
+    GasBurnToken
 } from "../utils/ControlsMocks.sol";
 import { ICS26Router } from "@eureka/ICS26Router.sol";
 import { ICS20Transfer } from "@eureka/ICS20Transfer.sol";
@@ -1594,6 +1595,49 @@ contract ReviewRegressionsTest is ControlsFixture {
         admin.execute(seq); // outside any payment it executes
         assertEq(_state(seq), S.EXECUTED);
         assertEq(ctl.limits(clientId, address(h)).limits.refundCap, 50);
+    }
+
+    /// @notice Round 6 #3: an eight-record kind 12 through IBCAdmin.execute whose token burns all the gas of every
+    /// payment: each payment runs out of its own bounded gas and is parked; the batch executes (not spent) and every
+    /// record is settled. A claimParked with gas to spare is not bounded.
+    function test_r6_3_gasBurningToken_eightItemBatch_parksEachPayment() public {
+        GasBurnToken b = new GasBurnToken();
+        b.mint(alice, 800);
+        vm.prank(alice);
+        b.approve(address(ics20), type(uint256).max);
+        _setLimits(address(b), 1000, 1000, 1000);
+        P.SettleItem[] memory items = new P.SettleItem[](8);
+        IICS26RouterMsgs.Packet[] memory pkts = new IICS26RouterMsgs.Packet[](8);
+        for (uint256 i = 0; i < 8; i++) {
+            pkts[i] = _send(alice, address(b), 100, clientId);
+            items[i] = P.SettleItem(pkts[i].sequence, 1, 100);
+        }
+        _retire();
+        for (uint256 i = 0; i < 8; i++) {
+            _proveRefundable(pkts[i]);
+        }
+        b.setBurnFor(alice);
+        uint64 seq = _decide(S.KIND_SETTLE, P.settle(clientId, items));
+        _skip(7 days);
+        admin.execute{ gas: 15_000_000 }(seq);
+        assertEq(_state(seq), S.EXECUTED, "settled, not spent");
+        for (uint256 i = 0; i < 8; i++) {
+            T.SendRecord memory rec = ctl.sendRecord(clientId, pkts[i].sequence);
+            assertEq(rec.settlement, 1);
+            assertEq(uint8(rec.payment), uint8(T.Payment.Parked));
+        }
+        assertEq(ctl.reserved(clientId, address(b)), 800);
+        // nine items never record
+        P.SettleItem[] memory nine = new P.SettleItem[](9);
+        for (uint256 i = 0; i < 9; i++) {
+            nine[i] = P.SettleItem(uint64(i + 1), 1, 1);
+        }
+        uint64 next = admin.lastSeq() + 1;
+        assertEq(_status(_recvGov(_env(next, S.KIND_SETTLE, P.settle("c", nine)))), S.STATUS_SPENT);
+        b.setBurnFor(address(0));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertEq(ctl.claimParked(clientId, pkts[0].sequence), 100);
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

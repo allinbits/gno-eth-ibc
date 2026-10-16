@@ -81,7 +81,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         // the meter charged first (checks-effects-interactions); a failed payment reverts it all
         got = rec.settlement == 1 ? remaining : LeakyBucket.chargeUpTo(t.refunded, t.limits.refundCap, remaining, now_);
         if (got == 0) return 0;
-        require(GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore), GnoRefundFailed(clientId, sequence));
+        require(
+            GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore, false), GnoRefundFailed(clientId, sequence)
+        );
         emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
         if (got == remaining) {
             rec.payment = Payment.Claimed;
@@ -146,7 +148,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 );
                 rec.settlement = 1;
                 if (left != 0) {
-                    if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore)) {
+                    if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, true)) {
                         rec.payment = Payment.Claimed;
                         emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
                         // the notification is due: anyone delivers it by retryNotification

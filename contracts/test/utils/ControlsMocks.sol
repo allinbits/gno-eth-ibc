@@ -204,3 +204,28 @@ contract OlderFork is GnoICS20Transfer {
         return 0;
     }
 }
+
+/// @notice A token whose transfers to `burnFor` burn every unit of gas they are given.
+contract GasBurnToken is ERC20 {
+    address public burnFor;
+
+    constructor() ERC20("Burn", "BURN") { }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setBurnFor(address a) external {
+        burnFor = a;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        super._update(from, to, value);
+        if (to != address(0) && to == burnFor) {
+            uint256 x;
+            while (true) {
+                x++;
+            }
+        }
+    }
+}

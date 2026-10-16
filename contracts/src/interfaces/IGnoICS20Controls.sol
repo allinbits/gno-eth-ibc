@@ -130,6 +130,8 @@ interface IGnoICS20ControlsTypes {
     error GnoNoNotification(string clientId, uint64 sequence);
     error GnoBadProof();
     error GnoBadModule();
+    /// @notice Less gas left than a bounded refund payment needs: the caller starves it (retry with more gas).
+    error GnoPaymentStarved();
     error GnoRouteReopening(string clientId);
     error GnoRecordsOpen(string clientId, uint64 open);
     error GnoSuspectUnsettled(string clientId, uint64 open);

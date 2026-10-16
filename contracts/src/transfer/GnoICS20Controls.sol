@@ -103,7 +103,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                 LeakyBucket.Bucket memory meter = t.refunded;
                 uint256 got = LeakyBucket.chargeUpTo(t.refunded, t.limits.refundCap, remaining, now_);
                 if (got == 0 && remaining != 0) break;
-                if (got != 0 && GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore)) {
+                if (got != 0 && GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore, true)) {
                     emit GnoRefundPaid(q.clientId, q.sequence, token, rec.sender, got);
                     if (got != remaining) {
                         // an installment: the meter is empty
@@ -212,7 +212,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !r.closed
                 && LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_)
         ) {
-            if (GnoTransferStorage.tryPayRefund(rec, amount, route, reservedBefore)) {
+            if (GnoTransferStorage.tryPayRefund(rec, amount, route, reservedBefore, true)) {
                 rec.payment = Payment.Paid;
                 GnoTransferStorage.closeRecord(rec, route);
                 paid = true;
