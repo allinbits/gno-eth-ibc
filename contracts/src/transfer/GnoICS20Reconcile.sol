@@ -27,11 +27,30 @@ import { GnoTransferStorage } from "./GnoTransferStorage.sol";
 /// and the backfill of records for packets sent before the fork was installed.
 contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, AccessManagedUpgradeable {
     address private immutable _self;
+    /// @notice GnoICS20Evidence: the proofs, backfills and notifications, served by this contract's fallback.
+    address public immutable EVIDENCE;
 
     error NotDelegated();
 
-    constructor() {
+    constructor(address evidence) {
+        require(evidence.code.length != 0, GnoBadModule());
         _self = address(this);
+        EVIDENCE = evidence;
+    }
+
+    /// @notice Serves the evidence functions from GnoICS20Evidence, in the transfer proxy's storage.
+    // solhint-disable-next-line no-complex-fallback
+    fallback() external {
+        address e = EVIDENCE;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let ok := delegatecall(gas(), e, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch ok
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
     }
 
     /// @notice The controls version this module implements (kind 7 checks it on the module and through the proxy).
@@ -115,85 +134,97 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         // an outcome counts only while the client that proved it is still the route's active replacement, under
         // the same generation; checked again for every outcome consumed and after the last payment, since a
         // payment runs token code that could freeze or swap it (any change rolls the whole batch back)
-        address active = _activeClient(clientId);
+        address active = GnoTransferStorage.activeClient(clientId);
         uint64 gen = g.routes[route].verifierGen;
         for (uint256 i = 0; i < items.length; i++) {
-            SettleItem calldata it = items[i];
-            if (it.action == 5) {
-                _bookForgedReceive(g, route, clientHash, clientId, it, i);
-                continue;
-            }
-            SendRecord storage rec = g.records[clientHash][it.sequence];
-            // a record (authenticated: written by the send or backfilled), settled at most once
-            require(
-                rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active
-                    && rec.provenGen == gen && _activeClient(clientId) == active && g.routes[route].verifierGen == gen,
-                GnoBadSettlement(i)
-            );
-            // a record processed in the suspected compromise interval: one fewer to settle
-            if (rec.processedBlock != 0 && rec.processedIndex >= g.routes[route].suspectStart) {
-                --g.routes[route].suspectOpen;
-            }
-            uint8 action = it.action;
-            bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
-            uint256 reservedBefore = GnoTransferStorage.reservation(rec);
-            if (action == 1) {
-                // a genuine refund: its whole remainder, never cut short (ADR §7.9); zero when it was already paid in
-                // full, which only settles the record
-                uint256 left = rec.amount - rec.refunded;
-                // proven not delivered: an error ack, never receivable, or another packet at its sequence
-                require(
-                    it.amount == left && (rec.proven == Proven.Refundable || rec.proven == Proven.Collision),
-                    GnoBadSettlement(i)
-                );
-                rec.settlement = 1;
-                if (left != 0) {
-                    if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, true)) {
-                        rec.payment = Payment.Claimed;
-                        emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
-                        // the notification is due: anyone delivers it by retryNotification
-                        GnoTransferStorage.releaseNotice(clientId, it.sequence);
-                    } else {
-                        rec.payment = Payment.Parked;
-                        emit GnoRefundParked(clientId, it.sequence, rec.token, left);
-                    }
-                }
-            } else if (action == 2 || action == 3) {
-                // a refund already (partly) paid can only be settled as forged (action 4, which books the loss) or
-                // genuine (action 1)
-                require(
-                    (action == 3 || owed) && rec.refunded == 0 && rec.proven == Proven.Delivered, GnoBadSettlement(i)
-                );
-                rec.settlement = action;
-                if (owed) _reject(rec, clientId, it.sequence);
-            } else if (action == 4) {
-                // a forged refund (of a packet that was delivered): its unpaid remainder is rejected and what was
-                // already paid is the loss, at once
-                require(
-                    (rec.outcome == Outcome.ErrorAck || rec.outcome == Outcome.Timeout) && it.amount == rec.refunded
-                        && rec.proven == Proven.Delivered,
-                    GnoBadSettlement(i)
-                );
-                rec.settlement = 4;
-                if (owed) _reject(rec, clientId, it.sequence);
-                if (it.amount != 0) _bookLoss(g, route, clientId, rec.token, it.sequence, it.amount);
-            } else {
-                revert GnoBadSettlement(i);
-            }
-            // one terminal notification per record: a settlement deciding another kind than the transport's
-            // supersedes the transport's (never delivered after); `notifySettled` delivers the settlement's
-            (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
-            if (transport != terminal) {
-                if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
-                if (terminal == 1 || rec.payment == Payment.Claimed) emit GnoNotificationDue(clientId, it.sequence);
-            }
-            GnoTransferStorage.closeRecord(rec, route);
-            GnoTransferStorage.syncReserve(route, rec, reservedBefore);
-            emit GnoSettled(clientId, it.sequence, action, it.amount);
+            if (items[i].action == 5) _bookForgedReceive(g, route, clientHash, clientId, items[i], i);
+            else _settleRecord(g, route, clientHash, clientId, items[i], i, active, gen);
         }
         require(
-            _activeClient(clientId) == active && g.routes[route].verifierGen == gen, GnoBadSettlement(type(uint256).max)
+            GnoTransferStorage.activeClient(clientId) == active && g.routes[route].verifierGen == gen,
+            GnoBadSettlement(type(uint256).max)
         );
+    }
+
+    /// @notice One kind 12 item on a send record (actions 1 to 4).
+    function _settleRecord(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        bytes32 clientHash,
+        string calldata clientId,
+        SettleItem calldata it,
+        uint256 i,
+        address active,
+        uint64 gen
+    )
+        private
+    {
+        SendRecord storage rec = g.records[clientHash][it.sequence];
+        // a record (authenticated: written by the send or backfilled), settled at most once
+        require(
+            rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active
+                && rec.provenGen == gen && GnoTransferStorage.activeClient(clientId) == active
+                && g.routes[route].verifierGen == gen,
+            GnoBadSettlement(i)
+        );
+        // a record processed in the suspected compromise interval: one fewer to settle
+        if (rec.processedBlock != 0 && rec.processedIndex >= g.routes[route].suspectStart) {
+            --g.routes[route].suspectOpen;
+        }
+        uint8 action = it.action;
+        bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        if (action == 1) {
+            // a genuine refund: its whole remainder, never cut short (ADR §7.9); zero when it was already paid in
+            // full, which only settles the record
+            uint256 left = rec.amount - rec.refunded;
+            // proven not delivered: an error ack, never receivable, or another packet at its sequence
+            require(
+                it.amount == left && (rec.proven == Proven.Refundable || rec.proven == Proven.Collision),
+                GnoBadSettlement(i)
+            );
+            rec.settlement = 1;
+            if (left != 0) {
+                if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, true)) {
+                    rec.payment = Payment.Claimed;
+                    emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
+                    // the notification is due: anyone delivers it by retryNotification
+                    GnoTransferStorage.releaseNotice(clientId, it.sequence);
+                } else {
+                    rec.payment = Payment.Parked;
+                    emit GnoRefundParked(clientId, it.sequence, rec.token, left);
+                }
+            }
+        } else if (action == 2 || action == 3) {
+            // a refund already (partly) paid can only be settled as forged (action 4, which books the loss) or
+            // genuine (action 1)
+            require((action == 3 || owed) && rec.refunded == 0 && rec.proven == Proven.Delivered, GnoBadSettlement(i));
+            rec.settlement = action;
+            if (owed) _reject(rec, clientId, it.sequence);
+        } else if (action == 4) {
+            // a forged refund (of a packet that was delivered): its unpaid remainder is rejected and what was
+            // already paid is the loss, at once
+            require(
+                (rec.outcome == Outcome.ErrorAck || rec.outcome == Outcome.Timeout) && it.amount == rec.refunded
+                    && rec.proven == Proven.Delivered,
+                GnoBadSettlement(i)
+            );
+            rec.settlement = 4;
+            if (owed) _reject(rec, clientId, it.sequence);
+            if (it.amount != 0) _bookLoss(g, route, clientId, rec.token, it.sequence, it.amount);
+        } else {
+            revert GnoBadSettlement(i);
+        }
+        // one terminal notification per record: a settlement deciding another kind than the transport's
+        // supersedes the transport's (never delivered after); `notifySettled` delivers the settlement's
+        (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+        if (transport != terminal) {
+            if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
+            if (terminal == 1 || rec.payment == Payment.Claimed) emit GnoNotificationDue(clientId, it.sequence);
+        }
+        GnoTransferStorage.closeRecord(rec, route);
+        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+        emit GnoSettled(clientId, it.sequence, action, it.amount);
     }
 
     /// @notice Kind 12 action 5: a forged receive at an inbound sequence of the retired client, whose release or
@@ -303,213 +334,5 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             r.lossClosed = false;
             emit GnoRouteReopened(key);
         }
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function backfill(IICS26RouterMsgs.Packet calldata packet) external delegated nonReentrant {
-        require(
-            packet.payloads.length == 1
-                && keccak256(bytes(packet.payloads[0].sourcePort)) == ICS20Lib.KECCAK256_DEFAULT_PORT_ID,
-            GnoBadBackfill()
-        );
-        bytes32 commitment = ICS24Host.packetCommitmentBytes32(packet);
-        address router = GnoTransferStorage.ics20Router();
-        require(
-            IIBCStore(router).getCommitment(ICS24Host.packetCommitmentKeyCalldata(packet.sourceClient, packet.sequence))
-                == commitment,
-            GnoBadBackfill()
-        );
-        SendRecord storage rec = _g().records[keccak256(bytes(packet.sourceClient))][packet.sequence];
-        require(rec.commitment == bytes32(0), GnoBadBackfill());
-        IICS20TransferMsgs.FungibleTokenPacketData memory data =
-            abi.decode(packet.payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
-        // the refund target, derived as the refund path derives it
-        bool burned = ICS20Lib.hasPrefix(
-            bytes(data.denom), abi.encodePacked(ICS20Lib.DEFAULT_PORT_ID, "/", packet.sourceClient, "/")
-        );
-        address token = GnoTransferStorage.ics20Registered(string(GnoTransferStorage.toRouteDenom(bytes(data.denom))));
-        if (token == address(0)) {
-            require(!burned, GnoBadBackfill());
-            token = ICS20Lib.mustHexStringToAddress(data.denom);
-        }
-        rec.commitment = commitment;
-        rec.sender = ICS20Lib.mustHexStringToAddress(data.sender);
-        rec.token = token;
-        rec.escrow = GnoTransferStorage.ics20Escrow(GnoTransferStorage.routeKey(packet.sourceClient));
-        rec.timeoutTimestamp = packet.timeoutTimestamp;
-        rec.sendBlock = uint64(block.number);
-        rec.burned = burned;
-        rec.amount = data.amount;
-        rec.legacy = true;
-        GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
-        GnoTransferStorage.syncReserve(GnoTransferStorage.routeHash(packet.sourceClient), rec, 0);
-        emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function gnoReceipt(IICS26RouterMsgs.Packet calldata packet) public pure returns (bytes32) {
-        return sha256(
-            abi.encodePacked(
-                uint8(3), packet.sequence, sha256(bytes(packet.sourceClient)), ICS24Host.packetCommitmentBytes32(packet)
-            )
-        );
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function proveOutcome(
-        IICS26RouterMsgs.Packet calldata packet,
-        OutcomeProof calldata proof
-    )
-        external
-        delegated
-        nonReentrant
-        returns (Proven proven)
-    {
-        GnoTransferStorage.Layout storage g = _g();
-        SendRecord storage rec = g.records[keccak256(bytes(packet.sourceClient))][packet.sequence];
-        require(g.retired[packet.sourceClient], GnoBadProof());
-        // through the route's replacement: its current client, active, and that client's counterparty prefix
-        string memory current = g.currentOf[GnoTransferStorage.routeKey(packet.sourceClient)];
-        IICS02Client router = IICS02Client(GnoTransferStorage.ics20Router());
-        ILightClient lc = ILightClient(_activeClient(packet.sourceClient));
-        // final once proven, unless its verifier is no longer the active replacement (the outcome is then void)
-        require(
-            address(lc) != address(0) && rec.commitment != bytes32(0)
-                && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && rec.settlement == 0
-                && (rec.proven == Proven.None
-                    || rec.provenBy != address(lc)
-                    || rec.provenGen != g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen),
-            GnoBadProof()
-        );
-        bytes memory receiptPath = ICS24Host.packetReceiptCommitmentPathCalldata(packet.destClient, packet.sequence);
-        if (proof.receipt == bytes32(0)) {
-            uint256 time = lc.verifyNonMembership(
-                ILightClientMsgs.MsgVerifyNonMembership(
-                    proof.receiptProof,
-                    proof.proofHeight,
-                    ICS24Host.prefixedPath(router.getCounterparty(current).merklePrefix, receiptPath)
-                )
-            );
-            // not received, and past its timeout: never receivable
-            require(time >= packet.timeoutTimestamp, GnoBadProof());
-            proven = Proven.Refundable;
-        } else {
-            lc.verifyMembership(
-                ILightClientMsgs.MsgVerifyMembership(
-                    proof.receiptProof,
-                    proof.proofHeight,
-                    ICS24Host.prefixedPath(router.getCounterparty(current).merklePrefix, receiptPath),
-                    abi.encodePacked(proof.receipt)
-                )
-            );
-            if (proof.receipt != gnoReceipt(packet)) {
-                proven = Proven.Collision;
-            } else {
-                bytes[] memory acks = new bytes[](1);
-                acks[0] = proof.ack;
-                lc.verifyMembership(
-                    ILightClientMsgs.MsgVerifyMembership(
-                        proof.ackProof,
-                        proof.proofHeight,
-                        ICS24Host.prefixedPath(
-                            router.getCounterparty(current).merklePrefix,
-                            ICS24Host.packetAcknowledgementCommitmentPathCalldata(packet.destClient, packet.sequence)
-                        ),
-                        abi.encodePacked(ICS24Host.packetAcknowledgementCommitmentBytes32(acks))
-                    )
-                );
-                proven = keccak256(proof.ack) == ICS24Host.KECCAK256_UNIVERSAL_ERROR_ACK
-                    ? Proven.Refundable
-                    : Proven.Delivered;
-            }
-        }
-        rec.proven = proven;
-        rec.provenBy = address(lc);
-        if (proven == Proven.Delivered) {
-            g.provenAck[keccak256(bytes(packet.sourceClient))][packet.sequence] = keccak256(proof.ack);
-        }
-        rec.provenGen = g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen;
-        emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
-    }
-
-    /// @notice The route's replacement client if active (neither frozen nor expired), else zero.
-    function _activeClient(string memory clientId) private view returns (address) {
-        string memory current = _g().currentOf[GnoTransferStorage.routeKey(clientId)];
-        address lc = address(IICS02Client(GnoTransferStorage.ics20Router()).getClient(current));
-        if (IGnoLightClientStatus(lc).isFrozen() || IGnoLightClientStatus(lc).isExpired()) return address(0);
-        return lc;
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function receiveRecord(
-        string calldata clientId,
-        uint64 sequence
-    )
-        external
-        view
-        delegated
-        returns (address, uint256)
-    {
-        uint256 r = _g().receives[keccak256(bytes(clientId))][sequence];
-        return (address(uint160(r)), r >> 160);
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function notifySettled(
-        IICS26RouterMsgs.Packet calldata packet,
-        bytes calldata ack,
-        uint256 gasBudget
-    )
-        external
-        delegated
-        nonReentrant
-        returns (bool)
-    {
-        bytes32 h = keccak256(bytes(packet.sourceClient));
-        SendRecord storage rec = _g().records[h][packet.sequence];
-        (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
-        // the settlement's terminal outcome, when the transport brought another kind (or none): a refund once paid in
-        // full, or a success with the ack proven for it
-        require(
-            rec.commitment != bytes32(0) && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && terminal != 0
-                && terminal != transport
-                && (terminal == 2
-                        ? rec.payment == Payment.Claimed
-                        : keccak256(ack) == _g().provenAck[h][packet.sequence]),
-            GnoNoNotification(packet.sourceClient, packet.sequence)
-        );
-        bytes memory call = terminal == 2
-            ? abi.encodeCall(
-                IIBCSenderCallbacks.onTimeoutPacket,
-                (IIBCAppCallbacks.OnTimeoutPacketCallback(
-                        packet.sourceClient, packet.destClient, packet.sequence, packet.payloads[0], msg.sender
-                    ))
-            )
-            : abi.encodeCall(
-                IIBCSenderCallbacks.onAckPacket,
-                (
-                    true,
-                    IIBCAppCallbacks.OnAcknowledgementPacketCallback(
-                        packet.sourceClient, packet.destClient, packet.sequence, packet.payloads[0], ack, msg.sender
-                    )
-                )
-            );
-        return GnoTransferStorage.deliverSettled(rec.sender, call, packet.sourceClient, packet.sequence, gasBudget);
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function retryNotification(
-        string calldata clientId,
-        uint64 sequence,
-        bytes calldata call,
-        uint256 gasBudget
-    )
-        external
-        delegated
-        nonReentrant
-        returns (bool)
-    {
-        SendRecord storage rec = _g().records[keccak256(bytes(clientId))][sequence];
-        return GnoTransferStorage.retryNotice(rec, clientId, sequence, call, gasBudget);
     }
 }

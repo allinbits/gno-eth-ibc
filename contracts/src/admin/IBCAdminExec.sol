@@ -442,7 +442,8 @@ contract IBCAdminExec is IIBCAdmin {
                 proxy == ics20
                     && (_version(ics20, "gnoControlsVersion()") != v
                         || _version(ics20, "gnoControlsModuleVersion()") != v
-                        || _version(ics20, "gnoReconcileModuleVersion()") != v)
+                        || _version(ics20, "gnoReconcileModuleVersion()") != v
+                        || _version(ics20, "gnoEvidenceModuleVersion()") != v)
             ) revert AuthorityLost(proxy);
             if (IAccessManaged(proxy).authority() != accessManager) revert AuthorityLost(proxy);
             if (proxy == ics20) {
@@ -485,6 +486,9 @@ contract IBCAdminExec is IIBCAdmin {
         (ok, ret) = controls.staticcall(abi.encodeWithSignature("RECONCILE()"));
         address reconcile = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
         if (!_isCode(reconcile) || _version(reconcile, "gnoReconcileModuleVersion()") != v) return 0;
+        (ok, ret) = reconcile.staticcall(abi.encodeWithSignature("EVIDENCE()"));
+        address evidence = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
+        if (!_isCode(evidence) || _version(evidence, "gnoEvidenceModuleVersion()") != v) return 0;
     }
 
     /// @notice Runs a step of this executor as IBCAdmin in a call frame of its own (IBCAdmin.selfDelegate), so that

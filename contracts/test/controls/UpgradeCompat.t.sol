@@ -26,6 +26,7 @@ import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
 import { GnoVoucher } from "../../src/GnoVoucher.sol";
 import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
 import { GnoICS20Reconcile } from "../../src/transfer/GnoICS20Reconcile.sol";
+import { GnoICS20Evidence } from "../../src/transfer/GnoICS20Evidence.sol";
 import { IGnoICS20Controls, IGnoICS20ControlsTypes as T } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
 
@@ -103,7 +104,8 @@ contract UpgradeCompatTest is Test {
         address ibcBeacon = ICS20Transfer(ics20).getIBCERC20Beacon();
         assertEq(usdc.balanceOf(escrow), 500);
 
-        address controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
+        address controls =
+            address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))));
         address fork = address(new GnoICS20Transfer(controls));
         address[6] memory keys = [address(1), address(2), address(3), address(4), address(5), address(6)];
         UUPSUpgradeable(ics20).upgradeToAndCall(fork, abi.encodeCall(IGnoICS20Controls.initializeGno, (keys)));

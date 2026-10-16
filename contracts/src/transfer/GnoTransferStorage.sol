@@ -10,6 +10,8 @@ import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 import { ERC165Checker } from "@openzeppelin-contracts/utils/introspection/ERC165Checker.sol";
 import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
 
+import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
+import { IGnoLightClientStatus } from "../interfaces/IGnoLightClientStatus.sol";
 import { IGnoICS20ControlsTypes } from "../interfaces/IGnoICS20Controls.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { LeakyBucket } from "../lib/LeakyBucket.sol";
@@ -290,6 +292,14 @@ library GnoTransferStorage {
     function syncReserve(bytes32 route, IGnoICS20ControlsTypes.SendRecord storage rec, uint256 before) internal {
         TokenControls storage t = layout().tokens[route][rec.token];
         t.reserved = t.reserved - before + reservation(rec);
+    }
+
+    /// @notice The route's replacement client if active (neither frozen nor expired), else zero.
+    function activeClient(string memory clientId) internal view returns (address) {
+        string memory current = layout().currentOf[GnoTransferStorage.routeKey(clientId)];
+        address lc = address(IICS02Client(ics20Router()).getClient(current));
+        if (IGnoLightClientStatus(lc).isFrozen() || IGnoLightClientStatus(lc).isExpired()) return address(0);
+        return lc;
     }
 
     // ------------------------------------------------------------------------------------------- receives --

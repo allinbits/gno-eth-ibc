@@ -22,6 +22,7 @@ import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
 import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
 import { GnoICS20Reconcile } from "../../src/transfer/GnoICS20Reconcile.sol";
+import { GnoICS20Evidence } from "../../src/transfer/GnoICS20Evidence.sol";
 import { IGnoICS20ControlsTypes as T } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IGuardians } from "../../src/interfaces/IGuardians.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
@@ -334,7 +335,11 @@ contract ReviewRegressionsTest is ControlsFixture {
     }
 
     function test_r2_gasSweep_upgradeSelfStep() public {
-        address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
+        address impl = address(
+            new GnoICS20Transfer(
+                address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))))
+            )
+        );
         uint64 seq = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), impl, impl.codehash, ""));
         _skip(7 days);
         for (uint256 g = 100_000; g < 6_000_000; g += 100_000) {
@@ -716,7 +721,8 @@ contract ReviewRegressionsTest is ControlsFixture {
     /// @notice Round 3 #2: a kind 7 call may not set any other code: neither beacon setter as the call, nor a call of
     /// the new code that re-points a beacon (an after-check), and the upgrade rolls back whole.
     function test_r3_2_upgradeCallNeverSwapsABeacon() public {
-        address controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
+        address controls =
+            address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))));
         address a = address(new GnoICS20Transfer(controls));
         address evil = address(new BeaconSwappingFork(controls));
         address unpinned = address(new Escrow());
@@ -980,7 +986,11 @@ contract ReviewRegressionsTest is ControlsFixture {
     /// no client addition and no admin call; a kind 9 hand-over to an executor with its own list admits that list.
     function test_r4_1_upgradeMigrationCall_onlyFromThePinnedAllowList() public {
         address routerImpl = address(new ICS26Router());
-        address fork = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
+        address fork = address(
+            new GnoICS20Transfer(
+                address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))))
+            )
+        );
         address unpinned = address(new MockLightClient());
         IICS02ClientMsgs.CounterpartyInfo memory cp = IICS02ClientMsgs.CounterpartyInfo("ethereum-1", _prefix());
         bytes[5] memory calls = [
@@ -1354,7 +1364,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
         bytes32 before = vm.load(address(ics20), implSlot);
         address stock = address(new ICS20Transfer());
-        address controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
+        address controls =
+            address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))));
         address older = address(new OlderFork(controls));
         address fork = address(new GnoICS20Transfer(controls));
         vm.expectRevert(T.GnoBadModule.selector);
