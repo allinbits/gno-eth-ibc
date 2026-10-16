@@ -207,14 +207,7 @@ library Guardians {
 
     /// @notice Why a replacement would be refused, or zero: one to four pairs of (seat 0-5, key); no seat twice; no
     /// zero key; never a seat's current key; at most two guardian seats; no key in two places afterwards.
-    function checkReplace(
-        address[6] storage keys,
-        IGuardians.SeatKey[] memory pairs
-    )
-        internal
-        view
-        returns (bytes4)
-    {
+    function checkReplace(address[6] storage keys, IGuardians.SeatKey[] memory pairs) internal view returns (bytes4) {
         if (pairs.length == 0 || pairs.length > 4) return IGuardians.BadSeat.selector;
         address[6] memory next = keys;
         bool[6] memory replaced;

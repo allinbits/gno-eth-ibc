@@ -46,7 +46,9 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
     event ClientUpdated(uint64 indexed height, bytes32 blockHash, bytes32 appHash);
     /// @notice An accepted update was a live transition (ADR pr6375 §7.10): token receives over this client are
     /// quarantined from `transitionTime` for the route's governed duration.
-    event LiveTransition(uint64 indexed height, bytes32 validatorsHash, bytes32 nextValidatorsHash, uint64 transitionTime);
+    event LiveTransition(
+        uint64 indexed height, bytes32 validatorsHash, bytes32 nextValidatorsHash, uint64 transitionTime
+    );
     event Frozen(uint64 indexed height);
     event ValidatorSetCached(bytes32 indexed valSetHash, uint256 size, uint256 totalPower);
 
@@ -200,11 +202,14 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         if (_isLiveTransition(header.signedHeader)) {
             _transitionTime = uint64(block.timestamp);
             emit LiveTransition(
-                height, header.signedHeader.validatorsHash, header.signedHeader.nextValidatorsHash, uint64(block.timestamp)
+                height,
+                header.signedHeader.validatorsHash,
+                header.signedHeader.nextValidatorsHash,
+                uint64(block.timestamp)
             );
         }
         (_liveValidatorsHash, _liveNextValidatorsHash) =
-            (header.signedHeader.validatorsHash, header.signedHeader.nextValidatorsHash);
+        (header.signedHeader.validatorsHash, header.signedHeader.nextValidatorsHash);
         // The next header's set is this one's next set; when it is this set, keep it for the updates to come.
         if (!v.vals.cached && v.vals.hash == v.consensusState.nextValidatorsHash) _cacheValSet(v.vals);
         emit ClientUpdated(height, v.blockHash, v.consensusState.appHash);
