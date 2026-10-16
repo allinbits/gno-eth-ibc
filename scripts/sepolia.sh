@@ -11,7 +11,8 @@
 #           finalized, and relay gno's acknowledgement to Sepolia
 #
 # Needs .env with DEPLOYER_PRIVATE_KEY / ETH_PRIVATE_KEY (a funded Sepolia
-# key). Ethereum -> gno proofs are taken at the finalized block, which most
+# key), and for the controls GUARDIANS (4 addresses), WATCH_KEYS (2) and
+# EXPECTED_LOCK (ugnot base units); see contracts/script/DeployGnoIBC.s.sol. Ethereum -> gno proofs are taken at the finalized block, which most
 # public RPCs cannot serve; PROOF_RPC must keep that much state history.
 # Each relay to gno waits for Sepolia finality (about 13 to 15 minutes).
 set -euo pipefail
@@ -63,6 +64,8 @@ setup() {
 		docker run --rm -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
 			-e DEPLOYER_PRIVATE_KEY -e GNO_TRUST_FILE=deployments/sepolia-trust.json \
 			-e GNO_COUNTERPARTY_CLIENT_ID="$GNO_CLIENT" -e DEPLOYMENTS_FILE="$out" \
+			-e GUARDIANS -e WATCH_KEYS -e EXPECTED_LOCK -e QUARANTINE_SECONDS \
+			-e RECOVERY_DELAY -e RECOVERY_THRESHOLD -e RECOVERY_CANCEL_THRESHOLD -e RECOVERY_SILENCE -e RECOVERY_HOLD_PERIOD \
 			--entrypoint forge "$FOUNDRY_IMAGE" script script/DeployGnoIBC.s.sol --rpc-url "$ETH_RPC_URL" \
 			--broadcast --slow --skip-simulation --gas-estimate-multiplier 130 "$@"
 	}
