@@ -42,6 +42,8 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
     bytes32 private _liveNextValidatorsHash;
     /// @notice Block time at which the latest live transition was accepted (0: none yet). See `quarantineEnd`.
     uint64 private _transitionTime;
+    /// @notice How many live transitions were accepted: a transition's identity (two can share a block time).
+    uint64 private _transitionCount;
 
     event ClientUpdated(uint64 indexed height, bytes32 blockHash, bytes32 appHash);
     /// @notice An accepted update was a live transition (ADR pr6375 §7.10): token receives over this client are
@@ -131,6 +133,12 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         return _transitionTime;
     }
 
+    /// @notice The latest accepted live transition: its number (1, 2, ...; 0 if none) and block time. Receivers tell
+    /// transitions apart by number, since two can be accepted at one block time.
+    function lastTransition() external view returns (uint64 id, uint64 time) {
+        return (_transitionCount, _transitionTime);
+    }
+
     /// @notice When a quarantine of `duration` seconds after the latest live transition ends (0 if none happened).
     /// @dev Transition times only grow, so this is the max over every transition of (its time + duration): each
     /// transition sets its own deadline once, and later headers of the established epoch do not extend it. The
@@ -201,6 +209,7 @@ contract GnoLightClient is ILightClient, IGnoLightClientErrors {
         _clientState.latestHeight = height;
         if (_isLiveTransition(header.signedHeader)) {
             _transitionTime = uint64(block.timestamp);
+            ++_transitionCount;
             emit LiveTransition(
                 height,
                 header.signedHeader.validatorsHash,

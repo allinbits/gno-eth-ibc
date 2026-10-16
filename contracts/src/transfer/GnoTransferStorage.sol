@@ -32,7 +32,7 @@ library GnoTransferStorage {
         /// no send, no claim.
         bool closed;
         /// The deadline the transitions already seen set, each with the duration in force when it was accepted, and
-        /// the latest transition seen (client and time) when a duration last changed.
+        /// the latest transition seen (client and transition number) when a duration last changed.
         uint64 quarantineDeadline;
         address seenClient;
         uint64 seenTransition;
@@ -129,12 +129,21 @@ library GnoTransferStorage {
     /// @notice When the route's quarantine ends (ADR §7.10, kind 11): the deadline the transitions seen when the
     /// duration last changed set, and for a later transition of the client (`lastTransition`), its time plus the
     /// duration in force now. A duration applies only to transitions accepted after it; one already started keeps
-    /// its deadline.
-    function quarantineUntil(Route storage r, address client, uint64 lastTransition) internal view returns (uint256) {
+    /// its deadline. Transitions are told apart by number, never by time (two can share a block).
+    function quarantineUntil(
+        Route storage r,
+        address client,
+        uint64 transitionId,
+        uint64 transitionTime
+    )
+        internal
+        view
+        returns (uint256)
+    {
         uint256 until = r.quarantineDeadline;
         uint64 q = r.quarantineSeconds;
-        if (q != 0 && lastTransition != 0 && (client != r.seenClient || lastTransition != r.seenTransition)) {
-            uint256 end = uint256(lastTransition) + q;
+        if (q != 0 && transitionId != 0 && (client != r.seenClient || transitionId != r.seenTransition)) {
+            uint256 end = uint256(transitionTime) + q;
             if (end > until) until = end;
         }
         return until;

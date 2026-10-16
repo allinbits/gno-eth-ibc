@@ -328,6 +328,18 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(_isSuccessAck(_gnotIn(1, bob)));
     }
 
+    /// @notice Round 2 #7: two transitions at one block time, a duration enabled between them: the second is
+    /// quarantined (transitions are told apart by number, not time).
+    function test_r2_7_sameBlockTransitions_toldApart() public {
+        _setQ(0);
+        lc.setTransitionTime(uint64(_now())); // A, while disabled
+        _setQ(7 days);
+        lc.setTransitionTime(uint64(_now())); // B, same block time, after the change
+        assertTrue(_isErrorAck(_gnotIn(1, bob)), "B is quarantined");
+        _skip(7 days);
+        assertTrue(_isSuccessAck(_gnotIn(1, bob)));
+    }
+
     // ================================================================ #16, #18 port and envelope boundary ==
 
     function test_r18_envelope1024Recorded_1025Spent() public {

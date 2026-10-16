@@ -119,6 +119,16 @@ contract QuarantineTest is Fixtures {
         assertTrue(client.isExpired());
     }
 
+    function test_transitionsAreNumbered() public {
+        (uint64 id,) = client.lastTransition();
+        assertEq(id, 0);
+        _update("h11");
+        _update("h12");
+        (uint64 id2, uint64 t) = client.lastTransition();
+        assertEq(id2, 1);
+        assertEq(t, client.lastTransitionTime());
+    }
+
     function testFuzz_quarantineEnd_isTransitionPlusDuration(uint32 duration, uint32 later) public {
         _update("h11");
         _update("h12");

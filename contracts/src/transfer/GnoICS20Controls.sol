@@ -198,10 +198,10 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         require(seconds_ <= MAX_QUARANTINE, GnoBadLimits());
         GnoTransferStorage.Route storage r = _route(clientId);
         // the transitions accepted so far keep the deadline the old duration gave them
-        (address lc, uint64 last) = _lastTransition(clientId);
-        uint256 until = GnoTransferStorage.quarantineUntil(r, lc, last);
+        (address lc, uint64 id, uint64 time) = _lastTransition(clientId);
+        uint256 until = GnoTransferStorage.quarantineUntil(r, lc, id, time);
         r.quarantineDeadline = until > type(uint64).max ? type(uint64).max : uint64(until);
-        (r.seenClient, r.seenTransition) = (lc, last);
+        (r.seenClient, r.seenTransition) = (lc, id);
         r.quarantineSeconds = seconds_;
         emit GnoQuarantineSet(GnoTransferStorage.routeKey(clientId), seconds_);
     }
@@ -255,13 +255,13 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice The route's light client and its latest live transition (zero when the router or the client cannot
     /// tell: a client without the quarantine views has no transitions to keep).
-    function _lastTransition(string calldata clientId) private view returns (address lc, uint64 last) {
+    function _lastTransition(string calldata clientId) private view returns (address lc, uint64 id, uint64 time) {
         (bool ok, bytes memory ret) =
             GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (clientId)));
-        if (!ok || ret.length != 32) return (address(0), 0);
+        if (!ok || ret.length != 32) return (address(0), 0, 0);
         lc = abi.decode(ret, (address));
-        (ok, ret) = lc.staticcall(abi.encodeCall(IGnoLightClientStatus.lastTransitionTime, ()));
-        if (ok && ret.length == 32) last = abi.decode(ret, (uint64));
+        (ok, ret) = lc.staticcall(abi.encodeCall(IGnoLightClientStatus.lastTransition, ()));
+        if (ok && ret.length == 64) (id, time) = abi.decode(ret, (uint64, uint64));
     }
 
     // ------------------------------------------------------------------------------------------------- views --

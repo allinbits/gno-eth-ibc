@@ -18,8 +18,16 @@ contract MockLightClient is ILightClient {
         timestamp = t;
     }
 
+    uint64 public transitionCount;
+
+    /// @notice A live transition accepted at time `t` (each call is a new transition).
     function setTransitionTime(uint64 t) external {
         transitionTime = t;
+        ++transitionCount;
+    }
+
+    function lastTransition() external view returns (uint64 id, uint64 time) {
+        return (transitionCount, transitionTime);
     }
 
     function setStatus(bool frozen_, bool expired_) external {

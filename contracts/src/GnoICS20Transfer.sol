@@ -711,13 +711,14 @@ contract GnoICS20Transfer is
         require(!r.closed, GnoRouteClosed(clientId));
         if (r.quarantineSeconds != 0 || r.quarantineDeadline != 0) {
             address lc = address(IICS02Client(address(_getICS26Router())).getClient(clientId));
-            uint64 last;
-            try IGnoLightClientStatus(lc).lastTransitionTime() returns (uint64 t) {
-                last = t;
+            uint64 id;
+            uint64 time;
+            try IGnoLightClientStatus(lc).lastTransition() returns (uint64 i, uint64 t) {
+                (id, time) = (i, t);
             } catch {
                 revert GnoQuarantineUnknown(clientId);
             }
-            uint256 until = GnoTransferStorage.quarantineUntil(r, lc, last);
+            uint256 until = GnoTransferStorage.quarantineUntil(r, lc, id, time);
             // forge-lint: disable-next-line(block-timestamp)
             require(block.timestamp >= until, GnoQuarantined(clientId, until));
         }
