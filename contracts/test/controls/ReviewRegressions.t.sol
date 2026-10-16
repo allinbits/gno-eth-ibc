@@ -725,6 +725,35 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(_isSuccessAck(_transferIn("gnoland-2", "ugnot", 1, bob)));
     }
 
+    /// @notice Round 3 #4: a sender whose callback burns all its gas, with a 10,000-byte memo, cannot make a kind 12
+    /// settlement fail (it would leave its record open and the route closed for good).
+    function test_r3_4_gasBurningSender_cannotBlockSettlement() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 500);
+        _setLimits(address(usdc), 1000, 1000, 10);
+        vm.recordLogs();
+        adapter.sendWithMemo(500, clientId, string(new bytes(10_000)));
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        _errorAck(pkt); // queued, its notification held
+        adapter.setBurn(true);
+        _retire();
+        uint64 seq = _decide(S.KIND_SETTLE, P.settle1(clientId, pkt.sequence, 1, 500));
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED, "settled, not spent");
+        assertEq(usdc.balanceOf(address(adapter)), 500);
+        assertEq(ctl.openRecords(clientId), 0);
+        // the notification stays kept; a failing retry reads it but never rewrites its 10,000 bytes
+        adapter.setBurn(false);
+        adapter.setRefuse(true);
+        uint256 g = gasleft();
+        assertFalse(ctl.retryNotification(clientId, pkt.sequence));
+        assertLt(g - gasleft(), 1_000_000, "kept, not rewritten");
+        adapter.setRefuse(false);
+        assertTrue(ctl.retryNotification(clientId, pkt.sequence));
+        assertEq(usdc.balanceOf(bob), 500);
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

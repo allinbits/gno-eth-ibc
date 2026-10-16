@@ -162,7 +162,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         private
     {
         rec.payment = Payment.Rejected;
-        delete g.notices[clientHash][sequence];
+        GnoTransferStorage.dropNotice(clientId, sequence);
         emit GnoRefundRejected(clientId, sequence);
     }
 

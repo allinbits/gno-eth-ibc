@@ -78,6 +78,8 @@ library GnoTransferStorage {
         mapping(bytes32 clientHash => mapping(uint64 sequence => IGnoICS20ControlsTypes.SendRecord)) records;
         /// A sender's notification (IIBCSenderCallbacks calldata) held until its refund is paid.
         mapping(bytes32 clientHash => mapping(uint64 sequence => bytes)) notices;
+        /// A notification delivered or dropped: done for good.
+        mapping(bytes32 clientHash => mapping(uint64 sequence => bool)) noticeDone;
         /// Losses recorded by kind 12, per route and token, and the part of them kind 13 accepted as a deficit.
         mapping(bytes32 route => mapping(address token => uint256)) losses;
         mapping(bytes32 route => mapping(address token => uint256)) acceptedDeficit;
@@ -219,11 +221,16 @@ library GnoTransferStorage {
 
     // ---------------------------------------------------------------------------------------- notifications --
 
+    /// @notice The gas a sender's callback gets, and the gas kept back for the rest of the transaction: a callback
+    /// that burns its gas never takes a settlement down with it.
+    uint256 internal constant CALLBACK_GAS = 100_000;
+    uint256 internal constant CALLBACK_RESERVE = 60_000;
+
     /// @notice Delivers a sender's IIBCSenderCallbacks notification, if it takes them. A failure never rolls a refund
     /// back: the notification is kept for `retryNotification`.
     function notify(address sender, bytes memory call, string memory clientId, uint64 sequence) internal {
         if (!ERC165Checker.supportsInterface(sender, type(IIBCSenderCallbacks).interfaceId)) return;
-        _deliver(sender, call, clientId, sequence);
+        _deliver(sender, call, clientId, sequence, false);
     }
 
     /// @notice Holds a notification until the refund it announces is paid (only for senders that take them).
@@ -240,24 +247,34 @@ library GnoTransferStorage {
     )
         internal
     {
-        bytes memory call = layout().notices[keccak256(bytes(clientId))][sequence];
-        if (call.length != 0) _deliver(rec.sender, call, clientId, sequence);
+        bytes32 h = keccak256(bytes(clientId));
+        if (layout().noticeDone[h][sequence]) return;
+        bytes memory call = layout().notices[h][sequence];
+        if (call.length != 0) _deliver(rec.sender, call, clientId, sequence, true);
     }
 
-    /// @notice Calls the sender; on success the stored copy (if any) is dropped, on failure the notification is kept.
+    /// @notice Drops a held notification for good (its refund was rejected): constant work, the bytes stay.
+    function dropNotice(string memory clientId, uint64 sequence) internal {
+        layout().noticeDone[keccak256(bytes(clientId))][sequence] = true;
+    }
+
+    /// @notice Calls the sender with CALLBACK_GAS, and only with CALLBACK_RESERVE left beyond it. Delivered, the
+    /// notification is marked done (its bytes are never rewritten or cleared: constant work whatever its size); not
+    /// delivered, it is kept (stored only if it was not already).
     function _deliver(
         address sender,
         bytes memory call,
         string memory clientId,
-        uint64 sequence
+        uint64 sequence,
+        bool stored
     )
         private
         returns (bool ok)
     {
-        (ok,) = sender.call(call);
-        mapping(uint64 => bytes) storage n = layout().notices[keccak256(bytes(clientId))];
-        if (ok) delete n[sequence];
-        else n[sequence] = call;
+        if (gasleft() >= CALLBACK_GAS * 64 / 63 + CALLBACK_RESERVE) (ok,) = sender.call{ gas: CALLBACK_GAS }(call);
+        bytes32 h = keccak256(bytes(clientId));
+        if (ok) layout().noticeDone[h][sequence] = true;
+        else if (!stored) layout().notices[h][sequence] = call;
         emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
     }
 
@@ -271,12 +288,15 @@ library GnoTransferStorage {
         internal
         returns (bool)
     {
-        bytes memory call = layout().notices[keccak256(bytes(clientId))][sequence];
+        bytes32 h = keccak256(bytes(clientId));
         IGnoICS20ControlsTypes.Payment pay = rec.payment;
         bool due = rec.outcome == IGnoICS20ControlsTypes.Outcome.Success || pay == IGnoICS20ControlsTypes.Payment.Paid
             || pay == IGnoICS20ControlsTypes.Payment.Claimed;
-        if (call.length == 0 || !due) revert IGnoICS20ControlsTypes.GnoNoNotification(clientId, sequence);
-        return _deliver(rec.sender, call, clientId, sequence);
+        bytes memory call = layout().notices[h][sequence];
+        if (call.length == 0 || layout().noticeDone[h][sequence] || !due) {
+            revert IGnoICS20ControlsTypes.GnoNoNotification(clientId, sequence);
+        }
+        return _deliver(rec.sender, call, clientId, sequence, true);
     }
 
     /// @notice What a record may still be refunded: its amount less what was refunded.

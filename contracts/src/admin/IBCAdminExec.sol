@@ -52,6 +52,9 @@ contract IBCAdminExec is IIBCAdmin {
     uint256 internal constant CALL_FLOOR = CALL_GAS * 64 / 63 + 10_000;
     /// @notice Gas a step's after-checks get past its call, and the gas a step (`_selfStep`) must have left to start.
     uint256 internal constant AFTER_GAS = 200_000;
+    /// @notice Kind 12's budget: an envelope holds at most about nine records, each with a payment and a sender
+    /// callback of capped gas.
+    uint256 internal constant SETTLE_GAS = 4_000_000;
     uint256 internal constant STEP_FLOOR = (CALL_FLOOR + AFTER_GAS + 50_000) * 64 / 63 + 50_000;
     uint64 internal constant MAX_QUARANTINE = 365 days;
 
@@ -255,7 +258,10 @@ contract IBCAdminExec is IIBCAdmin {
         if (kind == S.KIND_SETTLE) {
             (string memory sid, IGnoICS20ControlsTypes.SettleItem[] memory items) =
                 abi.decode(p, (string, IGnoICS20ControlsTypes.SettleItem[]));
-            return _call(ics20, abi.encodeCall(IGnoICS20Controls.settleRecords, (sid, items))) ? "" : "settle";
+            return
+                _callWith(ics20, abi.encodeCall(IGnoICS20Controls.settleRecords, (sid, items)), SETTLE_GAS)
+                    ? ""
+                    : "settle";
         }
         if (kind == S.KIND_REOPEN) {
             string memory rid = abi.decode(p, (string));
@@ -506,8 +512,12 @@ contract IBCAdminExec is IIBCAdmin {
     /// fail by starving it. A remaining-gas test after the call could not tell: the proxies on the way each keep a
     /// 64th and hand it back.
     function _call(address target, bytes memory data) private returns (bool ok) {
-        if (gasleft() < S.RECORD_FLOOR) revert CallStarved();
-        (ok,) = target.call{ gas: S.RECORD_GAS }(data);
+        return _callWith(target, data, S.RECORD_GAS);
+    }
+
+    function _callWith(address target, bytes memory data, uint256 budget) private returns (bool ok) {
+        if (gasleft() < budget * 64 / 63 + 10_000) revert CallStarved();
+        (ok,) = target.call{ gas: budget }(data);
     }
 
     /// @notice Whether `target`'s code is the one the decision pins (false spends it: no code, an EIP-7702 delegation

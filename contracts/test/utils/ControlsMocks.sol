@@ -45,8 +45,28 @@ contract SenderAdapter is IIBCSenderCallbacks {
         token_.approve(address(ics20_), type(uint256).max);
     }
 
+    bool public burn;
+
     function setRefuse(bool r) external {
         refuse = r;
+    }
+
+    function setBurn(bool b) external {
+        burn = b;
+    }
+
+    function sendWithMemo(uint256 amount, string calldata clientId, string calldata memo) external returns (uint64) {
+        return ics20.sendTransfer(
+            IICS20TransferMsgs.SendTransferMsg({
+                denom: address(token),
+                amount: amount,
+                receiver: "g1receiver",
+                sourceClient: clientId,
+                destPort: "transfer",
+                timeoutTimestamp: uint64(block.timestamp + 600),
+                memo: memo
+            })
+        );
     }
 
     function send(uint256 amount, string calldata clientId) external returns (uint64) {
@@ -64,12 +84,14 @@ contract SenderAdapter is IIBCSenderCallbacks {
     }
 
     function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external {
+        while (burn) { } // burns all the gas it is given
         require(!refuse, "refused");
         notices++;
         if (!success) _forward();
     }
 
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {
+        while (burn) { }
         require(!refuse, "refused");
         notices++;
         _forward();
