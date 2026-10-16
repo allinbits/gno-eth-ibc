@@ -9,6 +9,8 @@ pragma solidity ^0.8.28;
 /// spec's anyway, so a proof that disagreed would be rejected there too. Not ported: the IAVL-only leaf/inner
 /// prefix validation (validateIavlOps, applied only when the spec equals IavlSpec), compressed and batch
 /// proofs, and hash functions the EVM has no precompile for (SHA512, SHA512_256, BLAKE2B/2S, BLAKE3).
+/// Because IAVL's variable leaf prefixes are not supported, a leaf prefix must equal the spec's exactly; do
+/// not use this library with IAVL specs.
 library ICS23 {
     enum HashOp {
         NO_HASH,
@@ -209,7 +211,11 @@ library ICS23 {
 
     function _checkAgainstSpec(ProofSpec memory spec, ExistenceProof memory proof) private pure {
         bytes memory leafPrefix = spec.leafSpec.prefix;
-        if (!_hasPrefix(proof.leafPrefix, leafPrefix)) revert LeafPrefixMismatch();
+        // The leaf prefix must equal the spec's, not merely start with it. Go's ics23 only checks the start
+        // and relies on validateIavlOps for IAVL's variable prefixes, which this port does not include. With
+        // gno's fixed one-byte prefixes, extra prefix bytes would let a proof of key P ‖ uvarint(len K) ‖ K
+        // be relabelled as a proof of K with prefix 0x00 ‖ uvarint(len L) ‖ P: the same leaf preimage.
+        if (!_eq(proof.leafPrefix, leafPrefix)) revert LeafPrefixMismatch();
 
         uint256 depth = proof.path.length;
         if (spec.minDepth > 0 && depth < spec.minDepth) revert PathTooShort(depth);

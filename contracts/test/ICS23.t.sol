@@ -68,9 +68,15 @@ contract ICS23Test is Test {
         ICS23.verifyNonMembership(spec, root, abi.decode(proof, (ICS23.NonExistenceProof)), key);
     }
 
+    function _isIavl(string memory base) internal view returns (bool) {
+        return keccak256(bytes(vm.parseJsonString(vectors, string.concat(base, ".spec")))) == keccak256("iavl");
+    }
+
+    /// The tendermint and SMT vectors verify; IAVL's are refused (see test_officialVectors_iavlRefused).
     function test_officialVectors() public view {
         for (uint256 i = 0; i < 18; ++i) {
             string memory base = string.concat(".vectors[", vm.toString(i), "]");
+            if (_isIavl(base)) continue;
             ICS23.ProofSpec memory spec = _spec(vm.parseJsonString(vectors, string.concat(base, ".spec")));
             bytes memory root = vm.parseJsonBytes(vectors, string.concat(base, ".root"));
             bytes memory key = vm.parseJsonBytes(vectors, string.concat(base, ".key"));
@@ -83,9 +89,32 @@ contract ICS23Test is Test {
         }
     }
 
+    /// IAVL encodes height, size and version in its leaf prefixes, which only Go's validateIavlOps can check;
+    /// this library requires the spec's exact leaf prefix, so it refuses every IAVL proof.
+    function test_officialVectors_iavlRefused() public {
+        uint256 seen;
+        for (uint256 i = 0; i < 18; ++i) {
+            string memory base = string.concat(".vectors[", vm.toString(i), "]");
+            if (!_isIavl(base)) continue;
+            ++seen;
+            ICS23.ProofSpec memory spec = _spec("iavl");
+            bytes memory root = vm.parseJsonBytes(vectors, string.concat(base, ".root"));
+            bytes memory key = vm.parseJsonBytes(vectors, string.concat(base, ".key"));
+            bytes memory proof = vm.parseJsonBytes(vectors, string.concat(base, ".proof"));
+            vm.expectRevert(ICS23.LeafPrefixMismatch.selector);
+            if (vm.parseJsonBool(vectors, string.concat(base, ".exist"))) {
+                this.verifyExist(spec, root, proof, key, vm.parseJsonBytes(vectors, string.concat(base, ".value")));
+            } else {
+                this.verifyNonExist(spec, root, proof, key);
+            }
+        }
+        assertGt(seen, 0);
+    }
+
     function test_officialVectors_wrongRootRejected() public {
         for (uint256 i = 0; i < 18; ++i) {
             string memory base = string.concat(".vectors[", vm.toString(i), "]");
+            if (_isIavl(base)) continue;
             ICS23.ProofSpec memory spec = _spec(vm.parseJsonString(vectors, string.concat(base, ".spec")));
             bytes memory root = vm.parseJsonBytes(vectors, string.concat(base, ".root"));
             root[0] ^= 0x01;
@@ -104,8 +133,8 @@ contract ICS23Test is Test {
         string memory base = ".vectors[0]";
         assertEq(vm.parseJsonString(vectors, string.concat(base, ".spec")), "iavl");
         bytes memory proof = vm.parseJsonBytes(vectors, string.concat(base, ".proof"));
-        // an IAVL proof does not fit the Tendermint spec's inner op layout (33-byte children)
-        vm.expectPartialRevert(ICS23.InnerSuffixMalformed.selector);
+        // an IAVL proof does not fit the Tendermint spec: its leaf prefix is longer than the spec's
+        vm.expectRevert(ICS23.LeafPrefixMismatch.selector);
         this.verifyExist(
             GnoProofSpecs.tendermintSpec(),
             vm.parseJsonBytes(vectors, string.concat(base, ".root")),
@@ -146,6 +175,35 @@ contract ICS23Test is Test {
         (ICS23.ExistenceProof memory p, bytes memory root) = _bptreeProof();
         ICS23.ProofSpec memory spec = GnoProofSpecs.bptreeSpec(); // before expectRevert: it calls sha256
         p.leafPrefix = hex"01";
+        vm.expectRevert(ICS23.LeafPrefixMismatch.selector);
+        this.verifyExist(spec, root, abi.encode(p), p.key, p.value);
+    }
+
+    /// A leaf prefix longer than the spec's would let a proof of one key be relabelled as a proof of another:
+    /// with L = P ‖ uvarint(len K) ‖ K, the proof of (L, v) under prefix 0x00 has the same leaf preimage as
+    /// (K, v) under prefix 0x00 ‖ uvarint(len L) ‖ P. Realm param names are arbitrary, so anyone could store a
+    /// value under such an L and pass it off as a core commitment K.
+    function test_bptree_relabelledLeafPrefixRejected() public {
+        (ICS23.ExistenceProof memory p,) = _bptreeProof();
+        ICS23.ProofSpec memory spec = GnoProofSpecs.bptreeSpec(); // before expectRevert: it calls sha256
+        bytes memory target = "/pv/vm:gno.land/r/aib/ibc/core:commitments/client-0/1";
+        bytes memory attackerPrefix = "/pv/vm:gno.land/r/attacker:";
+        bytes memory forgedKey = abi.encodePacked(attackerPrefix, uint8(target.length), target);
+        p.key = forgedKey;
+        p.leafPrefix = hex"00";
+        bytes memory root = ICS23.calculateExistenceRoot(spec, p); // the root an honest proof of forgedKey has
+
+        ICS23.ExistenceProof memory relabelled = p;
+        relabelled.key = target;
+        relabelled.leafPrefix = abi.encodePacked(hex"00", uint8(forgedKey.length), attackerPrefix);
+        vm.expectRevert(ICS23.LeafPrefixMismatch.selector);
+        this.verifyExist(spec, root, abi.encode(relabelled), relabelled.key, relabelled.value);
+    }
+
+    function test_bptree_leafPrefixLongerThanSpecRejected() public {
+        (ICS23.ExistenceProof memory p, bytes memory root) = _bptreeProof();
+        ICS23.ProofSpec memory spec = GnoProofSpecs.bptreeSpec(); // before expectRevert: it calls sha256
+        p.leafPrefix = hex"0000";
         vm.expectRevert(ICS23.LeafPrefixMismatch.selector);
         this.verifyExist(spec, root, abi.encode(p), p.key, p.value);
     }
