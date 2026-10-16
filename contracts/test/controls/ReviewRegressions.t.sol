@@ -28,7 +28,15 @@ import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
 import { RefusingToken } from "../utils/RefusingToken.sol";
-import { MockPermit2, SenderAdapter, ReentrantToken, BeaconSwappingFork } from "../utils/ControlsMocks.sol";
+import {
+    MockPermit2,
+    SenderAdapter,
+    ReentrantToken,
+    BeaconSwappingFork,
+    AllowingExec
+} from "../utils/ControlsMocks.sol";
+import { ICS26Router } from "@eureka/ICS26Router.sol";
+import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
 import { Escrow } from "@eureka/utils/Escrow.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
@@ -900,6 +908,49 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.reopenRoute("gnoland-8");
         vm.stopPrank();
         assertFalse(ctl.routeClosed(clientId));
+    }
+
+    /// @notice Round 4 #1: a kind 7 migration call is empty or on the executor's pinned allow-list (empty at
+    /// launch): an upgrade can carry no client migration (an unpinned verifier, a retired id, a quarantine skipped),
+    /// no client addition and no admin call; a kind 9 hand-over to an executor with its own list admits that list.
+    function test_r4_1_upgradeMigrationCall_onlyFromThePinnedAllowList() public {
+        address routerImpl = address(new ICS26Router());
+        address fork = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(new GnoICS20Reconcile())))));
+        address unpinned = address(new MockLightClient());
+        IICS02ClientMsgs.CounterpartyInfo memory cp = IICS02ClientMsgs.CounterpartyInfo("ethereum-1", _prefix());
+        bytes[5] memory calls = [
+            abi.encodeWithSignature("migrateClient(string,(string,bytes[]),address)", clientId, cp, unpinned),
+            abi.encodeWithSignature("addClient(string,(string,bytes[]),address)", "gnoland-7", cp, unpinned),
+            abi.encodeWithSignature("addClient((string,bytes[]),address)", cp, unpinned),
+            abi.encodeCall(IICS02Client.getClient, (clientId)),
+            abi.encodeWithSignature("setCustomERC20(string,address)", "transfer/client-0/ugnot", address(usdc))
+        ];
+        uint64[5] memory seqs;
+        for (uint256 i = 0; i < 4; i++) {
+            seqs[i] = _decide(S.KIND_UPGRADE, P.upgrade(address(router), routerImpl, routerImpl.codehash, calls[i]));
+        }
+        seqs[4] = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), fork, fork.codehash, calls[4]));
+        AllowingExec next = new AllowingExec(address(router), d.accessManager, address(ics20));
+        uint64 handover = _decide(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
+        address clientBefore = address(router.getClient(clientId));
+        _skip(7 days);
+        for (uint256 i = 0; i < 5; i++) {
+            admin.execute(seqs[i]);
+            assertEq(_state(seqs[i]), S.SPENT);
+        }
+        assertEq(address(router.getClient(clientId)), clientBefore);
+        vm.expectRevert();
+        router.getClient("gnoland-7");
+        admin.execute(handover);
+        assertEq(_state(handover), S.EXECUTED);
+        uint64 allowed = _decide(S.KIND_UPGRADE, P.upgrade(address(router), routerImpl, routerImpl.codehash, calls[3]));
+        uint64 still = _decide(S.KIND_UPGRADE, P.upgrade(address(router), routerImpl, routerImpl.codehash, calls[0]));
+        _skip(7 days);
+        admin.execute(allowed);
+        admin.execute(still);
+        assertEq(_state(allowed), S.EXECUTED);
+        assertEq(_state(still), S.SPENT);
+        assertEq(address(router.getClient(clientId)), clientBefore);
     }
 
     // ============================================================== #20 send variants and reentrancy ==

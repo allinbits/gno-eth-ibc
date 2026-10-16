@@ -14,6 +14,8 @@ import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
 
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
+import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
+import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { IGnoICS20Controls } from "../../src/interfaces/IGnoICS20Controls.sol";
 
 /// @notice A Permit2 stand-in that moves the tokens without checking a signature (the fork's balance check still
@@ -145,5 +147,14 @@ contract BeaconSwappingFork is GnoICS20Transfer {
 
     function swapEscrowBeacon(address impl) external {
         UpgradeableBeacon(this.getEscrowBeacon()).upgradeTo(impl);
+    }
+}
+
+/// @notice An executor whose pinned allow-list admits one harmless migration call: the router's `getClient`.
+contract AllowingExec is IBCAdminExec {
+    constructor(address r, address am, address t) IBCAdminExec(r, am, t) { }
+
+    function migrationAllowed(address proxy, bytes4 selector) public pure override returns (bool) {
+        return proxy != address(0) && selector == IICS02Client.getClient.selector;
     }
 }

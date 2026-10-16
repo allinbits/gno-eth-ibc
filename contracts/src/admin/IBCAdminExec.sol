@@ -370,8 +370,10 @@ contract IBCAdminExec is IIBCAdmin {
 
     /// @notice Kind 7: the router or the transfer app (UUPS `upgradeToAndCall`, the call given CALL_GAS exactly),
     /// or one of the transfer app's beacons (escrow, IBCERC20; no call); the implementation's code the decision's.
-    /// The call may not upgrade again (`upgradeToAndCall`, `multicall`). The upgrade and its after-checks run as a
-    /// self-step (`applyUpgrade`): a failure rolls them back and spends the decision.
+    /// The migration call runs in the new code with IBCAdmin's authority, so it is empty or its selector is on this
+    /// executor's pinned allow-list (`migrationAllowed`, empty here: only a kind 9 hand-over to other code extends
+    /// it); never an upgrade or a client change, which kinds 6 and 7 validate themselves. The upgrade and its
+    /// after-checks run as a self-step (`applyUpgrade`): a failure rolls them back and spends the decision.
     function _upgrade(bytes calldata p) private returns (string memory) {
         (address proxy, address impl, bytes32 codeHash, bytes memory call) =
             abi.decode(p, (address, address, bytes32, bytes));
@@ -381,9 +383,9 @@ contract IBCAdminExec is IIBCAdmin {
             bool escrow = proxy == IICS20Transfer(ics20).getEscrowBeacon();
             if (!escrow && proxy != IICS20Transfer(ics20).getIBCERC20Beacon()) return "params";
             if (call.length != 0) return "params";
-        } else if (call.length >= 4) {
-            // the call runs in the new code as the proxy with IBCAdmin's authority: it must not set any other code (no
-            // decision pinned), directly or through multicall
+        } else if (call.length != 0) {
+            if (call.length < 4 || !migrationAllowed(proxy, bytes4(call))) return "migration call";
+            // a floor no allow-list lifts: the call never sets other code (no decision pinned it)
             bytes4 sel = bytes4(call);
             if (
                 sel == UUPSUpgradeable.upgradeToAndCall.selector || sel == IMulticallLike.multicall.selector
@@ -394,6 +396,13 @@ contract IBCAdminExec is IIBCAdmin {
             }
         }
         return _selfStep(abi.encodeCall(IBCAdminExec.applyUpgrade, (proxy, impl, call))) ? "" : "upgrade";
+    }
+
+    /// @notice Kind 7's allow-list of migration calls: a selector a migration call to `proxy`'s new code may have.
+    /// Pinned in this code (empty: every kind 7 migration call is refused); an executor installed by kind 9 may
+    /// carry its own.
+    function migrationAllowed(address, bytes4) public pure virtual returns (bool) {
+        return false;
     }
 
     /// @notice Kind 7's effect and after-checks, in a frame of its own (`_selfStep`): any failure rolls it back
