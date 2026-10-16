@@ -73,6 +73,8 @@ interface IGnoICS20ControlsTypes {
         /// The reconciliation outcome kind 12 applied (0: none; 1 refund, 2 rejected, 3 delivered, 4 forged
         /// refund).
         uint8 settlement;
+        /// Still open: an outstanding packet, or a refund owed (queued, parked) not settled by kind 12.
+        bool open;
     }
 
     /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.
@@ -95,6 +97,7 @@ interface IGnoICS20ControlsTypes {
     error GnoBadSettlement(uint256 item);
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
+    error GnoRecordsOpen(string clientId, uint64 open);
     error GnoQuarantined(string clientId, uint256 until);
     error GnoQuarantineUnknown(string clientId);
     error GnoDenomNotRegistered(string denom);
@@ -130,6 +133,8 @@ interface IGnoICS20ControlsTypes {
     event GnoSettled(string clientId, uint64 indexed sequence, uint8 action, uint256 amount);
     event GnoLossRecorded(string routeKey, address indexed token, uint64 indexed sequence, uint256 amount);
     event GnoRouteReopened(string routeKey);
+    /// @notice Kind 13 accepted a recorded loss not recapitalized as a deficit of the route (ADR §7.9).
+    event GnoDeficitAccepted(string routeKey, address indexed token, uint256 amount);
     event GnoBackfilled(string clientId, uint64 indexed sequence, bytes32 commitment);
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).
@@ -154,7 +159,8 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice Points `newClientId` at `oldClientId`'s route, retires `oldClientId` and closes the route (constant
     /// work); kind 12 settles its records and kind 13 reopens it.
     function migrateRoute(string calldata oldClientId, string calldata newClientId) external;
-    /// @notice Kind 13: reopens a closed route.
+    /// @notice Kind 13: reopens a closed route, refused while any of its send records is open (`openRecords`);
+    /// every recorded loss not yet accepted becomes an accepted deficit.
     function reopenRoute(string calldata clientId) external;
     /// @notice Kind 12: applies reconciliation outcomes to send records of a retired client id, each at most once:
     /// 1 pay the refund's remainder (`amount` must equal the amount less what was refunded; parked if the token
@@ -203,6 +209,10 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function routeClosed(string calldata clientId) external view returns (bool);
     /// @notice Losses kind 12 recorded on the route for the token.
     function losses(string calldata clientId, address token) external view returns (uint256);
+    /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).
+    function openRecords(string calldata clientId) external view returns (uint64);
+    /// @notice The part of the route's losses of the token kind 13 accepted as a deficit.
+    function acceptedDeficit(string calldata clientId, address token) external view returns (uint256);
     function refundsHeld(string calldata clientId) external view returns (bool);
     function limits(string calldata clientId, address token) external view returns (LimitsView memory);
     function quarantineSeconds(string calldata clientId) external view returns (uint64);

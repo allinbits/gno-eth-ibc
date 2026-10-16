@@ -487,7 +487,7 @@ contract IBCAdminKindsTest is ControlsFixture {
 
     function test_kind10_routeReplacement_opensTheNextEpoch() public {
         _setLimits(address(usdc), 1000, 1000, 1000);
-        _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory out = _send(alice, address(usdc), 100, clientId);
         MockLightClient lc2 = new MockLightClient();
         uint64 add = _decidePending(
             S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
@@ -522,8 +522,16 @@ contract IBCAdminKindsTest is ControlsFixture {
         // the route stays closed until reconciled and reopened by decision (kinds 12, 13)
         assertTrue(ctl.routeClosed("gnoland-2"));
         assertTrue(_isErrorAck(_transferIn("gnoland-2", "ugnot", 5, bob)));
+        // the packet in flight on the old id is still open: reopening is spent until it is reconciled
+        uint64 early = _decidePending(S.KIND_REOPEN, P.reopen("gnoland-2"));
+        _executeAfterWeek(early);
+        assertEq(_state(early), S.SPENT);
+        uint64 settle = _decidePending(S.KIND_SETTLE, P.settle1(clientId, out.sequence, 3, 0));
         uint64 reopen = _decidePending(S.KIND_REOPEN, P.reopen("gnoland-2"));
-        _executeAfterWeek(reopen);
+        _skip(7 days);
+        admin.execute(settle);
+        admin.execute(reopen);
+        assertEq(_state(reopen), S.EXECUTED);
         assertTrue(_isSuccessAck(_transferIn("gnoland-2", "ugnot", 5, bob)));
     }
 

@@ -36,6 +36,11 @@ library GnoTransferStorage {
         uint64 quarantineDeadline;
         address seenClient;
         uint64 seenTransition;
+        /// Send records of the route still open: an outstanding packet, or a refund queued, parked or unpaid, not
+        /// settled by kind 12. Kind 13 reopens only at zero (ADR §5.4).
+        uint64 openRecords;
+        /// Tokens kind 12 recorded a loss of (each once), for kind 13's accepted deficits.
+        address[] lossTokens;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.
@@ -70,8 +75,9 @@ library GnoTransferStorage {
         mapping(bytes32 clientHash => mapping(uint64 sequence => IGnoICS20ControlsTypes.SendRecord)) records;
         /// A sender's notification (IIBCSenderCallbacks calldata) held until its refund is paid.
         mapping(bytes32 clientHash => mapping(uint64 sequence => bytes)) notices;
-        /// Losses recorded by kind 12, per route and token.
+        /// Losses recorded by kind 12, per route and token, and the part of them kind 13 accepted as a deficit.
         mapping(bytes32 route => mapping(address token => uint256)) losses;
+        mapping(bytes32 route => mapping(address token => uint256)) acceptedDeficit;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))
@@ -175,6 +181,21 @@ library GnoTransferStorage {
         }
         rec.refunded += amount;
         return true;
+    }
+
+    // ------------------------------------------------------------------------------------------ open records --
+
+    /// @notice A record now open (written by a send or a backfill).
+    function openRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 route) internal {
+        rec.open = true;
+        ++layout().routes[route].openRecords;
+    }
+
+    /// @notice A record closed: its packet acknowledged with success, its refund paid in full, or settled by kind 12.
+    function closeRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 route) internal {
+        if (!rec.open) return;
+        rec.open = false;
+        --layout().routes[route].openRecords;
     }
 
     // ---------------------------------------------------------------------------------------- notifications --

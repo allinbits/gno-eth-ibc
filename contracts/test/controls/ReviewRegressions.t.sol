@@ -196,6 +196,32 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(usdc.balanceOf(alice), 1_000_000e6, "refunded once");
     }
 
+    /// @notice Round 2 #1: kind 13 waits until every record of the retired ids is reconciled (an outstanding packet,
+    /// a queued refund), then accepts the recorded losses as the route's deficit.
+    function test_r2_1_reopenWaitsForReconciliation_acceptsTheDeficit() public {
+        _setLimits(address(usdc), 1000, 1000, 10);
+        IICS26RouterMsgs.Packet memory forged = _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory inFlight = _send(alice, address(usdc), 200, clientId);
+        _errorAck(forged); // queued
+        ctl.claim(clientId, address(usdc), 1); // 10 paid of it
+        _retire();
+        assertEq(ctl.openRecords(clientId), 2);
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, clientId, 2));
+        ctl.reopenRoute(clientId);
+        _settle(_item(forged.sequence, 4, 10)); // the forged refund: 10 lost
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, clientId, 1));
+        ctl.reopenRoute(clientId);
+        _settle(_item(inFlight.sequence, 3, 0));
+        vm.expectEmit(true, true, false, true, address(ics20));
+        emit T.GnoDeficitAccepted(clientId, address(usdc), 10);
+        vm.prank(address(admin));
+        ctl.reopenRoute(clientId);
+        assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 10);
+        assertEq(ctl.losses(clientId, address(usdc)), 10);
+    }
+
     // ================================================================== #2 never spent by starving (proxies) ==
 
     function test_r2_gasSweep_routeReplacement_throughTheFallback() public {

@@ -74,6 +74,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
         if (got == remaining) {
             rec.payment = Payment.Claimed;
+            GnoTransferStorage.closeRecord(rec, route);
             emit GnoOutcomeRecorded(clientId, sequence, rec.outcome, Payment.Claimed);
             GnoTransferStorage.releaseNotice(rec, clientId, sequence);
         }
@@ -129,12 +130,14 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 rec.settlement = 4;
                 if (owed) _reject(g, rec, clientHash, clientId, it.sequence);
                 if (it.amount != 0) {
+                    if (g.losses[route][rec.token] == 0) g.routes[route].lossTokens.push(rec.token);
                     g.losses[route][rec.token] += it.amount;
                     emit GnoLossRecorded(GnoTransferStorage.routeKey(clientId), rec.token, it.sequence, it.amount);
                 }
             } else {
                 revert GnoBadSettlement(i);
             }
+            GnoTransferStorage.closeRecord(rec, route);
             emit GnoSettled(clientId, it.sequence, action, it.amount);
         }
     }
@@ -158,8 +161,22 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     function reopenRoute(string calldata clientId) external delegated restricted {
         GnoTransferStorage.Route storage r = _route(clientId);
         require(r.closed, GnoNotClosed(clientId));
+        // every record of the retired ids reconciled first: no outstanding packet, no refund owed
+        require(r.openRecords == 0, GnoRecordsOpen(clientId, r.openRecords));
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        bytes32 route = keccak256(bytes(key));
+        GnoTransferStorage.Layout storage g = _g();
+        // a loss not recapitalized is accepted as the route's deficit by this decision (ADR §7.9)
+        for (uint256 i = 0; i < r.lossTokens.length; i++) {
+            address token = r.lossTokens[i];
+            uint256 open_ = g.losses[route][token] - g.acceptedDeficit[route][token];
+            if (open_ != 0) {
+                g.acceptedDeficit[route][token] += open_;
+                emit GnoDeficitAccepted(key, token, open_);
+            }
+        }
         r.closed = false;
-        emit GnoRouteReopened(GnoTransferStorage.routeKey(clientId));
+        emit GnoRouteReopened(key);
     }
 
     /// @notice See IGnoICS20Controls.
@@ -198,6 +215,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         rec.burned = burned;
         rec.amount = data.amount;
         rec.legacy = true;
+        GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
     }
 

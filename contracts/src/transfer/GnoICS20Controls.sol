@@ -100,6 +100,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     emit GnoRefundPaid(q.clientId, q.sequence, token, rec.sender, got);
                     if (got != remaining) break; // an installment: the meter is empty
                     rec.payment = Payment.Claimed;
+                    GnoTransferStorage.closeRecord(rec, route);
                     GnoTransferStorage.releaseNotice(rec, q.clientId, q.sequence);
                 } else if (got != 0) {
                     // a refund the token refuses waits apart, so the refunds behind it are paid
@@ -170,7 +171,9 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         }
         rec.outcome = outcome;
         rec.processedBlock = uint64(block.number);
+        bytes32 route = GnoTransferStorage.routeHash(clientId);
         if (outcome == Outcome.Success) {
+            GnoTransferStorage.closeRecord(rec, route);
             emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
             GnoTransferStorage.notify(refundee, notice, clientId, sequence);
             return;
@@ -179,7 +182,6 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         require(
             rec.token == token && rec.sender == refundee && rec.amount == amount, GnoNoSendRecord(clientId, sequence)
         );
-        bytes32 route = GnoTransferStorage.routeHash(clientId);
         GnoTransferStorage.TokenControls storage t = g.tokens[route][token];
         uint64 now_ = uint64(block.timestamp);
         bool paid;
@@ -190,6 +192,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             if (GnoTransferStorage.tryPayRefund(rec, amount)) {
                 LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_);
                 rec.payment = Payment.Paid;
+                GnoTransferStorage.closeRecord(rec, route);
                 paid = true;
                 emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
             } else {
@@ -398,6 +401,16 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function losses(string calldata clientId, address token) external view delegated returns (uint256) {
         return _g().losses[GnoTransferStorage.routeHash(clientId)][token];
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function openRecords(string calldata clientId) external view delegated returns (uint64) {
+        return _route(clientId).openRecords;
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function acceptedDeficit(string calldata clientId, address token) external view delegated returns (uint256) {
+        return _g().acceptedDeficit[GnoTransferStorage.routeHash(clientId)][token];
     }
 
     /// @notice See IGnoICS20Controls.

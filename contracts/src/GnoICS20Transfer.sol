@@ -772,6 +772,7 @@ contract GnoICS20Transfer is
         rec.sendBlock = uint64(block.number);
         rec.burned = burned;
         rec.amount = msg_.amount;
+        GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(msg_.sourceClient));
         emit GnoSendRecorded(msg_.sourceClient, sequence, commitment, msg_.denom, msg_.amount);
     }
 

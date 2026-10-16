@@ -567,7 +567,7 @@ contract GnoICS20TransferTest is ControlsFixture {
 
     function test_migrateRoute_movesEverythingInConstantWork() public {
         _usdcLimits(1000, 1000, 1000);
-        _send(alice, address(usdc), 300, clientId);
+        IICS26RouterMsgs.Packet memory out = _send(alice, address(usdc), 300, clientId);
         _gnotIn(50, bob);
         address escrow = ics20.getEscrow(clientId);
         _addClient("gnoland-9", address(new MockLightClient()));
@@ -592,8 +592,17 @@ contract GnoICS20TransferTest is ControlsFixture {
         );
         vm.expectRevert(abi.encodeWithSelector(T.GnoRouteClosed.selector, "gnoland-9"));
         ctl.claim("gnoland-9", address(usdc), 1);
+        // reopening waits for every record of the retired id: the packet still in flight is open
+        assertEq(ctl.openRecords(clientId), 1);
         vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, "gnoland-9", 1));
         ctl.reopenRoute("gnoland-9");
+        T.SettleItem[] memory items = new T.SettleItem[](1);
+        items[0] = T.SettleItem(out.sequence, 3, 0); // reconciled: delivered
+        vm.startPrank(address(admin));
+        ctl.settleRecords(clientId, items);
+        ctl.reopenRoute("gnoland-9");
+        vm.stopPrank();
         assertFalse(ctl.routeClosed(clientId));
 
         // the new id: the same voucher, escrow and limits (receive level kept)
