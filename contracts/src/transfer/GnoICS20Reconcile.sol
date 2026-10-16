@@ -64,6 +64,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         bytes32 route = _openRoute(clientId);
         GnoTransferStorage.TokenControls storage t = g.tokens[route][rec.token];
         uint64 now_ = uint64(block.timestamp);
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         uint256 remaining = GnoTransferStorage.refundable(rec);
         // a refund kind 12 decided is not metered; one from an ack or timeout is
         got = rec.settlement == 1 ? remaining : LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
@@ -78,6 +79,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             emit GnoOutcomeRecorded(clientId, sequence, rec.outcome, Payment.Claimed);
             GnoTransferStorage.releaseNotice(rec, clientId, sequence);
         }
+        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
     }
 
     // -------------------------------------------------------------------------------------- reconciliation --
@@ -103,6 +105,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             require(rec.commitment != bytes32(0) && rec.settlement == 0, GnoBadSettlement(i));
             uint8 action = it.action;
             bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
+            uint256 reservedBefore = GnoTransferStorage.reservation(rec);
             if (action == 1) {
                 // the refund's whole remainder: a refund is never cut short (ADR §7.9)
                 uint256 left = rec.amount - rec.refunded;
@@ -138,6 +141,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 revert GnoBadSettlement(i);
             }
             GnoTransferStorage.closeRecord(rec, route);
+            GnoTransferStorage.syncReserve(route, rec, reservedBefore);
             emit GnoSettled(clientId, it.sequence, action, it.amount);
         }
     }

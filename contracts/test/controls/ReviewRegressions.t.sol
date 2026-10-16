@@ -11,6 +11,7 @@ import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
+import { Strings } from "@openzeppelin-contracts/utils/Strings.sol";
 import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
 import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
 import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
@@ -220,6 +221,42 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.reopenRoute(clientId);
         assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 10);
         assertEq(ctl.losses(clientId, address(usdc)), 10);
+    }
+
+    /// @notice Round 2 #5: a parked reconciled refund keeps its backing after an accepted deficit: redemptions may
+    /// not release the escrow reserved for it, and the refund is still payable once its sender takes tokens again.
+    function test_r2_5_owedRefundsReserveTheirBacking() public {
+        RefusingToken r = new RefusingToken();
+        r.mint(alice, 100);
+        r.mint(bob, 200);
+        vm.prank(alice);
+        r.approve(address(ics20), type(uint256).max);
+        vm.prank(bob);
+        r.approve(address(ics20), type(uint256).max);
+        _setLimits(address(r), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pa = _send(alice, address(r), 100, clientId); // never delivered
+        IICS26RouterMsgs.Packet memory pb = _send(bob, address(r), 200, clientId); // delivered: vouchers on gno
+        address escrow = ics20.getEscrow(clientId);
+        vm.prank(escrow);
+        r.transfer(address(0xdead), 100); // an incident: 100 of the backing is gone
+        _retire();
+        r.setBlocked(alice, true);
+        T.SettleItem[] memory items = new T.SettleItem[](2);
+        items[0] = T.SettleItem(pa.sequence, 1, 100); // refunded in full: parked (alice refuses for now)
+        items[1] = T.SettleItem(pb.sequence, 3, 0);
+        _settle(items);
+        assertEq(ctl.reserved(clientId, address(r)), 100);
+        vm.prank(address(admin));
+        ctl.reopenRoute(clientId); // the deficit is accepted
+        // bob redeems his 200 vouchers: only what is not reserved can leave
+        string memory back = string.concat("transfer/ethereum-9/", Strings.toHexString(address(r)));
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", back, 200, bob)), "would eat alice's refund");
+        assertTrue(_isSuccessAck(_transferIn("gnoland-9", back, 100, bob)));
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", back, 1, bob)));
+        r.setBlocked(alice, false);
+        assertEq(ctl.claimParked(clientId, pa.sequence), 100);
+        assertEq(r.balanceOf(alice), 100);
+        assertEq(ctl.reserved(clientId, address(r)), 0);
     }
 
     // ================================================================== #2 never spent by starving (proxies) ==

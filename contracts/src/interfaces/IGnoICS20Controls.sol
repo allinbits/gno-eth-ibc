@@ -98,6 +98,7 @@ interface IGnoICS20ControlsTypes {
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
     error GnoRecordsOpen(string clientId, uint64 open);
+    error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
     error GnoQuarantined(string clientId, uint256 until);
     error GnoQuarantineUnknown(string clientId);
     error GnoDenomNotRegistered(string denom);
@@ -209,6 +210,8 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function routeClosed(string calldata clientId) external view returns (bool);
     /// @notice Losses kind 12 recorded on the route for the token.
     function losses(string calldata clientId, address token) external view returns (uint256);
+    /// @notice Escrow of the token reserved for the route's owed refunds (queued, parked or decided but unpaid).
+    function reserved(string calldata clientId, address token) external view returns (uint256);
     /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).
     function openRecords(string calldata clientId) external view returns (uint64);
     /// @notice The part of the route's losses of the token kind 13 accepted as a deficit.

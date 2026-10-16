@@ -91,6 +91,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             GnoTransferStorage.QueuedRefund storage q = t.queue[t.head];
             SendRecord storage rec = g.records[keccak256(bytes(q.clientId))][q.sequence];
             if (rec.payment == Payment.Queued) {
+                uint256 reservedBefore = GnoTransferStorage.reservation(rec);
                 uint256 remaining = GnoTransferStorage.refundable(rec);
                 uint256 got = LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
                 if (got > remaining) got = remaining;
@@ -98,7 +99,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                 if (got != 0 && GnoTransferStorage.tryPayRefund(rec, got)) {
                     LeakyBucket.charge(t.refunded, t.limits.refundCap, got, now_);
                     emit GnoRefundPaid(q.clientId, q.sequence, token, rec.sender, got);
-                    if (got != remaining) break; // an installment: the meter is empty
+                    if (got != remaining) {
+                        // an installment: the meter is empty
+                        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+                        break;
+                    }
                     rec.payment = Payment.Claimed;
                     GnoTransferStorage.closeRecord(rec, route);
                     GnoTransferStorage.releaseNotice(rec, q.clientId, q.sequence);
@@ -107,6 +112,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     rec.payment = Payment.Parked;
                     emit GnoRefundParked(q.clientId, q.sequence, token, remaining);
                 }
+                GnoTransferStorage.syncReserve(route, rec, reservedBefore);
                 emit GnoOutcomeRecorded(q.clientId, q.sequence, rec.outcome, rec.payment);
             }
             // an entry kind 12 settled (rejected, paid or parked) leaves the queue without a payment
@@ -204,6 +210,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             rec.payment = Payment.Queued;
             emit GnoRefundQueued(clientId, sequence, token, amount);
         }
+        GnoTransferStorage.syncReserve(route, rec, 0);
         emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
         if (paid) GnoTransferStorage.notify(refundee, notice, clientId, sequence);
         else GnoTransferStorage.holdNotice(refundee, notice, clientId, sequence);
@@ -406,6 +413,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function openRecords(string calldata clientId) external view delegated returns (uint64) {
         return _route(clientId).openRecords;
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function reserved(string calldata clientId, address token) external view delegated returns (uint256) {
+        return _g().tokens[GnoTransferStorage.routeHash(clientId)][token].reserved;
     }
 
     /// @notice See IGnoICS20Controls.

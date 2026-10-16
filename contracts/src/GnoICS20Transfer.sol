@@ -395,6 +395,13 @@ contract GnoICS20Transfer is
                 require(erc20Address != address(0), ICS20DenomNotFound(string(newDenom)));
             } // else: Case 2: "Native" ERC20
             _chargeReceive(route, msg_.destinationClient, erc20Address, packetData.amount); // GNO: E5
+            // GNO: never below the escrow reserved for refunds owed (ADR §7.12)
+            uint256 balance = IERC20(erc20Address).balanceOf(address(escrow));
+            uint256 reserved = _gno().tokens[route][erc20Address].reserved;
+            require(
+                balance >= packetData.amount && balance - packetData.amount >= reserved,
+                GnoEscrowReserved(erc20Address, balance, reserved)
+            );
         } else {
             // we are not origin source, i.e. sender chain is the origin source: add denom trace and mint vouchers
             bytes memory newDenomPrefix = ICS20Lib.getDenomPrefix(msg_.payload.destPort, msg_.destinationClient);

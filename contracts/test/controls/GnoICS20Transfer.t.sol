@@ -530,6 +530,7 @@ contract GnoICS20TransferTest is ControlsFixture {
             ctl.claim(clientId, address(usdc), 20);
         }
         assertEq(usdc.balanceOf(alice) - before, total, "every refund paid in full");
+        assertEq(ctl.reserved(clientId, address(usdc)), 0, "nothing owed, nothing reserved");
         for (uint256 i = 0; i < n; i++) {
             T.SendRecord memory rec = ctl.sendRecord(clientId, pkts[i].sequence);
             assertEq(rec.refunded, rec.amount);
