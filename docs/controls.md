@@ -129,6 +129,57 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | E4/E11 hand-over of every authority, deployer roles removed, check list read back | `script/DeployGnoIBC.s.sol`; `IBCAdmin.finishSetup`; `IBCAdminSetupCheck` |
 | §7.2/§9 launch values from the expected lock: day cap min(100,000 GNOT, lock/10), max per message min(25,000 GNOT, day cap), refund cap the day cap; overrides only lower; quarantine 7 d | `DeployGnoIBC._launchLimits`, `_deploy` |
 
+## Reconciliation state machine
+
+This is the specification the controls implement for route closure, reconciliation (kind 12) and reopening
+(kind 13), across any number of incidents. `GnoTransferStorage` holds the state; `GnoICS20Controls.migrateRoute`,
+`ackHook`, `GnoICS20Reconcile.settleRecords`, `reopenRoute`, `continueReopen` and `GnoICS20Evidence.backfill` are
+the transitions.
+
+### State
+
+- **Client generation.** Every client id a route has had is one generation: the route's current (live) client, or
+  a retired one. Per client id: the list of the blocks at which its acks and timeouts were processed (append-only,
+  in order; a send record keeps its index in it), its **open-record count** (records opened by a send or backfill
+  and not yet closed by a success ack, a refund paid in full or a settlement), and, once retired, the **incident**
+  covering it, the first suspect index `suspectStart` and its **suspect count**.
+- **Incident.** A closure of the route: `{kind, status, client, suspectFrom}`.
+  - kind *replacement* (kind 10 or the emergency recovery): covers exactly the client id it retired. Its suspect
+    range is that client's processed list from the first entry at or after block `suspectFrom` to the end, frozen
+    at closure, plus every ack or timeout processed on that client later (a retired client cannot normally process
+    any: it is frozen).
+  - kind *late loss*: a loss kind 12 booked while the route was open. It covers no records.
+  - status *open* → *reopening* → *resolved*. Incidents are appended; every incident below `resolvedUpTo` is
+    resolved.
+- **Route.** `closed`, `reopening` and the deficit cursor; the losses and accepted deficits per token.
+
+### Invariants
+
+1. A route is open (`closed == false`) only if every incident on it is resolved.
+2. The open-record count of a client id equals the number of its records with `open` set; its suspect count
+   equals the number of its unsettled records whose processed index is at or after `suspectStart`.
+3. Acks and timeouts on the live client never count against any incident.
+4. Every send record is settled at most once, and a refund is never paid twice (`refunded <= amount`).
+5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12).
+6. When a route opens, every token's losses equal its accepted deficit.
+7. While a route is reopening, its losses do not change (reconciliation is sealed: no kind 12 on a client whose
+   incident is reopening, and no loss booked on the route).
+
+### Transitions
+
+| Event | Precondition | Effect |
+|---|---|---|
+| replacement (kind 10, emergency recovery) | the old id is the route's current client; the new id fresh | a new *replacement* incident covering the old id (suspect range from `suspectFrom`); the route closes; a reopening under way is aborted (its incidents back to *open*); earlier incidents, their records, reservations and counters untouched. Allowed while the route is closed |
+| ack or timeout | a record of the client | appended to the client's processed list; counted as suspect only if the client is retired |
+| kind 12 on a retired client's records | its incident not *reopening*; the outcome proven by the active verifier | the record settled once; its client's open and suspect counts follow |
+| kind 12 booking a loss | the route not reopening | the loss recorded; if the route was open, a *late-loss* incident opens and the route closes |
+| backfill | the router still holds the packet | a record opened for its client |
+| kind 13 | the route closed and not reopening; every unresolved incident settled (a replacement's client with no open and no suspect record; a late loss always) | unresolved incidents become *reopening*; deficits accepted in batches (`continueReopen`) |
+| last deficit batch | — | every reopening incident checked again: all settled → *resolved*, the route opens; otherwise the reopening aborts (incidents back to *open*, the route stays closed) |
+
+Each client id is retired once, so its suspect range never overlaps another incident's and a record reconciled by
+one incident is never counted by another; nothing is counted on the live client.
+
 ## Execution of decisions, per kind
 
 `IBCAdmin.execute` checks, before anything runs: the decision pending and not tombstoned, not suspended by an open
