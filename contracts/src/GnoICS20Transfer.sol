@@ -430,21 +430,25 @@ contract GnoICS20Transfer is
             // if the acknowledgement is an error, we must refund the tokens to the sender
             // GNO: paid at once, or queued under the refund meter or the refunds hold; the sender is notified
             // when its refund is paid, and its notification failing never rolls the refund back
-            (address sender, bool paid) =
-                _refundTokens(msg_.payload.sourcePort, msg_.sourceClient, msg_.sequence, packetData, Outcome.ErrorAck);
-            _notice(
-                sender,
-                abi.encodeCall(IIBCSenderCallbacks.onAckPacket, (false, msg_)),
+            _refundTokens(
+                msg_.payload.sourcePort,
                 msg_.sourceClient,
                 msg_.sequence,
-                paid
+                packetData,
+                Outcome.ErrorAck,
+                abi.encodeCall(IIBCSenderCallbacks.onAckPacket, (false, msg_))
             );
         } else {
+            // GNO: the outcome attached to the send record; a notification failing never rolls it back
             address sender = ICS20Lib.mustHexStringToAddress(packetData.sender);
-            _recordOutcome(msg_.sourceClient, msg_.sequence, Outcome.Success); // GNO
-            // GNO: a notification failing never rolls the outcome back
-            GnoTransferStorage.notify(
-                sender, abi.encodeCall(IIBCSenderCallbacks.onAckPacket, (true, msg_)), msg_.sourceClient, msg_.sequence
+            _ackHook(
+                msg_.sourceClient,
+                msg_.sequence,
+                Outcome.Success,
+                address(0),
+                sender,
+                0,
+                abi.encodeCall(IIBCSenderCallbacks.onAckPacket, (true, msg_))
             );
         }
     }
@@ -455,36 +459,32 @@ contract GnoICS20Transfer is
         IICS20TransferMsgs.FungibleTokenPacketData memory packetData =
             abi.decode(msg_.payload.value, (IICS20TransferMsgs.FungibleTokenPacketData));
         // GNO: paid at once, or queued under the refund meter or the refunds hold; notified when paid
-        (address sender, bool paid) =
-            _refundTokens(msg_.payload.sourcePort, msg_.sourceClient, msg_.sequence, packetData, Outcome.Timeout);
-        _notice(
-            sender, abi.encodeCall(IIBCSenderCallbacks.onTimeoutPacket, (msg_)), msg_.sourceClient, msg_.sequence, paid
+        _refundTokens(
+            msg_.payload.sourcePort,
+            msg_.sourceClient,
+            msg_.sequence,
+            packetData,
+            Outcome.Timeout,
+            abi.encodeCall(IIBCSenderCallbacks.onTimeoutPacket, (msg_))
         );
-    }
-
-    /// @notice GNO: a refund's notification, delivered now if it was paid, else held until it is.
-    function _notice(address sender, bytes memory call, string calldata clientId, uint64 sequence, bool paid) private {
-        if (paid) GnoTransferStorage.notify(sender, call, clientId, sequence);
-        else GnoTransferStorage.holdNotice(sender, call, clientId, sequence);
     }
 
     /// @notice Refund the tokens to the sender
     /// @param sourcePort The source port of the packet
     /// @param sourceClient The source client of the packet
     /// @param packetData The packet data
-    /// @return The address that received the refunded tokens, i.e. sender of the packet
-    /// GNO: also takes the sequence and outcome; the refund is attached to the packet's send record and paid by
-    /// `_settleRefund` (at once, or queued). Returns the refundee and whether the refund was paid now (upstream's
-    /// first return value, the token, was unused).
+    /// GNO: also takes the sequence, the outcome and the sender's notification; the refund is attached to the
+    /// packet's send record and paid by the controls' `ackHook` (at once, or queued). Upstream's return values (the
+    /// token and the refundee) were unused and are dropped.
     function _refundTokens(
         string calldata sourcePort,
         string calldata sourceClient,
         uint64 sequence,
         IICS20TransferMsgs.FungibleTokenPacketData memory packetData,
-        Outcome outcome
+        Outcome outcome,
+        bytes memory notice
     )
         private
-        returns (address, bool)
     {
         ICS20TransferStorage storage $ = _getICS20TransferStorage();
         IEscrow escrow = $._escrows[_routeKey(sourceClient)]; // GNO: by route key
@@ -515,8 +515,7 @@ contract GnoICS20Transfer is
         }
 
         // GNO: instead of `escrow.send(IERC20(erc20Address), refundee, packetData.amount)`
-        bool paid = _settleRefund(sourceClient, sequence, outcome, erc20Address, refundee, packetData.amount);
-        return (refundee, paid);
+        _ackHook(sourceClient, sequence, outcome, erc20Address, refundee, packetData.amount, notice);
     }
 
     /// @notice Transfer tokens from sender to receiver
@@ -776,70 +775,41 @@ contract GnoICS20Transfer is
         emit GnoSendRecorded(msg_.sourceClient, sequence, commitment, msg_.denom, msg_.amount);
     }
 
-    /// @notice The send record of a processed packet, with the outcome and processing block attached.
-    function _processed(
-        string calldata clientId,
-        uint64 sequence,
-        Outcome outcome
-    )
-        private
-        returns (SendRecord storage rec)
-    {
-        rec = _gno().records[keccak256(bytes(clientId))][sequence];
-        // a packet sent before the fork was installed is processed only once `backfill` authenticated its record
-        // against the router's commitment, which stays until this callback succeeds
-        require(rec.commitment != bytes32(0), GnoNoSendRecord(clientId, sequence));
-        rec.outcome = outcome;
-        rec.processedBlock = uint64(block.number);
-    }
-
-    function _recordOutcome(string calldata clientId, uint64 sequence, Outcome outcome) private {
-        SendRecord storage rec = _processed(clientId, sequence, outcome);
-        emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
-    }
-
-    /// @notice Attaches an error ack or a timeout to the send record and pays the refund at once when the refund
-    /// meter has room, no refunds hold stands, the route is open and nothing is queued before it; otherwise queues it
-    /// for `claim` (§7.13). Never reverts for the meter, the hold or a token refusing the payment (parked for
-    /// `claimParked`): a refund is delayed, never refused. Returns whether it was paid now.
-    function _settleRefund(
+    /// @notice The controls' `ackHook`, run in this contract's storage: attaches an ack's or timeout's outcome to
+    /// the send record and settles its refund (GnoICS20Controls). A consume-once transient flag lets only this call
+    /// reach the hook: the fallback cannot.
+    function _ackHook(
         string calldata clientId,
         uint64 sequence,
         Outcome outcome,
         address token,
         address refundee,
-        uint256 amount
+        uint256 amount,
+        bytes memory notice
     )
         private
-        returns (bool paid)
     {
-        SendRecord storage rec = _processed(clientId, sequence, outcome);
-        // the record is the send's (or the backfill's, authenticated): it must name this refund
-        require(
-            rec.token == token && rec.sender == refundee && rec.amount == amount, GnoNoSendRecord(clientId, sequence)
+        address controls = CONTROLS;
+        bytes memory call = abi.encodeWithSignature(
+            "ackHook(string,uint64,uint8,address,address,uint256,bytes)",
+            clientId,
+            sequence,
+            outcome,
+            token,
+            refundee,
+            amount,
+            notice
         );
-        bytes32 route = GnoTransferStorage.routeHash(clientId);
-        GnoTransferStorage.TokenControls storage t = _gno().tokens[route][token];
-        uint64 now_ = uint64(block.timestamp);
-        if (
-            t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !_gno().routes[route].closed
-                && amount <= LeakyBucket.available(t.refunded, t.limits.refundCap, now_)
-        ) {
-            // a payment the token refuses never blocks the acknowledgement: the refund is parked
-            if (GnoTransferStorage.tryPayRefund(rec, amount)) {
-                LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_);
-                rec.payment = Payment.Paid;
-                paid = true;
-                emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
-            } else {
-                rec.payment = Payment.Parked;
-                emit GnoRefundParked(clientId, sequence, token, amount);
-            }
-        } else {
-            t.queue[t.tail++] = GnoTransferStorage.QueuedRefund(clientId, sequence);
-            rec.payment = Payment.Queued;
-            emit GnoRefundQueued(clientId, sequence, token, amount);
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            tstore(0xfe384f8ea4975d6b603976442788326f3f0c6e1e07e29205223544c80bcce885, 1)
         }
-        emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
+        (bool ok, bytes memory ret) = controls.delegatecall(call);
+        if (!ok) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
     }
 }

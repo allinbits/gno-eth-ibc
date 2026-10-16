@@ -122,6 +122,84 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         require(!GnoTransferStorage.refundsHeld(route), GnoRefundsHeld(clientId));
     }
 
+    // ------------------------------------------------------------------------------------------ the ack hook --
+
+    error NotHook();
+
+    /// @notice Only through GnoICS20Transfer's own call (`_ackHook`): it sets a transient flag that this consumes, so
+    /// no call through the fallback, and no call nested inside the hook (a token's transfer hook), can reach it.
+    modifier onlyHook() {
+        uint256 f;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            f := tload(0xfe384f8ea4975d6b603976442788326f3f0c6e1e07e29205223544c80bcce885)
+            tstore(0xfe384f8ea4975d6b603976442788326f3f0c6e1e07e29205223544c80bcce885, 0)
+        }
+        if (f != 1) revert NotHook();
+        _;
+    }
+
+    /// @notice Attaches an ack's or timeout's outcome to the packet's send record (§7.13). A success notifies the
+    /// sender. An error ack or timeout pays the refund at once when the refund meter has room, no refunds hold
+    /// stands, the route is open and nothing is queued before it; otherwise queues it for `claim`. A token refusing
+    /// the payment parks it for `claimParked`. Never reverts for the meter, the hold or a refusal: a refund is
+    /// delayed, never refused. The sender is notified when the refund is paid.
+    function ackHook(
+        string calldata clientId,
+        uint64 sequence,
+        Outcome outcome,
+        address token,
+        address refundee,
+        uint256 amount,
+        bytes calldata notice
+    )
+        external
+        delegated
+        onlyHook
+    {
+        GnoTransferStorage.Layout storage g = _g();
+        SendRecord storage rec = g.records[keccak256(bytes(clientId))][sequence];
+        // a packet sent before the fork is processed only once `backfill` authenticated its record against the
+        // router's commitment, which stays until this callback succeeds
+        require(rec.commitment != bytes32(0), GnoNoSendRecord(clientId, sequence));
+        rec.outcome = outcome;
+        rec.processedBlock = uint64(block.number);
+        if (outcome == Outcome.Success) {
+            emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
+            GnoTransferStorage.notify(refundee, notice, clientId, sequence);
+            return;
+        }
+        // the record is the send's (or the backfill's, authenticated): it must name this refund
+        require(
+            rec.token == token && rec.sender == refundee && rec.amount == amount, GnoNoSendRecord(clientId, sequence)
+        );
+        bytes32 route = GnoTransferStorage.routeHash(clientId);
+        GnoTransferStorage.TokenControls storage t = g.tokens[route][token];
+        uint64 now_ = uint64(block.timestamp);
+        bool paid;
+        if (
+            t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !g.routes[route].closed
+                && amount <= LeakyBucket.available(t.refunded, t.limits.refundCap, now_)
+        ) {
+            if (GnoTransferStorage.tryPayRefund(rec, amount)) {
+                LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_);
+                rec.payment = Payment.Paid;
+                paid = true;
+                emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
+            } else {
+                rec.payment = Payment.Parked;
+                emit GnoRefundParked(clientId, sequence, token, amount);
+            }
+        } else {
+            t.queue[t.tail++] = GnoTransferStorage.QueuedRefund(clientId, sequence);
+            rec.payment = Payment.Queued;
+            emit GnoRefundQueued(clientId, sequence, token, amount);
+        }
+        emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
+        if (paid) GnoTransferStorage.notify(refundee, notice, clientId, sequence);
+        else GnoTransferStorage.holdNotice(refundee, notice, clientId, sequence);
+    }
+
     // --------------------------------------------------------------------------------------------- guardians --
 
     function _flag(string calldata clientId, bool refunds, bool set) private {

@@ -80,6 +80,22 @@ contract GnoICS20TransferTest is ControlsFixture {
         GnoICS20Controls(d.ics20Controls).routeKey(clientId);
     }
 
+    function test_ackHook_onlyThroughTheForksOwnCall() public {
+        bytes memory call = abi.encodeWithSignature(
+            "ackHook(string,uint64,uint8,address,address,uint256,bytes)",
+            clientId,
+            uint64(1),
+            uint8(T.Outcome.Timeout),
+            address(usdc),
+            alice,
+            uint256(1),
+            ""
+        );
+        (bool ok, bytes memory ret) = address(ics20).call(call);
+        assertFalse(ok);
+        assertEq(bytes4(ret), GnoICS20Controls.NotHook.selector);
+    }
+
     function test_setLimits_refusesBadValues() public {
         vm.startPrank(address(admin));
         vm.expectRevert(T.GnoBadLimits.selector);
