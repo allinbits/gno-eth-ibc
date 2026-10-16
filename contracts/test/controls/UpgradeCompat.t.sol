@@ -65,7 +65,7 @@ contract UpgradeCompatTest is Test {
         ugnot = new GnoVoucher("Gno.land", "GNOT", 6, ics20, "transfer/client-0/ugnot");
         ICS20Transfer(ics20).setCustomERC20("transfer/client-0/ugnot", address(ugnot));
         usdc = new ERC20Mock();
-        usdc.mint(alice, 1000);
+        usdc.mint(alice, 1100);
         vm.prank(alice);
         usdc.approve(ics20, type(uint256).max);
     }
@@ -96,10 +96,11 @@ contract UpgradeCompatTest is Test {
 
     function test_upgradeKeepsUpstreamState_andLegacyPacketsRefund() public {
         IICS26RouterMsgs.Packet memory legacy = _sendUsdc(400);
+        IICS26RouterMsgs.Packet memory legacyOk = _sendUsdc(100);
         address escrow = ICS20Transfer(ics20).getEscrow(clientId);
         address escrowBeacon = ICS20Transfer(ics20).getEscrowBeacon();
         address ibcBeacon = ICS20Transfer(ics20).getIBCERC20Beacon();
-        assertEq(usdc.balanceOf(escrow), 400);
+        assertEq(usdc.balanceOf(escrow), 500);
 
         address controls = address(new GnoICS20Controls());
         address fork = address(new GnoICS20Transfer(controls));
@@ -119,17 +120,48 @@ contract UpgradeCompatTest is Test {
         vm.expectRevert();
         IGnoICS20Controls(ics20).initializeGno(keys);
 
-        // the packet sent before the upgrade: no limits yet, so its refund is queued, with a record made for it
-        router.ackPacket(
-            IICS26RouterMsgs.MsgAckPacket(legacy, ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1))
+        // the packet sent before the upgrade has no record: its ack waits (the router keeps its commitment) ...
+        IICS26RouterMsgs.MsgAckPacket memory ack =
+            IICS26RouterMsgs.MsgAckPacket(legacy, ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoSendRecord.selector, clientId, legacy.sequence));
+        router.ackPacket(ack);
+        // ... a success ack too: no outcome is ever attached to an unauthenticated record
+        IICS26RouterMsgs.MsgAckPacket memory ok =
+            IICS26RouterMsgs.MsgAckPacket(legacyOk, bytes("{\"result\":\"AQ==\"}"), "", IICS02ClientMsgs.Height(0, 1));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoSendRecord.selector, clientId, legacyOk.sequence));
+        router.ackPacket(ok);
+        IGnoICS20Controls(ics20).backfill(legacyOk);
+        router.ackPacket(ok);
+        assertEq(
+            uint8(IGnoICS20Controls(ics20).sendRecord(clientId, legacyOk.sequence).outcome), uint8(T.Outcome.Success)
         );
+        // ... a forged packet cannot be backfilled: its commitment is not the router's
+        IICS26RouterMsgs.Packet memory forged = IICS26RouterMsgs.Packet(
+            legacy.sequence, legacy.sourceClient, legacy.destClient, legacy.timeoutTimestamp + 1, legacy.payloads
+        );
+        vm.expectRevert(T.GnoBadBackfill.selector);
+        IGnoICS20Controls(ics20).backfill(forged);
+        // ... until anyone backfills its record from the packet bytes the router authenticates
+        IGnoICS20Controls(ics20).backfill(legacy);
         T.SendRecord memory rec = IGnoICS20Controls(ics20).sendRecord(clientId, legacy.sequence);
-        assertEq(rec.commitment, bytes32(0));
-        assertEq(rec.sendBlock, 0);
+        assertEq(rec.commitment, ICS24Host.packetCommitmentBytes32(legacy));
+        assertTrue(rec.legacy);
         assertEq(rec.amount, 400);
         assertEq(rec.sender, alice);
+        assertEq(rec.token, address(usdc));
+        assertEq(rec.escrow, escrow);
+        assertEq(rec.timeoutTimestamp, legacy.timeoutTimestamp);
+        vm.expectRevert(T.GnoBadBackfill.selector);
+        IGnoICS20Controls(ics20).backfill(legacy); // once
+
+        // no limits yet: the refund is queued
+        router.ackPacket(ack);
+        rec = IGnoICS20Controls(ics20).sendRecord(clientId, legacy.sequence);
         assertEq(uint8(rec.payment), uint8(T.Payment.Queued));
         assertEq(usdc.balanceOf(alice), 600);
+        // and a processed packet's commitment is gone: no record can be made for it any more
+        vm.expectRevert(T.GnoBadBackfill.selector);
+        IGnoICS20Controls(ics20).backfill(legacy);
 
         IGnoICS20Controls(ics20).setLimits(clientId, address(usdc), T.Limits(0, 0, 1000, 0, 0));
         assertEq(IGnoICS20Controls(ics20).claim(clientId, address(usdc), 5), 1);

@@ -177,10 +177,15 @@ contract GnoICS20TransferTest is ControlsFixture {
         assertTrue(_isSuccessAck(_gnotIn(1, bob)));
     }
 
-    function test_recv_quarantineDisabled() public {
+    function test_recv_quarantineDisabled_forLaterTransitionsOnly() public {
         lc.setTransitionTime(uint64(_now()));
+        _skip(1 days);
         vm.prank(address(admin));
         ctl.setQuarantine(clientId, 0);
+        assertTrue(_isErrorAck(_gnotIn(1, bob)), "a started quarantine keeps its deadline");
+        _skip(6 days);
+        assertTrue(_isSuccessAck(_gnotIn(1, bob)));
+        lc.setTransitionTime(uint64(_now())); // a transition after the change: not quarantined
         assertTrue(_isSuccessAck(_gnotIn(1, bob)));
     }
 
@@ -378,14 +383,22 @@ contract GnoICS20TransferTest is ControlsFixture {
         ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber()) + 1);
     }
 
-    function test_unpauseRoute_clearsRefundsFlagsWhateverStands() public {
+    function test_refundsHold_followsTheHoldRules() public {
         vm.prank(G[0]);
         ctl.setRefundsFlag(clientId);
         vm.prank(G[1]);
-        ctl.setRefundsFlag(clientId); // two guardian refunds flags: no hold of the route's own flags
+        ctl.setRefundsFlag(clientId); // two guardian refunds flags: a hold
+        assertTrue(ctl.refundsHold(clientId).blockNumber != 0);
         _skip(12);
         vm.prank(address(admin));
-        assertEq(ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber())), 2);
+        vm.expectRevert(IGuardians.HoldStands.selector);
+        ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber()));
+        // one guardian lifts its own flag: 24 hours later the hold has ended and an unpause clears the rest
+        vm.prank(G[1]);
+        ctl.clearRefundsFlag(clientId);
+        _skip(1 days);
+        vm.prank(address(admin));
+        assertEq(ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber())), 1);
         assertFalse(ctl.refundsHeld(clientId));
     }
 
@@ -555,6 +568,17 @@ contract GnoICS20TransferTest is ControlsFixture {
         _sendExpectRevert(
             alice, address(usdc), 1, clientId, abi.encodeWithSelector(T.GnoClientRetired.selector, clientId)
         );
+        // the route is closed until reconciled and reopened (kinds 12, 13): no receive, no send, no claim
+        assertTrue(ctl.routeClosed("gnoland-9"));
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", "ugnot", 10, bob)));
+        _sendExpectRevert(
+            alice, address(usdc), 1, "gnoland-9", abi.encodeWithSelector(T.GnoRouteClosed.selector, "gnoland-9")
+        );
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRouteClosed.selector, "gnoland-9"));
+        ctl.claim("gnoland-9", address(usdc), 1);
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertFalse(ctl.routeClosed(clientId));
 
         // the new id: the same voucher, escrow and limits (receive level kept)
         assertEq(ctl.limits("gnoland-9", address(ugnot)).receiveLevel, 50);

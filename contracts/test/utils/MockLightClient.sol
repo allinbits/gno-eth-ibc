@@ -4,6 +4,8 @@ pragma solidity ^0.8.28;
 import { ILightClient } from "@eureka/interfaces/ILightClient.sol";
 import { ILightClientMsgs } from "@eureka/msgs/ILightClientMsgs.sol";
 
+import { IGnoLightClientMsgs } from "../../src/msgs/IGnoLightClientMsgs.sol";
+
 /// @notice A light client that proves whatever it is asked (tests drive the router without real proofs), with the
 /// quarantine and status views of GnoLightClient under the test's control.
 contract MockLightClient is ILightClient {
@@ -38,12 +40,26 @@ contract MockLightClient is ILightClient {
 
     function misbehaviour(bytes calldata) external { }
 
-    function getClientState() external pure returns (bytes memory) {
-        return "";
+    string public chainId = "gno-test";
+
+    function setChainId(string memory id) external {
+        chainId = id;
+    }
+
+    /// @notice A GnoLightClient-shaped client state (chain id, frozen).
+    function getClientState() external view returns (bytes memory) {
+        IGnoLightClientMsgs.ClientState memory cs;
+        cs.chainId = chainId;
+        cs.isFrozen = frozen;
+        return abi.encode(cs);
     }
 
     function quarantineEnd(uint256 duration) external view returns (uint256) {
         return transitionTime == 0 || duration == 0 ? 0 : uint256(transitionTime) + duration;
+    }
+
+    function lastTransitionTime() external view returns (uint64) {
+        return transitionTime;
     }
 
     function isFrozen() external view returns (bool) {

@@ -306,12 +306,12 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertEq(_state(wrongHash), S.SPENT);
         assertEq(_state(wrongIcs20), S.SPENT);
         assertEq(_state(taken), S.SPENT);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NoCodeYet.selector, later));
+        // no code at the address: a failed check, spent for good (never retried once code appears)
         admin.execute(pendingCode);
-        assertEq(_state(pendingCode), S.PENDING);
+        assertEq(_state(pendingCode), S.SPENT);
         vm.etch(later, address(v).code);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotPending.selector, pendingCode));
         admin.execute(pendingCode);
-        assertEq(ics20.ibcERC20Contract("transfer/client-0/ubar"), later);
     }
 
     // =============================================================================================== kind 6 ==
@@ -373,7 +373,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         address impl = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
         uint64 notAProxy = _decidePending(S.KIND_UPGRADE, P.upgrade(address(usdc), impl, impl.codehash, ""));
         uint64 wrongHash = _decidePending(S.KIND_UPGRADE, P.upgrade(address(ics20), impl, bytes32(uint256(7)), ""));
-        // a call that reverts (re-running the one-time initializer) reverts the execution: the decision pends
+        // a call that reverts (re-running the one-time initializer): the upgrade rolls back whole and is spent
         uint64 reverting = _decidePending(
             S.KIND_UPGRADE,
             P.upgrade(
@@ -388,9 +388,32 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.execute(wrongHash);
         assertEq(_state(notAProxy), S.SPENT);
         assertEq(_state(wrongHash), S.SPENT);
-        vm.expectRevert();
+        bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+        bytes32 before = vm.load(address(ics20), implSlot);
         admin.execute(reverting);
-        assertEq(_state(reverting), S.PENDING);
+        assertEq(_state(reverting), S.SPENT);
+        assertEq(vm.load(address(ics20), implSlot), before, "rolled back");
+    }
+
+    function test_kind7_nestedUpgradeRefused() public {
+        address a = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
+        address b = address(new GnoICS20Transfer(address(new GnoICS20Controls())));
+        bytes memory nested = abi.encodeWithSignature("upgradeToAndCall(address,bytes)", b, "");
+        bytes[] memory calls = new bytes[](1);
+        calls[0] = nested;
+        uint64 direct = _decidePending(S.KIND_UPGRADE, P.upgrade(address(ics20), a, a.codehash, nested));
+        uint64 viaMulticall = _decidePending(
+            S.KIND_UPGRADE,
+            P.upgrade(address(ics20), a, a.codehash, abi.encodeWithSignature("multicall(bytes[])", calls))
+        );
+        bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+        bytes32 before = vm.load(address(ics20), implSlot);
+        _skip(7 days);
+        admin.execute(direct);
+        admin.execute(viaMulticall);
+        assertEq(_state(direct), S.SPENT);
+        assertEq(_state(viaMulticall), S.SPENT);
+        assertEq(vm.load(address(ics20), implSlot), before, "neither A nor B installed");
     }
 
     // =============================================================================================== kind 8 ==
@@ -495,7 +518,11 @@ contract IBCAdminKindsTest is ControlsFixture {
             _packetFromGno(clientId, "transfer", "ics20-1", "application/x-solidity-abi", "");
         vm.expectRevert();
         router.recvPacket(IICS26RouterMsgs.MsgRecvPacket(old, "", IICS02ClientMsgs.Height(0, 1)));
-        // the route works over the new client
+        // the route stays closed until reconciled and reopened by decision (kinds 12, 13)
+        assertTrue(ctl.routeClosed("gnoland-2"));
+        assertTrue(_isErrorAck(_transferIn("gnoland-2", "ugnot", 5, bob)));
+        uint64 reopen = _decidePending(S.KIND_REOPEN, P.reopen("gnoland-2"));
+        _executeAfterWeek(reopen);
         assertTrue(_isSuccessAck(_transferIn("gnoland-2", "ugnot", 5, bob)));
     }
 

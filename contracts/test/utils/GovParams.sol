@@ -108,4 +108,33 @@ library GovParams {
     function settings(string memory clientId, uint64 quarantineSeconds) internal pure returns (bytes memory) {
         return abi.encode(clientId, quarantineSeconds);
     }
+
+    struct SettleItem {
+        uint64 sequence;
+        uint8 action;
+        uint256 amount;
+    }
+
+    function settle(string memory clientId, SettleItem[] memory items) internal pure returns (bytes memory) {
+        return abi.encode(clientId, items);
+    }
+
+    function settle1(
+        string memory clientId,
+        uint64 sequence,
+        uint8 action,
+        uint256 amount
+    )
+        internal
+        pure
+        returns (bytes memory)
+    {
+        SettleItem[] memory items = new SettleItem[](1);
+        items[0] = SettleItem(sequence, action, amount);
+        return abi.encode(clientId, items);
+    }
+
+    function reopen(string memory clientId) internal pure returns (bytes memory) {
+        return abi.encode(clientId);
+    }
 }

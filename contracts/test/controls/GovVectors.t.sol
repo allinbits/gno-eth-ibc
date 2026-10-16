@@ -152,6 +152,17 @@ contract GovVectorsTest is ControlsFixture {
             "((uint64 from, uint64 to)[] ranges = [(100, 120)]) at seq 200",
             P.cancel(far)
         );
+        P.SettleItem[] memory items = new P.SettleItem[](2);
+        items[0] = P.SettleItem(1, 1, 100);
+        items[1] = P.SettleItem(2, 2, 0);
+        _deliver(
+            "kind12-settle",
+            14,
+            12,
+            "(string clientId = \"client-0\", (uint64 sequence, uint8 action, uint256 amount)[] items = [(1, 1, 100), (2, 2, 0)])",
+            P.settle("client-0", items)
+        );
+        _deliver("kind13-reopen", 15, 13, "(string clientId = \"gnoland-2\")", P.reopen("gnoland-2"));
     }
 
     function _json() internal view returns (string memory j) {
@@ -209,16 +220,16 @@ contract GovVectorsTest is ControlsFixture {
     function test_govVectors() public {
         _build();
         // the statuses the protocol must produce
-        uint8[16] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2];
+        uint8[18] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1];
         for (uint256 i = 0; i < vectors.length; i++) {
             (uint32 e, uint64 s, uint8 st,) = _govAck(vectors[i].ack);
             assertEq(e, 1);
             assertEq(s, vectors[i].seq);
             assertEq(st, want[i], vectors[i].name);
         }
-        (,,, uint8 redispatch) = _govAck(vectors[vectors.length - 1].ack);
+        (,,, uint8 redispatch) = _govAck(vectors[15].ack);
         assertEq(redispatch, 1);
-        assertEq(admin.lastSeq(), 13);
+        assertEq(admin.lastSeq(), 15);
 
         if (vm.envOr("WRITE_GOV_VECTORS", false)) {
             vm.writeFile(FILE, _json());

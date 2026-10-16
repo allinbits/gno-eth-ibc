@@ -52,6 +52,8 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
 
     function _recovery() internal virtual returns (IIBCAdmin.RecoveryConfig memory c) { }
 
+    function _permit2() internal virtual returns (address) { }
+
     function setUp() public virtual {
         vm.warp(1_700_000_000);
         vm.roll(1000);
@@ -66,7 +68,10 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
         p.counterparty = CP;
         p.guardians = G;
         p.watch = W;
+        p.clientState.chainId = "gno-test";
+        p.expectedLock = 1_000_000e6;
         p.gnotLimits = IGnoICS20ControlsTypes.Limits(GNOT_MAX, GNOT_DAY, GNOT_DAY, 0, 0);
+        p.permit2 = _permit2();
         p.quarantineSeconds = 7 days;
         p.recovery = _recovery();
         vm.startPrank(deployer);

@@ -87,7 +87,23 @@ contract IntegrationTest is ControlsFixture {
         assertEq(admin.govClient(), "gnoland-2");
         assertEq(address(router.getClient(clientId)), next.frozenClient());
 
-        // --- queued refunds of the old client id are claimed on the route, by either id
+        // --- the replaced route is closed: queued refunds wait for reconciliation, nothing moves
+        assertTrue(ctl.routeClosed("gnoland-2"));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRouteClosed.selector, "gnoland-2"));
+        ctl.claim("gnoland-2", address(usdc), 10);
+        assertTrue(_isErrorAck(_transferIn("gnoland-2", "ugnot", 5e6, bob)));
+        // reconciliation (kind 12): b and c were never delivered, their refunds are paid by decision; then kind 13
+        P.SettleItem[] memory items = new P.SettleItem[](2);
+        items[0] = P.SettleItem(b.sequence, 1, 50e6);
+        items[1] = P.SettleItem(c.sequence, 1, 30e6);
+        assertEq(_decide(1, S.KIND_SETTLE, P.settle(clientId, items)), S.STATUS_RECORDED);
+        assertEq(_decide(2, S.KIND_REOPEN, P.reopen("gnoland-2")), S.STATUS_RECORDED);
+        _skip(7 days);
+        admin.execute(1);
+        admin.execute(2);
+        assertEq(usdc.balanceOf(alice), start + 160e6);
+        assertEq(uint8(ctl.sendRecord(clientId, b.sequence).settlement), 1);
+        // the settled entries leave the queue without a second payment
         assertEq(ctl.claim("gnoland-2", address(usdc), 10), 2);
         assertEq(usdc.balanceOf(alice), start + 160e6);
 
@@ -96,7 +112,7 @@ contract IntegrationTest is ControlsFixture {
         IICS26RouterMsgs.Packet memory e = _send(alice, address(usdc), 10e6, "gnoland-2");
         _errorAck(e);
         assertEq(usdc.balanceOf(alice), start + 160e6);
-        assertEq(_decide(1, S.KIND_SETTINGS, P.settings("gnoland-2", 14 days)), S.STATUS_RECORDED);
+        assertEq(_decide(3, S.KIND_SETTINGS, P.settings("gnoland-2", 14 days)), S.STATUS_RECORDED);
         assertEq(ctl.quarantineSeconds("gnoland-2"), 14 days);
         assertEq(ctl.quarantineSeconds(clientId), 14 days, "one route, two ids");
     }

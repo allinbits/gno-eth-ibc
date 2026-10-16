@@ -25,6 +25,7 @@ contract DeployHarness is DeployGnoIBC {
         p.counterparty = "ethereum-1";
         p.guardians = [address(0x1001), address(0x1002), address(0x1003), address(0x1004)];
         p.watch = [address(0x1005), address(0x1006)];
+        p.expectedLock = 1_000_000e6;
         p.gnotLimits = IGnoICS20ControlsTypes.Limits(25_000e6, 100_000e6, 100_000e6, 0, 0);
         p.quarantineSeconds = 7 days;
         return _deploy(p);

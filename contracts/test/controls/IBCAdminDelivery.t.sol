@@ -148,14 +148,36 @@ contract IBCAdminDeliveryTest is ControlsFixture {
         assertEq(admin.tombstones(1).length, 1);
     }
 
-    function test_cancel_clampedBelowItsOwnNumber() public {
-        _recvGov(_shorten(1, 1));
-        _recvGov(_env(2, S.KIND_CANCEL, P.cancel1(1, 50)));
-        assertTrue(admin.isTombstoned(1, 1));
-        assertFalse(admin.isTombstoned(1, 3), "a cancel never withdraws a later number");
-        uint64[2][] memory t = admin.tombstones(1);
-        assertEq(t.length, 1);
-        assertEq(t[0][1], 1);
+    function test_cancel_targetsAnyNumber_evenAboveItsOwn() public {
+        // a forged decision 20 waits in the buffer while the honest ledger is at 10; the honest cancel 11 withdraws it
+        for (uint64 s = 1; s <= 10; s++) {
+            _recvGov(_shorten(s, s));
+        }
+        _recvGov(_shorten(20, 1));
+        _recvGov(_env(11, S.KIND_CANCEL, P.cancel1(20, 20)));
+        assertTrue(admin.isTombstoned(1, 20));
+        for (uint64 s = 12; s <= 19; s++) {
+            _recvGov(_shorten(s, s));
+        }
+        assertEq(_state(20), S.CANCELLED);
+    }
+
+    function test_cancel_beyondWindow_boundToItsHash() public {
+        bytes memory first = _env(200, S.KIND_CANCEL, P.cancel1(5, 5));
+        bytes memory other = _env(200, S.KIND_CANCEL, P.cancel1(6, 6));
+        _assertAck(_recvGov(first), 200, S.STATUS_BUFFERED, 1);
+        // another cancel at the same number: a conflict, its targets never tombstoned
+        _assertAck(_recvGov(other), 200, S.STATUS_CONFLICT, 0);
+        assertFalse(admin.isTombstoned(1, 6));
+        assertTrue(admin.conflictBlock() != 0);
+        // and once the window reaches it, other bytes at that number are a conflict too
+        for (uint64 s = 1; s <= 150; s++) {
+            _recvGov(_shorten(s, 1));
+        }
+        _assertAck(_recvGov(_env(200, S.KIND_SETTINGS, P.settings(clientId, 1))), 200, S.STATUS_CONFLICT, 0);
+        // while the first bytes take their place in the sequence
+        _assertAck(_recvGov(first), 200, S.STATUS_BUFFERED, 0);
+        assertEq(admin.decision(1, 200).state, S.BUFFERED);
     }
 
     function test_cancel_rangesMergeAndStayBounded() public {

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+
+import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessManager.sol";
+import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
+
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
@@ -149,6 +154,50 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertTrue(_openedAt() != 0);
     }
 
+    /// @notice #10: a revocation buffered before the recovery opened, drained while it is open, waits; it is due at
+    /// once when the recovery is cancelled.
+    function test_revocationDrainedDuringRecovery_waits() public {
+        IAccessManager am = IAccessManager(d.accessManager);
+        vm.prank(address(admin));
+        am.grantRole(IBCRolesLib.RELAYER_ROLE, alice, 0);
+        uint64 next = admin.lastSeq() + 1;
+        _recvGov(_env(next + 1, S.KIND_ROLE, P.role(false, IBCRolesLib.RELAYER_ROLE, alice))); // buffered
+        _openFrozen();
+        _recvGov(_env(next, S.KIND_SETTINGS, P.settings(clientId, 14 days))); // fills the gap, drains the revoke
+        assertEq(admin.decision(1, next + 1).state, S.PENDING);
+        (bool has,) = am.hasRole(IBCRolesLib.RELAYER_ROLE, alice);
+        assertTrue(has, "not revoked while the recovery is open");
+        vm.expectRevert(IIBCAdmin.Suspended.selector);
+        admin.execute(next + 1);
+        vm.prank(G[0]);
+        admin.cancelRecovery();
+        vm.prank(G[1]);
+        admin.cancelRecovery();
+        vm.prank(G[2]);
+        admin.cancelRecovery();
+        admin.execute(next + 1); // a revocation: due at once, never deferred
+        (has,) = am.hasRole(IBCRolesLib.RELAYER_ROLE, alice);
+        assertFalse(has);
+    }
+
+    /// @notice #11: the attested client must follow gno.land's chain and still be usable when the recovery executes.
+    function test_attestedClient_sameChain_usableAtExecution() public {
+        lc.setStatus(true, false);
+        attested.setChainId("other-chain");
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.approveRecovery(_proposal("gnoland-7"));
+        attested.setChainId("gno-test");
+        _openFrozen();
+        _skip(DELAY);
+        attested.setStatus(false, true); // expired during the delay
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.executeRecovery();
+        attested.setStatus(false, false);
+        admin.executeRecovery();
+        assertEq(admin.epoch(), 2);
+    }
+
     function test_whileOpen_receivesBlocked_authorityKindsSuspended() public {
         uint64 seats = admin.lastSeq() + 1;
         _recvGov(_env(seats, S.KIND_SEATS, P.seat1(0, makeAddr("fresh"))));
@@ -184,7 +233,7 @@ contract IBCAdminRecoveryTest is ControlsFixture {
 
     function test_executesAfterTheDelay_asARouteReplacement() public {
         _setLimits(address(usdc), 1000, 1000, 1000);
-        _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory inFlight = _send(alice, address(usdc), 100, clientId);
         uint64 stale = admin.lastSeq() + 1;
         _recvGov(_env(stale, S.KIND_SETTINGS, P.settings(clientId, 1 days)));
         _openFrozen();
@@ -205,9 +254,21 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertEq(_openedAt(), 0);
         vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotPending.selector, stale));
         admin.execute(stale);
-        // the route and governance work over the new client
+        // the replaced route stays closed: the packet in flight on the frozen id is reconciled by decision (kind 12:
+        // not delivered, refunded), then the route reopens (kind 13)
+        assertTrue(ctl.routeClosed("gnoland-7"));
+        assertTrue(_isErrorAck(_transferIn("gnoland-7", "ugnot", 5, bob)));
+        uint256 before = usdc.balanceOf(alice);
+        assertEq(
+            _status(_recvGov(_env(1, S.KIND_SETTLE, P.settle1(clientId, inFlight.sequence, 1, 100)))), S.STATUS_RECORDED
+        );
+        assertEq(_status(_recvGov(_env(2, S.KIND_REOPEN, P.reopen("gnoland-7")))), S.STATUS_RECORDED);
+        _skip(7 days);
+        admin.execute(1);
+        admin.execute(2);
+        assertEq(usdc.balanceOf(alice), before + 100);
         assertTrue(_isSuccessAck(_transferIn("gnoland-7", "ugnot", 5, bob)));
-        assertEq(_status(_recvGov(_env(1, S.KIND_SETTINGS, P.settings("gnoland-7", 1 days)))), S.STATUS_RECORDED);
+        assertEq(_status(_recvGov(_env(3, S.KIND_SETTINGS, P.settings("gnoland-7", 1 days)))), S.STATUS_RECORDED);
     }
 
     function test_executeRefusesAClientWithAnotherCode() public {

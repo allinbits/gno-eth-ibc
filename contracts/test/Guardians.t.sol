@@ -25,15 +25,15 @@ contract GuardiansHarness {
     }
 
     function setFlag(address key) external returns (uint256) {
-        return Guardians.setFlag(g.keys, g.f, key, uint64(block.number), uint64(block.timestamp), GRACE);
+        return Guardians.setFlag(g.k, g.f, key, uint64(block.number), uint64(block.timestamp), GRACE);
     }
 
     function clearFlag(address key) external returns (uint256) {
-        return Guardians.clearFlag(g.keys, g.f, key, uint64(block.number), uint64(block.timestamp), GRACE);
+        return Guardians.clearFlag(g.k, g.f, key, uint64(block.number), uint64(block.timestamp), GRACE);
     }
 
     function unpause(uint64 before) external returns (uint256) {
-        return Guardians.unpause(g.keys, g.f, before, uint64(block.number), uint64(block.timestamp), GRACE);
+        return Guardians.unpause(g.k, g.f, before, uint64(block.number), uint64(block.timestamp), GRACE);
     }
 
     function replace(IGuardians.SeatKey[] memory pairs) external {
@@ -41,31 +41,31 @@ contract GuardiansHarness {
     }
 
     function setOtherFlag(address key) external {
-        Guardians.setFlag(g.keys, other, key, uint64(block.number), uint64(block.timestamp), GRACE);
+        Guardians.setFlag(g.k, other, key, uint64(block.number), uint64(block.timestamp), GRACE);
     }
 
     function otherAnyFlag() external view returns (bool) {
-        return Guardians.anyFlag(g.keys, other);
+        return Guardians.anyFlag(g.k, other);
     }
 
     function otherHold() external view returns (bool stands) {
-        (stands,,) = Guardians.hold(g.keys, other, uint64(block.timestamp), GRACE);
+        (stands,,) = Guardians.hold(g.k, other, uint64(block.timestamp), GRACE);
     }
 
     function keys() external view returns (address[6] memory) {
-        return g.keys;
+        return g.k.keys;
     }
 
     function flags() external view returns (IGuardians.Flag[6] memory) {
-        return Guardians.flags(g.keys, g.f);
+        return Guardians.flags(g.k, g.f);
     }
 
     function anyFlag() external view returns (bool) {
-        return Guardians.anyFlag(g.keys, g.f);
+        return Guardians.anyFlag(g.k, g.f);
     }
 
     function hold() external view returns (bool stands, uint64 b, uint64 t) {
-        return Guardians.hold(g.keys, g.f, uint64(block.timestamp), GRACE);
+        return Guardians.hold(g.k, g.f, uint64(block.timestamp), GRACE);
     }
 }
 
