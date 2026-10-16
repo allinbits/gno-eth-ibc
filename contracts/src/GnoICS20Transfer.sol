@@ -265,6 +265,8 @@ contract GnoICS20Transfer is
     {
         // GNO: no send on a retired client id: its sends could never be acknowledged or timed out
         require(!_gno().retired[msg_.sourceClient], GnoClientRetired(msg_.sourceClient));
+        // GNO: amounts the accounting holds in 96 bits, as receives: reservations, refunds and losses never overflow
+        require(msg_.amount <= type(uint96).max, ICS20InvalidAmount(msg_.amount));
         require(
             !_gno().routes[GnoTransferStorage.routeHash(msg_.sourceClient)].closed, GnoRouteClosed(msg_.sourceClient)
         );

@@ -1460,6 +1460,47 @@ contract ReviewRegressionsTest is ControlsFixture {
         );
     }
 
+    // ====================================================================================== round 6 ==
+
+    /// @notice Round 6 #6: sends are capped at 2^96 - 1 (as receives), so the reservation, refund and loss
+    /// arithmetic never overflows; at the cap, a reserved refund is paid in installments and kind 12 pays its
+    /// remainder.
+    function test_r6_6_amountBoundary_reservationArithmetic() public {
+        uint256 cap = type(uint96).max;
+        ERC20Mock big = new ERC20Mock();
+        big.mint(alice, type(uint256).max);
+        vm.prank(alice);
+        big.approve(address(ics20), type(uint256).max);
+        _setLimits(address(big), 1000, 1000, 1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("ICS20InvalidAmount(uint256)", cap + 1));
+        ics20.sendTransfer(
+            IICS20TransferMsgs.SendTransferMsg(
+                address(big), cap + 1, GNO_SENDER, clientId, "transfer", uint64(_now() + 600), ""
+            )
+        );
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("ICS20InvalidAmount(uint256)", type(uint256).max));
+        ics20.sendTransfer(
+            IICS20TransferMsgs.SendTransferMsg(
+                address(big), type(uint256).max, GNO_SENDER, clientId, "transfer", uint64(_now() + 600), ""
+            )
+        );
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(big), cap, clientId);
+        assertEq(ctl.reserved(clientId, address(big)), cap);
+        _timeout(pkt); // beyond the refund meter: queued, its whole amount reserved
+        assertEq(ctl.reserved(clientId, address(big)), cap);
+        _skip(1 days);
+        ctl.claim(clientId, address(big), 1); // an installment of 1
+        assertEq(ctl.sendRecord(clientId, pkt.sequence).refunded, 1);
+        assertEq(ctl.reserved(clientId, address(big)), cap - 1);
+        _retire();
+        _proveRefundable(pkt);
+        _settle(_item(pkt.sequence, 1, cap - 1));
+        assertEq(ctl.reserved(clientId, address(big)), 0);
+        assertEq(big.balanceOf(alice), type(uint256).max);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {

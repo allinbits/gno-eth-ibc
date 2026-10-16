@@ -216,8 +216,11 @@ library GnoTransferStorage {
         address escrow = rec.escrow;
         bool burned = rec.burned;
         bool ok;
-        if (!burned && IERC20(token).balanceOf(escrow) < amount + layout().tokens[route][token].reserved - own) {
-            return false;
+        if (!burned) {
+            // the escrow keeps the route's other reservations: subtractions only, each guarded
+            uint256 others = layout().tokens[route][token].reserved - own;
+            uint256 balance = IERC20(token).balanceOf(escrow);
+            if (balance < amount || balance - amount < others) return false;
         }
         if (burned) {
             (ok,) = token.call(abi.encodeCall(IMintableAndBurnable.mint, (escrow, amount)));
