@@ -239,10 +239,9 @@ library GnoTransferStorage {
         return _deliver(rec.sender, call, clientId, sequence);
     }
 
-    /// @notice What a record may still be refunded: its entitlement (kind 12) or its amount, less what was refunded.
+    /// @notice What a record may still be refunded: its amount less what was refunded.
     function refundable(IGnoICS20ControlsTypes.SendRecord storage rec) internal view returns (uint256) {
-        uint256 cap = rec.settlement == 1 ? rec.entitlement : rec.amount;
-        return cap > rec.refunded ? cap - rec.refunded : 0;
+        return rec.amount - rec.refunded;
     }
 
     // ------------------------------------------------------------------------- eureka's ICS20Transfer state --

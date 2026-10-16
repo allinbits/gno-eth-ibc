@@ -103,36 +103,55 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             uint8 action = it.action;
             bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
             if (action == 1) {
+                // the refund's whole remainder: a refund is never cut short (ADR §7.9)
                 uint256 left = rec.amount - rec.refunded;
-                require(it.amount != 0 && it.amount <= left, GnoBadSettlement(i));
+                require(it.amount != 0 && it.amount == left, GnoBadSettlement(i));
                 rec.settlement = 1;
-                rec.entitlement = rec.refunded + it.amount;
-                if (GnoTransferStorage.tryPayRefund(rec, it.amount)) {
+                if (GnoTransferStorage.tryPayRefund(rec, left)) {
                     rec.payment = Payment.Claimed;
-                    emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, it.amount);
+                    emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
                     GnoTransferStorage.releaseNotice(rec, clientId, it.sequence);
                 } else {
                     rec.payment = Payment.Parked;
-                    emit GnoRefundParked(clientId, it.sequence, rec.token, it.amount);
+                    emit GnoRefundParked(clientId, it.sequence, rec.token, left);
                 }
             } else if (action == 2 || action == 3) {
                 require(action == 3 || owed, GnoBadSettlement(i));
                 rec.settlement = action;
-                if (owed) {
-                    rec.payment = Payment.Rejected;
-                    delete g.notices[clientHash][it.sequence];
-                    emit GnoRefundRejected(clientId, it.sequence);
-                }
+                if (owed) _reject(g, rec, clientHash, clientId, it.sequence);
             } else if (action == 4) {
-                require(it.amount != 0, GnoBadSettlement(i));
+                // a forged refund (of a packet that was delivered): its unpaid remainder is rejected and what was
+                // already paid is the loss, at once
+                require(
+                    (rec.outcome == Outcome.ErrorAck || rec.outcome == Outcome.Timeout) && it.amount == rec.refunded,
+                    GnoBadSettlement(i)
+                );
                 rec.settlement = 4;
-                g.losses[route][rec.token] += it.amount;
-                emit GnoLossRecorded(GnoTransferStorage.routeKey(clientId), rec.token, it.sequence, it.amount);
+                if (owed) _reject(g, rec, clientHash, clientId, it.sequence);
+                if (it.amount != 0) {
+                    g.losses[route][rec.token] += it.amount;
+                    emit GnoLossRecorded(GnoTransferStorage.routeKey(clientId), rec.token, it.sequence, it.amount);
+                }
             } else {
                 revert GnoBadSettlement(i);
             }
             emit GnoSettled(clientId, it.sequence, action, it.amount);
         }
+    }
+
+    /// @notice A queued or parked refund rejected by reconciliation: never paid, its notification dropped.
+    function _reject(
+        GnoTransferStorage.Layout storage g,
+        SendRecord storage rec,
+        bytes32 clientHash,
+        string calldata clientId,
+        uint64 sequence
+    )
+        private
+    {
+        rec.payment = Payment.Rejected;
+        delete g.notices[clientHash][sequence];
+        emit GnoRefundRejected(clientId, sequence);
     }
 
     /// @notice See IGnoICS20Controls.

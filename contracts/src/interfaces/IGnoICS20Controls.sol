@@ -70,10 +70,9 @@ interface IGnoICS20ControlsTypes {
         /// Backfilled for a packet sent before the fork was installed (authenticated against the router's
         /// commitment; `sendBlock` is the backfill's block).
         bool legacy;
-        /// The reconciliation outcome kind 12 applied (0: none; 1 refund, 2 rejected, 3 delivered, 4 loss), and
-        /// for a refund the total the record may be refunded (0: its amount).
+        /// The reconciliation outcome kind 12 applied (0: none; 1 refund, 2 rejected, 3 delivered, 4 forged
+        /// refund).
         uint8 settlement;
-        uint256 entitlement;
     }
 
     /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.
@@ -156,9 +155,10 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice Kind 13: reopens a closed route.
     function reopenRoute(string calldata clientId) external;
     /// @notice Kind 12: applies reconciliation outcomes to send records of a retired client id, each at most once:
-    /// 1 pay a refund of `amount` (at most the entitlement minus what was refunded; parked if the token refuses),
-    /// 2 reject a queued or parked refund, 3 settled as delivered (a queued or parked refund is rejected), 4 record
-    /// a loss of `amount`. All or nothing.
+    /// 1 pay the refund's remainder (`amount` must equal the amount less what was refunded; parked if the token
+    /// refuses), 2 reject a queued or parked refund, 3 settled as delivered (a queued or parked refund is rejected),
+    /// 4 forged refund: reject the unpaid remainder and record what was already paid as a loss (`amount` must equal
+    /// what was paid). All or nothing.
     function settleRecords(string calldata clientId, SettleItem[] calldata items) external;
     /// @notice Delivers a sender notification kept after it failed, once its outcome is final for the sender (a
     /// success ack, or a refund paid in full). Permissionless; it only calls the sender, never pays. Returns whether

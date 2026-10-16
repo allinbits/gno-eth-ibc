@@ -71,12 +71,14 @@ contract ReviewRegressionsTest is ControlsFixture {
     // ===================================================================== #1 settle and reopen (kinds 12, 13) ==
 
     function test_r1_settle_eachActionOnce_allOrNothing() public {
-        _setLimits(address(usdc), 1000, 1000, 10); // a small refund meter
+        _setLimits(address(usdc), 1000, 1000, 1000);
         IICS26RouterMsgs.Packet memory forged = _send(alice, address(usdc), 100, clientId);
         IICS26RouterMsgs.Packet memory delivered = _send(alice, address(usdc), 200, clientId);
         IICS26RouterMsgs.Packet memory honest = _send(alice, address(usdc), 300, clientId);
-        IICS26RouterMsgs.Packet memory lost = _send(alice, address(usdc), 400, clientId);
-        _errorAck(forged); // queued: a forged error ack of a delivered packet
+        IICS26RouterMsgs.Packet memory inFlight = _send(alice, address(usdc), 400, clientId);
+        _setLimits(address(usdc), 1000, 1000, 10); // a small refund meter
+        _errorAck(forged); // a forged error ack of a delivered packet: queued
+        ctl.claim(clientId, address(usdc), 1); // an installment of it is paid: 10
         _ack(delivered, bytes("{\"result\":\"AQ==\"}"));
         _ack(honest, bytes("{\"result\":\"AQ==\"}")); // a forged success ack of an undelivered packet
         _retire();
@@ -85,43 +87,48 @@ contract ReviewRegressionsTest is ControlsFixture {
         // not for an id still in use
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, type(uint256).max));
-        ctl.settleRecords("gnoland-9", _item(honest.sequence, 1, 1));
-        // all or nothing: an over-entitlement item reverts the whole batch
+        ctl.settleRecords("gnoland-9", _item(honest.sequence, 1, 300));
+        // all or nothing: a refund cut short reverts the whole batch
         T.SettleItem[] memory bad = new T.SettleItem[](2);
         bad[0] = T.SettleItem(honest.sequence, 1, 300);
-        bad[1] = T.SettleItem(delivered.sequence, 1, 201);
+        bad[1] = T.SettleItem(inFlight.sequence, 1, 399);
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 1));
         ctl.settleRecords(clientId, bad);
+        // a forged refund's loss must be exactly what was paid
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(forged.sequence, 4, 0));
         assertEq(usdc.balanceOf(alice), before);
 
         T.SettleItem[] memory items = new T.SettleItem[](4);
-        items[0] = T.SettleItem(forged.sequence, 2, 0); // reject the queued refund
+        items[0] = T.SettleItem(forged.sequence, 4, 10); // forged refund: remainder rejected, 10 lost
         items[1] = T.SettleItem(delivered.sequence, 3, 0);
-        items[2] = T.SettleItem(honest.sequence, 1, 300); // refund the undelivered packet
-        items[3] = T.SettleItem(lost.sequence, 4, 400); // a loss
+        items[2] = T.SettleItem(honest.sequence, 1, 300); // refund the undelivered packet in full
+        items[3] = T.SettleItem(inFlight.sequence, 1, 400);
         _settle(items);
-        assertEq(usdc.balanceOf(alice), before + 300);
+        assertEq(usdc.balanceOf(alice), before + 700);
         assertEq(uint8(ctl.sendRecord(clientId, forged.sequence).payment), uint8(T.Payment.Rejected));
         assertEq(ctl.sendRecord(clientId, delivered.sequence).settlement, 3);
-        assertEq(ctl.losses(clientId, address(usdc)), 400);
+        assertEq(ctl.losses(clientId, address(usdc)), 10);
 
         // each record at most once
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
         ctl.settleRecords(clientId, _item(honest.sequence, 1, 0));
-        // the rejected refund is dropped from the queue, never paid
+        // the forged refund's remainder is never paid: it leaves the queue without a payment
         vm.prank(address(admin));
         ctl.reopenRoute(clientId);
         _skip(30 days);
         assertEq(ctl.claim(clientId, address(usdc), 10), 1);
-        assertEq(usdc.balanceOf(alice), before + 300);
+        assertEq(usdc.balanceOf(alice), before + 700);
+        assertEq(ctl.sendRecord(clientId, forged.sequence).refunded, 10);
         vm.prank(address(admin));
         vm.expectRevert(abi.encodeWithSelector(T.GnoNotClosed.selector, clientId));
         ctl.reopenRoute(clientId);
     }
 
-    function test_r1_settledRefundRefused_parkedUpToItsEntitlement() public {
+    function test_r1_settledRefund_neverCutShort_parkedInFull() public {
         RefusingToken r = new RefusingToken();
         r.mint(alice, 1000);
         vm.prank(alice);
@@ -129,14 +136,17 @@ contract ReviewRegressionsTest is ControlsFixture {
         _setLimits(address(r), 1000, 1000, 1000);
         IICS26RouterMsgs.Packet memory pkt = _send(alice, address(r), 500, clientId);
         _retire();
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 1, 200)); // a haircut is refused
         r.setBlocked(alice, true);
-        _settle(_item(pkt.sequence, 1, 200)); // entitled to 200 of 500
+        _settle(_item(pkt.sequence, 1, 500));
         assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Parked));
         r.setBlocked(alice, false);
         vm.prank(address(admin));
         ctl.reopenRoute(clientId);
-        assertEq(ctl.claimParked(clientId, pkt.sequence), 200);
-        assertEq(r.balanceOf(alice), 700);
+        assertEq(ctl.claimParked(clientId, pkt.sequence), 500);
+        assertEq(r.balanceOf(alice), 1000);
     }
 
     function test_r1_settleAndReopen_byDecision() public {
