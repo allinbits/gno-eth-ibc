@@ -1,0 +1,513 @@
+// SPDX-License-Identifier: LicenseRef-GNO-Network-GPL
+pragma solidity ^0.8.28;
+
+// Ported in part from gnolang/bridges (branch ethereum-draft), ethereum/bridge/contracts/src/admin/HlAdminExec.sol:
+// the kinds' execution behind a delegatecall, code-hash pins with "no code yet pends", the fixed gas budget of an
+// upgrade's call, and `checkSetup`'s numbered check list. Copyright (C) 2026 NewTendermint, LLC. GNO Network General
+// Public License: see contracts/licenses/.
+
+import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessManager.sol";
+import { IAccessManaged } from "@openzeppelin-contracts/access/manager/IAccessManaged.sol";
+import { UUPSUpgradeable } from "@openzeppelin-contracts/proxy/utils/UUPSUpgradeable.sol";
+import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
+
+import { IICS02Client, IICS02ClientAccessControlled } from "@eureka/interfaces/IICS02Client.sol";
+import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
+import { IICS20Transfer, IICS20TransferAccessControlled } from "@eureka/interfaces/IICS20Transfer.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
+import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
+import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
+
+import { IIBCAdmin } from "../interfaces/IIBCAdmin.sol";
+import { IGuardians } from "../interfaces/IGuardians.sol";
+import { IGnoICS20Controls, IGnoICS20ControlsTypes } from "../interfaces/IGnoICS20Controls.sol";
+import { IGnoLightClientStatus } from "../interfaces/IGnoLightClientStatus.sol";
+import { Guardians } from "../lib/Guardians.sol";
+import { LeakyBucket } from "../lib/LeakyBucket.sol";
+import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
+import { FrozenLightClient } from "./FrozenLightClient.sol";
+import { IBCAdminSetupCheck } from "./IBCAdminSetupCheck.sol";
+
+/// @notice What IBCAdminExec asks of a GnoVoucher and of the transfer fork beyond their interfaces.
+interface IVoucherLike {
+    function ics20() external view returns (address);
+}
+
+/// @title IBCAdmin's executor
+/// @notice The kinds' logic (at recording and at execution), the emergency recovery and `finishSetup`'s check list.
+/// IBCAdmin delegatecalls it at a pinned code hash, so it runs as IBCAdmin, with IBCAdmin's storage (IBCAdminStorage)
+/// and authority; called at its own address every function refuses (`NotDelegated`). Kind 9 replaces it by another
+/// executor bound to the same router, AccessManager and transfer app.
+contract IBCAdminExec is IIBCAdmin {
+    /// @notice The gas a kind 7's call is forwarded, whatever gas its executor sends; below CALL_FLOOR left, the
+    /// execution reverts (`CallStarved`) and the decision pends.
+    uint256 internal constant CALL_GAS = 2_000_000;
+    uint256 internal constant CALL_FLOOR = CALL_GAS * 64 / 63 + 10_000;
+    uint64 internal constant MAX_QUARANTINE = 365 days;
+
+    address public immutable router;
+    address public immutable accessManager;
+    address public immutable ics20;
+    /// @notice The light client retired client ids are migrated to.
+    address public immutable frozenClient;
+    /// @notice `finishSetup`'s check list.
+    address public immutable setupCheck;
+    address private immutable _self;
+
+    constructor(address router_, address accessManager_, address ics20_) {
+        if (router_ == address(0) || accessManager_ == address(0) || ics20_ == address(0)) revert ZeroAddress();
+        router = router_;
+        accessManager = accessManager_;
+        ics20 = ics20_;
+        frozenClient = address(new FrozenLightClient());
+        setupCheck = address(new IBCAdminSetupCheck());
+        _self = address(this);
+    }
+
+    /// @notice What this executor is bound to; IBCAdmin and kind 9 require it to be IBCAdmin's own.
+    function bindings() external view returns (address, address, address) {
+        return (router, accessManager, ics20);
+    }
+
+    modifier delegated() {
+        if (address(this) == _self) revert NotDelegated();
+        _;
+    }
+
+    // ============================================================================================ recording ==
+
+    /// @notice A decision at recording: WAIT (it waits for its delay), DONE_NOW (an immediate kind, executed now) or
+    /// SPEND (bad parameters). Every kind's parameters are decoded here; malformed ones revert, which IBCAdmin spends.
+    function atRecording(uint8 kind, bytes calldata p) external delegated returns (uint8, string memory) {
+        if (kind == S.KIND_UNPAUSE) {
+            (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));
+            bool ok = (object == 1 && bytes(clientId).length != 0) || (object == 2 && bytes(clientId).length == 0);
+            return ok ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        if (kind == S.KIND_SEATS) {
+            IGuardians.SeatKey[] memory pairs = abi.decode(p, (IGuardians.SeatKey[]));
+            return Guardians.checkReplace(S.layout().g.keys, pairs) == bytes4(0) ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        if (kind == S.KIND_LIMITS) {
+            (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
+            if (!_validLimits(token, l)) return (S.SPEND, "params");
+            if (_loosens(IGnoICS20Controls(ics20).limits(clientId, token), l)) return (S.WAIT, "");
+            IGnoICS20Controls(ics20).setLimits(clientId, token, l);
+            return (S.DONE_NOW, "");
+        }
+        if (kind == S.KIND_VOUCHER) {
+            (string memory clientId, string memory baseDenom, address voucher,) =
+                abi.decode(p, (string, string, address, bytes32));
+            bool ok = bytes(clientId).length != 0 && bytes(baseDenom).length != 0 && voucher != address(0);
+            return ok ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        if (kind == S.KIND_CLIENT) {
+            (uint8 op, string memory clientId,,, address lc,) =
+                abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
+            bool ok = (op == 1 || op == 2) && bytes(clientId).length != 0 && lc != address(0);
+            return ok ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        if (kind == S.KIND_UPGRADE) {
+            (address proxy, address impl,,) = abi.decode(p, (address, address, bytes32, bytes));
+            return proxy != address(0) && impl != address(0) ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        if (kind == S.KIND_ROLE) {
+            (bool grant, uint64 roleId, address account) = abi.decode(p, (bool, uint64, address));
+            if (roleId != IBCRolesLib.RELAYER_ROLE || account == address(0)) return (S.SPEND, "role");
+            if (grant) return (S.WAIT, "");
+            IAccessManager(accessManager).revokeRole(roleId, account);
+            return (S.DONE_NOW, "");
+        }
+        if (kind == S.KIND_HANDOVER) {
+            (address x,,) = abi.decode(p, (address, bytes32, bytes));
+            return x != address(0) ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        if (kind == S.KIND_ROUTE) {
+            (string memory oldId, string memory newId) = abi.decode(p, (string, string));
+            bool ok = bytes(oldId).length != 0 && bytes(newId).length != 0
+                && keccak256(bytes(oldId)) != keccak256(bytes(newId));
+            return ok ? (S.WAIT, "") : (S.SPEND, "params");
+        }
+        // KIND_SETTINGS (IBCAdmin records no other kind here)
+        (string memory id, uint64 q) = abi.decode(p, (string, uint64));
+        if (q > MAX_QUARANTINE || bytes(id).length == 0) return (S.SPEND, "params");
+        if (q < IGnoICS20Controls(ics20).quarantineSeconds(id)) return (S.WAIT, "");
+        IGnoICS20Controls(ics20).setQuarantine(id, q);
+        return (S.DONE_NOW, "");
+    }
+
+    function _decodeLimits(bytes calldata p)
+        private
+        pure
+        returns (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l)
+    {
+        (clientId, token, l.maxPerMessage, l.dayCap, l.refundCap, l.sendMax, l.sendMin) =
+            abi.decode(p, (string, address, uint256, uint256, uint256, uint256, uint256));
+    }
+
+    function _validLimits(address token, IGnoICS20ControlsTypes.Limits memory l) private pure returns (bool) {
+        return token != address(0) && l.dayCap <= LeakyBucket.MAX_CAP && l.refundCap <= LeakyBucket.MAX_CAP
+            && (l.sendMax == 0 || l.sendMin <= l.sendMax);
+    }
+
+    /// @notice Whether new limits loosen any field: a first setting always does (unset limits refuse everything);
+    /// raising the receive maximum, the day cap, the refund cap or the send maximum (0 = none, the loosest), or
+    /// lowering the send minimum.
+    function _loosens(
+        IGnoICS20ControlsTypes.LimitsView memory cur,
+        IGnoICS20ControlsTypes.Limits memory n
+    )
+        private
+        pure
+        returns (bool)
+    {
+        if (!cur.set) return true;
+        IGnoICS20ControlsTypes.Limits memory c = cur.limits;
+        bool sendMaxLoosens = c.sendMax != 0 && (n.sendMax == 0 || n.sendMax > c.sendMax);
+        return n.maxPerMessage > c.maxPerMessage || n.dayCap > c.dayCap || n.refundCap > c.refundCap || sendMaxLoosens
+            || n.sendMin < c.sendMin;
+    }
+
+    // ============================================================================================ execution ==
+
+    /// @notice Carries out a matured decision IBCAdmin's `execute` closed; the reason it is spent, or "" when it
+    /// executed. A call that reverts reverts `execute` whole, and the decision stays pending for a retry.
+    function run(uint8 kind, bytes calldata p, uint64 recordedBlock) external delegated returns (string memory) {
+        if (kind == S.KIND_UNPAUSE) return _unpause(p, recordedBlock);
+        if (kind == S.KIND_SEATS) return _seats(p);
+        if (kind == S.KIND_LIMITS) {
+            (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
+            if (!_validLimits(token, l)) return "params";
+            IGnoICS20Controls(ics20).setLimits(clientId, token, l);
+            return "";
+        }
+        if (kind == S.KIND_VOUCHER) return _voucher(p);
+        if (kind == S.KIND_CLIENT) return _client(p);
+        if (kind == S.KIND_UPGRADE) return _upgrade(p);
+        if (kind == S.KIND_ROLE) {
+            (bool grant, uint64 roleId, address account) = abi.decode(p, (bool, uint64, address));
+            if (!grant || roleId != IBCRolesLib.RELAYER_ROLE || account == address(0)) return "role";
+            IAccessManager(accessManager).grantRole(roleId, account, 0);
+            return "";
+        }
+        if (kind == S.KIND_HANDOVER) return _handover(p);
+        if (kind == S.KIND_ROUTE) return _route(p);
+        // KIND_SETTINGS: a shortening (a lengthening executed at recording)
+        (string memory id, uint64 q) = abi.decode(p, (string, uint64));
+        if (q > MAX_QUARANTINE) return "params";
+        IGnoICS20Controls(ics20).setQuarantine(id, q);
+        return "";
+    }
+
+    /// @notice Kind 2: object 1 the transfer route of `clientId`, 2 IBCAdmin; spent under a hold on that object;
+    /// clears the flags (and on a route its refunds flags) set at a block before the decision's recording, and on
+    /// IBCAdmin a conflict's flag raised before it.
+    function _unpause(bytes calldata p, uint64 recordedBlock) private returns (string memory) {
+        (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));
+        if (object == 1) {
+            if (IGnoICS20Controls(ics20).routeHold(clientId).blockNumber != 0) return "hold";
+            IGnoICS20Controls(ics20).unpauseRoute(clientId, recordedBlock);
+            return "";
+        }
+        S.Layout storage l = S.layout();
+        (bool stands,,) = S.hold(l);
+        if (stands) return "hold";
+        (uint64 hb, uint64 ht, uint64 db, uint64 dt) = S.moments(l);
+        uint256 n =
+            Guardians.unpause(l.g.keys, l.g.f, recordedBlock, uint64(block.number), uint64(block.timestamp), S.DAY);
+        S.noteHoldEnd(l, hb, ht, db, dt);
+        if (l.conflictBlock != 0 && l.conflictBlock < recordedBlock) l.conflictBlock = 0;
+        emit Unpaused(recordedBlock, n);
+        return "";
+    }
+
+    /// @notice Kind 3: spent when it names a key that holds any seat now or the replacement's rules refuse it; the
+    /// transfer app's copy of the keys follows.
+    function _seats(bytes calldata p) private returns (string memory) {
+        IGuardians.SeatKey[] memory pairs = abi.decode(p, (IGuardians.SeatKey[]));
+        S.Layout storage l = S.layout();
+        for (uint256 i = 0; i < pairs.length; i++) {
+            if (Guardians.position(l.g.keys, pairs[i].key) != Guardians.KEYS) return "current key";
+        }
+        if (Guardians.checkReplace(l.g.keys, pairs) != bytes4(0)) return "params";
+        (uint64 hb, uint64 ht, uint64 db, uint64 dt) = S.moments(l);
+        Guardians.replace(l.g, pairs, uint64(block.number), uint64(block.timestamp), S.DAY);
+        S.noteHoldEnd(l, hb, ht, db, dt);
+        IGnoICS20Controls(ics20).setGuardianKeys(l.g.keys);
+        for (uint256 i = 0; i < pairs.length; i++) {
+            emit GuardiansSet(pairs[i].seat, pairs[i].key);
+        }
+        return "";
+    }
+
+    /// @notice Kind 5: registers `transfer/<clientId>/<baseDenom>`'s voucher, whose code is the decision's and which
+    /// answers to the transfer app; spent if the denom or the token is already registered.
+    function _voucher(bytes calldata p) private returns (string memory) {
+        (string memory clientId, string memory baseDenom, address voucher, bytes32 codeHash) =
+            abi.decode(p, (string, string, address, bytes32));
+        if (!_codeIs(voucher, codeHash)) return "codehash";
+        (bool ok, bytes memory ret) = voucher.staticcall(abi.encodeCall(IVoucherLike.ics20, ()));
+        if (!ok || ret.length != 32 || abi.decode(ret, (address)) != ics20) return "voucher";
+        string memory denom = string.concat(ICS20Lib.DEFAULT_PORT_ID, "/", clientId, "/", baseDenom);
+        if (!_call(ics20, abi.encodeCall(IICS20TransferAccessControlled.setCustomERC20, (denom, voucher)))) {
+            return "exists";
+        }
+        return "";
+    }
+
+    /// @notice Kind 6: op 1 adds `clientId` (a custom id), op 2 migrates it to `lightClient`, whose code is the
+    /// decision's; spent if the router refuses it.
+    function _client(bytes calldata p) private returns (string memory) {
+        (
+            uint8 op,
+            string memory clientId,
+            string memory counterpartyClientId,
+            bytes[] memory merklePrefix,
+            address lc,
+            bytes32 codeHash
+        ) = abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
+        if (!_codeIs(lc, codeHash)) return "codehash";
+        IICS02ClientMsgs.CounterpartyInfo memory info =
+            IICS02ClientMsgs.CounterpartyInfo(counterpartyClientId, merklePrefix);
+        bytes memory call = op == 1
+            ? abi.encodeCall(IICS02ClientAccessControlled.addClient, (clientId, info, lc))
+            : abi.encodeCall(IICS02ClientAccessControlled.migrateClient, (clientId, info, lc));
+        if (!_call(router, call)) return "client";
+        if (address(IICS02Client(router).getClient(clientId)) != lc) revert AuthorityLost(router);
+        return "";
+    }
+
+    /// @notice Kind 7: the router or the transfer app (UUPS `upgradeToAndCall`, the call given CALL_GAS exactly),
+    /// or one of the transfer app's beacons (escrow, IBCERC20; no call); the implementation's code the decision's.
+    /// After-checks: the proxy still answers to the AccessManager and keeps its bindings, a beacon points at the
+    /// implementation and is still the transfer app's; otherwise the execution reverts (`AuthorityLost`) and the
+    /// decision pends for a cancel.
+    function _upgrade(bytes calldata p) private returns (string memory) {
+        (address proxy, address impl, bytes32 codeHash, bytes memory call) =
+            abi.decode(p, (address, address, bytes32, bytes));
+        if (!_codeIs(impl, codeHash)) return "codehash";
+        if (proxy == router || proxy == ics20) {
+            if (gasleft() < CALL_FLOOR) revert CallStarved();
+            UUPSUpgradeable(proxy).upgradeToAndCall{ gas: CALL_GAS }(impl, call);
+            if (IAccessManaged(proxy).authority() != accessManager) revert AuthorityLost(proxy);
+            if (proxy == ics20) {
+                if (IICS20Transfer(ics20).ics26() != router) revert AuthorityLost(proxy);
+            } else if (
+                address(IICS26Router(router).getIBCApp(PORT)) != address(this)
+                    || address(IICS26Router(router).getIBCApp(ICS20Lib.DEFAULT_PORT_ID)) != ics20
+            ) {
+                revert AuthorityLost(proxy);
+            }
+            return "";
+        }
+        bool escrow = proxy == IICS20Transfer(ics20).getEscrowBeacon();
+        if (!escrow && proxy != IICS20Transfer(ics20).getIBCERC20Beacon()) return "params";
+        if (call.length != 0) return "params";
+        if (escrow) IICS20TransferAccessControlled(ics20).upgradeEscrowTo(impl);
+        else IICS20TransferAccessControlled(ics20).upgradeIBCERC20To(impl);
+        if (UpgradeableBeacon(proxy).implementation() != impl || UpgradeableBeacon(proxy).owner() != ics20) {
+            revert AuthorityLost(proxy);
+        }
+        return "";
+    }
+
+    /// @notice IBCAdmin's port on the router (IBCAdmin.PORT).
+    string internal constant PORT = "ibcgov";
+
+    /// @notice Kind 9: the executor's code is the decision's and it is bound as this one; the code hash pin moves to
+    /// it atomically, then the optional one-time migration call runs in it (a revert reverts the execution, which
+    /// pends). No state or authority moves: both stay in IBCAdmin.
+    function _handover(bytes calldata p) private returns (string memory) {
+        (address x, bytes32 codeHash, bytes memory migration) = abi.decode(p, (address, bytes32, bytes));
+        if (!_codeIs(x, codeHash)) return "codehash";
+        (bool ok, bytes memory ret) = x.staticcall(abi.encodeCall(IBCAdminExec.bindings, ()));
+        if (!ok || ret.length != 96) return "bindings";
+        (address r, address am, address t) = abi.decode(ret, (address, address, address));
+        if (r != router || am != accessManager || t != ics20) return "bindings";
+        S.Layout storage l = S.layout();
+        l.exec = x;
+        l.execHash = codeHash;
+        emit ExecReplaced(x, codeHash);
+        if (migration.length != 0) {
+            (ok, ret) = x.delegatecall(migration);
+            if (!ok) {
+                // solhint-disable-next-line no-inline-assembly
+                assembly ("memory-safe") {
+                    revert(add(ret, 32), mload(ret))
+                }
+            }
+        }
+        return "";
+    }
+
+    /// @notice Kind 10: `oldClientId` must be this epoch's client and `newClientId` a client the router knows (added
+    /// by kind 6 first); retires and freezes the old id, migrates the route, and opens the next epoch over the new id.
+    function _route(bytes calldata p) private returns (string memory) {
+        (string memory oldId, string memory newId) = abi.decode(p, (string, string));
+        S.Layout storage l = S.layout();
+        if (keccak256(bytes(oldId)) != keccak256(bytes(l.govClient))) return "client";
+        if (!_call(router, abi.encodeCall(IICS02Client.getClient, (newId)))) return "client";
+        if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId)))) return "route";
+        _replaceRoute(l, oldId, newId);
+        return "";
+    }
+
+    /// @notice Freezes the old client id and opens the next epoch over the new one: every unexecuted decision,
+    /// buffered entry and tombstone of the old epoch is dropped with it (they are keyed by epoch).
+    function _replaceRoute(S.Layout storage l, string memory oldId, string memory newId) private {
+        IICS02ClientMsgs.CounterpartyInfo memory info = IICS02Client(router).getCounterparty(oldId);
+        IICS02ClientAccessControlled(router).migrateClient(oldId, info, frozenClient);
+        uint32 e = l.epoch + 1;
+        l.epoch = e;
+        l.govClient = newId;
+        l.lastSeq = 0;
+        l.conflictBlock = 0;
+        l.lastRecordTime = uint64(block.timestamp);
+        emit EpochOpened(e, newId);
+    }
+
+    // ============================================================================================= recovery ==
+
+    function _guardianSeat(address guardian) private view returns (uint256 seat) {
+        seat = Guardians.position(S.layout().g.keys, guardian);
+        if (seat >= Guardians.SEATS) revert NotGuardian();
+    }
+
+    /// @notice A guardian approves a proposal (one per seat); it opens once `threshold` seats approve it while the
+    /// route is eligible (§7.12 step 2), and while it is open every token receive on the route is refused and the
+    /// authority-changing kinds are suspended.
+    function approveRecovery(address guardian, bytes calldata proposal, RecoveryConfig calldata c) external delegated {
+        uint256 seat = _guardianSeat(guardian);
+        S.Layout storage l = S.layout();
+        S.Recovery storage r = l.recovery;
+        if (r.openedAt != 0) revert RecoveryState();
+        RecoveryProposal memory rp = abi.decode(proposal, (RecoveryProposal));
+        if (bytes(rp.newClientId).length == 0 || rp.lightClient == address(0)) revert RecoveryState();
+        bytes32 h = keccak256(proposal);
+        r.approved[seat] = h;
+        if (bytes(r.params[h]).length == 0) r.params[h] = proposal;
+        uint256 n;
+        for (uint256 i = 0; i < Guardians.SEATS; i++) {
+            if (r.approved[i] == h) n++;
+        }
+        emit RecoveryApproved(h, guardian, n);
+        if (n < c.threshold || !_eligible(l, c)) return;
+        r.proposal = h;
+        r.openedAt = uint64(block.timestamp);
+        r.cancels = 0;
+        IGnoICS20Controls(ics20).setRecoveryBlock(l.govClient, true);
+        emit RecoveryOpened(h, uint64(block.timestamp) + c.delay);
+    }
+
+    /// @notice Eligible while the epoch's client is frozen or expired, the channel has been silent for `silence`,
+    /// or a hold has stood on IBCAdmin for `holdPeriod`.
+    function _eligible(S.Layout storage l, RecoveryConfig calldata c) private view returns (bool) {
+        address lc = address(IICS02Client(router).getClient(l.govClient));
+        if (_ask(lc, IGnoLightClientStatus.isFrozen.selector) || _ask(lc, IGnoLightClientStatus.isExpired.selector)) {
+            return true;
+        }
+        // forge-lint: disable-next-line(block-timestamp)
+        if (c.silence != 0 && block.timestamp - l.lastRecordTime >= c.silence) return true;
+        (bool stands,, uint64 start) = S.hold(l);
+        // forge-lint: disable-next-line(block-timestamp)
+        return c.holdPeriod != 0 && stands && block.timestamp - start >= c.holdPeriod;
+    }
+
+    function _ask(address lc, bytes4 selector) private view returns (bool) {
+        (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSelector(selector));
+        return ok && ret.length == 32 && abi.decode(ret, (bool));
+    }
+
+    /// @notice Before a proposal opens, a guardian withdraws its approval; once open, it votes to cancel, and
+    /// `cancelThreshold` votes close it (receives resume, the suspended kinds may run again).
+    function cancelRecovery(address guardian, RecoveryConfig calldata c) external delegated {
+        uint256 seat = _guardianSeat(guardian);
+        S.Layout storage l = S.layout();
+        S.Recovery storage r = l.recovery;
+        if (r.openedAt == 0) {
+            r.approved[seat] = bytes32(0);
+            return;
+        }
+        r.cancels |= uint8(1 << seat);
+        uint256 n;
+        for (uint256 i = 0; i < Guardians.SEATS; i++) {
+            if (r.cancels & (1 << i) != 0) n++;
+        }
+        emit RecoveryCancelVote(r.proposal, guardian, n);
+        if (n < c.cancelThreshold) return;
+        emit RecoveryCancelled(r.proposal);
+        _closeRecovery(r);
+        IGnoICS20Controls(ics20).setRecoveryBlock(l.govClient, false);
+    }
+
+    function _closeRecovery(S.Recovery storage r) private {
+        r.proposal = bytes32(0);
+        r.openedAt = 0;
+        r.cancels = 0;
+        delete r.approved;
+    }
+
+    /// @notice Executes the open proposal once its delay has passed (§7.12 step 4): adds the attested client under
+    /// its new id, migrates the route, freezes the old id and opens the next epoch over the new one.
+    function executeRecovery(RecoveryConfig calldata c) external delegated {
+        S.Layout storage l = S.layout();
+        S.Recovery storage r = l.recovery;
+        if (r.openedAt == 0) revert RecoveryState();
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < uint256(r.openedAt) + c.delay) revert NotMature(r.openedAt + c.delay);
+        bytes32 h = r.proposal;
+        RecoveryProposal memory rp = abi.decode(r.params[h], (RecoveryProposal));
+        if (rp.lightClient.code.length == 0) revert NoCodeYet(rp.lightClient);
+        if (!_isCode(rp.lightClient) || rp.lightClient.codehash != rp.codeHash) revert RecoveryState();
+        string memory oldId = l.govClient;
+        IICS02ClientMsgs.CounterpartyInfo memory info =
+            IICS02ClientMsgs.CounterpartyInfo(rp.counterpartyClientId, rp.merklePrefix);
+        IICS02ClientAccessControlled(router).addClient(rp.newClientId, info, rp.lightClient);
+        IGnoICS20Controls(ics20).migrateRoute(oldId, rp.newClientId);
+        // the route (now the new id's) was blocked while the proposal was open
+        IGnoICS20Controls(ics20).setRecoveryBlock(rp.newClientId, false);
+        _replaceRoute(l, oldId, rp.newClientId);
+        _closeRecovery(r);
+        emit RecoveryExecuted(h, rp.newClientId);
+    }
+
+    // ================================================================================================ setup ==
+
+    /// @notice `finishSetup`'s self-check (IBCAdminSetupCheck's numbered check list), run against IBCAdmin.
+    function checkSetup(address deployer) external view delegated {
+        IBCAdminSetupCheck(setupCheck).check(address(this), deployer);
+    }
+
+    // ================================================================================================ helpers ==
+
+    /// @notice A call whose failure is an answer, not an error: false when it reverts with data or for another
+    /// reason that left gas; when it ran out of gas, the execution reverts (`CallStarved`) and the decision pends.
+    function _call(address target, bytes memory data) private returns (bool ok) {
+        uint256 g = gasleft();
+        bytes memory ret;
+        (ok, ret) = target.call(data);
+        if (!ok && ret.length == 0 && gasleft() <= g / 63) revert CallStarved();
+    }
+
+    /// @notice Whether `target`'s code is the one the decision pins: no code at all reverts (`NoCodeYet`: the decision
+    /// pends until it is deployed); an EIP-7702 delegation designator or another code hash is false (spent).
+    function _codeIs(address target, bytes32 codeHash) private view returns (bool) {
+        if (target.code.length == 0) revert NoCodeYet(target);
+        return _isCode(target) && target.codehash == codeHash;
+    }
+
+    /// @notice Whether `a` holds contract code, and not an EIP-7702 delegation designator.
+    function _isCode(address a) private view returns (bool) {
+        uint256 size;
+        bytes32 head;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            size := extcodesize(a)
+            let ptr := mload(0x40)
+            mstore(ptr, 0)
+            extcodecopy(a, ptr, 0, 3)
+            head := mload(ptr)
+        }
+        return size != 0 && bytes3(head) != 0xef0100;
+    }
+}
