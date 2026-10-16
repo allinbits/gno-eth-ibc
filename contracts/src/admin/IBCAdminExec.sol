@@ -346,6 +346,8 @@ contract IBCAdminExec is IIBCAdmin {
             bytes32 codeHash
         ) = abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
         if (!_codeIs(lc, codeHash)) return "codehash";
+        // a retired client id is final: never migrated back to a live client (ADR §7.12)
+        if (op == 2 && IGnoICS20Controls(ics20).isRetired(clientId)) return "retired";
         IICS02ClientMsgs.CounterpartyInfo memory info =
             IICS02ClientMsgs.CounterpartyInfo(counterpartyClientId, merklePrefix);
         bytes memory call = op == 1

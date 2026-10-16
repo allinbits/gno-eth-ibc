@@ -125,6 +125,8 @@ interface IGnoICS20ControlsTypes {
     event GnoRefundQueued(string clientId, uint64 indexed sequence, address token, uint256 amount);
     event GnoRefundParked(string clientId, uint64 indexed sequence, address token, uint256 amount);
     event GnoRefundRejected(string clientId, uint64 indexed sequence);
+    /// @notice An ack or timeout of a record reconciliation already settled: ignored.
+    event GnoOutcomeIgnored(string clientId, uint64 indexed sequence, Outcome outcome);
     event GnoSettled(string clientId, uint64 indexed sequence, uint8 action, uint256 amount);
     event GnoLossRecorded(string routeKey, address indexed token, uint64 indexed sequence, uint256 amount);
     event GnoRouteReopened(string routeKey);

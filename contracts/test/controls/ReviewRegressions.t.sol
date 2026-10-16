@@ -12,6 +12,7 @@ import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
+import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
 import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
@@ -163,6 +164,36 @@ contract ReviewRegressionsTest is ControlsFixture {
         admin.execute(reopen);
         assertFalse(ctl.routeClosed("gnoland-9"));
         assertEq(usdc.balanceOf(alice), 1_000_000e6);
+    }
+
+    /// @notice Round 2 #4: a retired client id is final, and a reconciled packet is refunded once: kind 6 cannot
+    /// migrate the old id back, and even if the old client answered again, its timeout pays nothing.
+    function test_r2_4_retiredIsFinal_reconciledPacketRefundedOnce() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        _retire();
+        _settle(_item(pkt.sequence, 1, 100)); // not delivered: refunded by reconciliation
+        assertEq(usdc.balanceOf(alice), 1_000_000e6);
+        MockLightClient live = new MockLightClient();
+        uint64 seq = _decide(S.KIND_CLIENT, P.client(2, clientId, CP, _prefix(), address(live), address(live).codehash));
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.SPENT, "never migrated back");
+        // whatever brings the old client back, an authentic timeout of the reconciled packet pays nothing
+        IICS02ClientMsgs.CounterpartyInfo memory info = router.getCounterparty(clientId);
+        vm.prank(address(admin));
+        router.migrateClient(clientId, info, address(live));
+        live.setTimestamp(pkt.timeoutTimestamp);
+        router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(pkt, "", IICS02ClientMsgs.Height(0, 1)));
+        assertEq(usdc.balanceOf(alice), 1_000_000e6, "refunded once");
+        assertEq(router.getCommitment(ICS24Host.packetCommitmentKeyCalldata(clientId, pkt.sequence)), bytes32(0));
+        assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Claimed), "still settled");
+        // nothing was queued for it either: reopened, the route pays nothing more
+        vm.prank(address(admin));
+        ctl.reopenRoute(clientId);
+        _skip(1 days);
+        assertEq(ctl.claim(clientId, address(usdc), 10), 0);
+        assertEq(usdc.balanceOf(alice), 1_000_000e6, "refunded once");
     }
 
     // ================================================================== #2 never spent by starving (proxies) ==

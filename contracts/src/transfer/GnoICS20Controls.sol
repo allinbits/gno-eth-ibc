@@ -162,6 +162,12 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         // a packet sent before the fork is processed only once `backfill` authenticated its record against the
         // router's commitment, which stays until this callback succeeds
         require(rec.commitment != bytes32(0), GnoNoSendRecord(clientId, sequence));
+        // a record reconciliation settled is final: a later ack or timeout pays nothing and notifies nobody (the
+        // router's commitment is consumed as usual)
+        if (rec.settlement != 0) {
+            emit GnoOutcomeIgnored(clientId, sequence, outcome);
+            return;
+        }
         rec.outcome = outcome;
         rec.processedBlock = uint64(block.number);
         if (outcome == Outcome.Success) {
