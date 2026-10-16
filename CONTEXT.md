@@ -206,6 +206,10 @@ has the timeline, every tx with links and gas, balances, and what went wrong. Re
 ffmpeg assembly). Note: gnoscan shows balances/validators wrongly for this chain version, so those are
 shown as live node queries.
 
+## Related
+
+`docs/bridges-review.md`: review of gnolang/bridges (the Hyperlane-based Solana bridge and its Ethereum draft) and the plan to add its controls to this IBC stack.
+
 ## Conventions for this work
 
 - No AI attribution anywhere (commits, PRs, comments) — the user's global instruction.
