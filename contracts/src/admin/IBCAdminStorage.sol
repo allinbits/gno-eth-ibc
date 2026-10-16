@@ -65,6 +65,11 @@ library IBCAdminStorage {
     uint8 internal constant DONE_NOW = 1;
     uint8 internal constant SPEND = 2;
 
+    /// @notice The gas the executor gets at recording and for each call whose failure spends a decision at
+    /// execution; with less than the floor left, the call is not made and the transaction reverts.
+    uint256 internal constant RECORD_GAS = 1_000_000;
+    uint256 internal constant RECORD_FLOOR = RECORD_GAS * 64 / 63 + 10_000;
+
     /// @notice 24 hours: the unpause delay and the dip's grace.
     uint64 internal constant DAY = 1 days;
     /// @notice The decision delay.
@@ -104,6 +109,9 @@ library IBCAdminStorage {
         Guardians.State g;
         IGuardians.Hold[] holds;
         Recovery recovery;
+        /// The number of the decision that last set a setting (limits of a route and token, a route's quarantine),
+        /// keyed by (epoch, setting): an older decision maturing later never overwrites a newer one.
+        mapping(bytes32 setting => uint64 seq) appliedSeq;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.IBCAdmin")) - 1)) & ~bytes32(uint256(0xff))
@@ -173,6 +181,15 @@ library IBCAdminStorage {
     function moments(Layout storage l) internal view returns (uint64, uint64, uint64, uint64) {
         Guardians.Flags storage f = l.g.f;
         return (f.holdBlock, f.holdTime, f.dipBlock, f.dipTime);
+    }
+
+    /// @notice Whether the decision `seq` may set `setting`: not when a later decision of the epoch already did. Marks
+    /// it as the last when it may.
+    function supersede(Layout storage l, bytes32 setting, uint64 seq) internal returns (bool) {
+        bytes32 key = keccak256(abi.encode(l.epoch, setting));
+        if (l.appliedSeq[key] > seq) return false;
+        l.appliedSeq[key] = seq;
+        return true;
     }
 
     // ---------------------------------------------------------------------------------------- tombstones --

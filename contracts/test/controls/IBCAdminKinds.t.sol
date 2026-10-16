@@ -247,6 +247,39 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertEq(status, S.STATUS_SPENT);
     }
 
+    function test_kind4_olderLooseningNeverUndoesANewerTightening() public {
+        uint64 loosen =
+            _decidePending(S.KIND_LIMITS, P.limits(clientId, address(ugnot), GNOT_MAX * 2, GNOT_DAY, GNOT_DAY, 0, 0));
+        (uint64 tighten,) = _decide(S.KIND_LIMITS, P.limits(clientId, address(ugnot), 1, GNOT_DAY, GNOT_DAY, 0, 0));
+        assertEq(_state(tighten), S.EXECUTED);
+        _skip(7 days);
+        admin.execute(loosen);
+        assertEq(_state(loosen), S.SPENT);
+        assertEq(ctl.limits(clientId, address(ugnot)).limits.maxPerMessage, 1);
+    }
+
+    function test_kind11_olderShorteningNeverUndoesANewerLengthening() public {
+        uint64 shorten = _decidePending(S.KIND_SETTINGS, P.settings(clientId, 1 days));
+        _decide(S.KIND_SETTINGS, P.settings(clientId, 14 days));
+        _skip(7 days);
+        admin.execute(shorten);
+        assertEq(_state(shorten), S.SPENT);
+        assertEq(ctl.quarantineSeconds(clientId), 14 days);
+    }
+
+    function test_starvedExecution_pendsInsteadOfSpending() public {
+        GnoVoucher v = new GnoVoucher("Foo", "FOO", 6, address(ics20), "transfer/client-0/ufoo");
+        uint64 seq = _decidePending(S.KIND_VOUCHER, P.voucher(clientId, "ufoo", address(v), address(v).codehash));
+        _skip(7 days);
+        for (uint256 g = 150_000; g < 1_100_000; g += 50_000) {
+            (bool ok,) = address(admin).call{ gas: g }(abi.encodeCall(admin.execute, (seq)));
+            if (ok) break;
+            assertEq(_state(seq), S.PENDING, "never spent by starving it");
+        }
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+    }
+
     // =============================================================================================== kind 5 ==
 
     function test_kind5_registersVoucher() public {

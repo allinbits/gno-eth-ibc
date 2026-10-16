@@ -78,7 +78,7 @@ contract IBCAdminExec is IIBCAdmin {
 
     /// @notice A decision at recording: WAIT (it waits for its delay), DONE_NOW (an immediate kind, executed now) or
     /// SPEND (bad parameters). Every kind's parameters are decoded here; malformed ones revert, which IBCAdmin spends.
-    function atRecording(uint8 kind, bytes calldata p) external delegated returns (uint8, string memory) {
+    function atRecording(uint8 kind, uint64 seq, bytes calldata p) external delegated returns (uint8, string memory) {
         if (kind == S.KIND_UNPAUSE) {
             (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));
             bool ok = (object == 1 && bytes(clientId).length != 0) || (object == 2 && bytes(clientId).length == 0);
@@ -92,6 +92,7 @@ contract IBCAdminExec is IIBCAdmin {
             (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
             if (!_validLimits(token, l)) return (S.SPEND, "params");
             if (_loosens(IGnoICS20Controls(ics20).limits(clientId, token), l)) return (S.WAIT, "");
+            if (!S.supersede(S.layout(), _limitsKey(clientId, token), seq)) return (S.SPEND, "superseded");
             IGnoICS20Controls(ics20).setLimits(clientId, token, l);
             return (S.DONE_NOW, "");
         }
@@ -132,6 +133,7 @@ contract IBCAdminExec is IIBCAdmin {
         (string memory id, uint64 q) = abi.decode(p, (string, uint64));
         if (q > MAX_QUARANTINE || bytes(id).length == 0) return (S.SPEND, "params");
         if (q < IGnoICS20Controls(ics20).quarantineSeconds(id)) return (S.WAIT, "");
+        if (!S.supersede(S.layout(), _quarantineKey(id), seq)) return (S.SPEND, "superseded");
         IGnoICS20Controls(ics20).setQuarantine(id, q);
         return (S.DONE_NOW, "");
     }
@@ -143,6 +145,15 @@ contract IBCAdminExec is IIBCAdmin {
     {
         (clientId, token, l.maxPerMessage, l.dayCap, l.refundCap, l.sendMax, l.sendMin) =
             abi.decode(p, (string, address, uint256, uint256, uint256, uint256, uint256));
+    }
+
+    /// @notice The settings `supersede` orders, keyed by route key (so every client id of a route shares them).
+    function _limitsKey(string memory clientId, address token) private view returns (bytes32) {
+        return keccak256(abi.encode("limits", IGnoICS20Controls(ics20).routeKey(clientId), token));
+    }
+
+    function _quarantineKey(string memory clientId) private view returns (bytes32) {
+        return keccak256(abi.encode("quarantine", IGnoICS20Controls(ics20).routeKey(clientId)));
     }
 
     function _validLimits(address token, IGnoICS20ControlsTypes.Limits memory l) private pure returns (bool) {
@@ -172,12 +183,23 @@ contract IBCAdminExec is IIBCAdmin {
 
     /// @notice Carries out a matured decision IBCAdmin's `execute` closed; the reason it is spent, or "" when it
     /// executed. A call that reverts reverts `execute` whole, and the decision stays pending for a retry.
-    function run(uint8 kind, bytes calldata p, uint64 recordedBlock) external delegated returns (string memory) {
+    function run(
+        uint8 kind,
+        uint64 seq,
+        bytes calldata p,
+        uint64 recordedBlock
+    )
+        external
+        delegated
+        returns (string memory)
+    {
         if (kind == S.KIND_UNPAUSE) return _unpause(p, recordedBlock);
         if (kind == S.KIND_SEATS) return _seats(p);
         if (kind == S.KIND_LIMITS) {
             (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
             if (!_validLimits(token, l)) return "params";
+            // a tightening recorded after this loosening, and applied at once, stands
+            if (!S.supersede(S.layout(), _limitsKey(clientId, token), seq)) return "superseded";
             IGnoICS20Controls(ics20).setLimits(clientId, token, l);
             return "";
         }
@@ -195,6 +217,7 @@ contract IBCAdminExec is IIBCAdmin {
         // KIND_SETTINGS: a shortening (a lengthening executed at recording)
         (string memory id, uint64 q) = abi.decode(p, (string, uint64));
         if (q > MAX_QUARANTINE) return "params";
+        if (!S.supersede(S.layout(), _quarantineKey(id), seq)) return "superseded";
         IGnoICS20Controls(ics20).setQuarantine(id, q);
         return "";
     }
@@ -487,13 +510,13 @@ contract IBCAdminExec is IIBCAdmin {
 
     // ================================================================================================ helpers ==
 
-    /// @notice A call whose failure is an answer, not an error: false when it reverts with data or for another
-    /// reason that left gas; when it ran out of gas, the execution reverts (`CallStarved`) and the decision pends.
+    /// @notice A call whose failure is an answer, not an error (the decision is spent): made with a fixed gas budget,
+    /// and only with enough gas left for all of it (`CallStarved` otherwise: the decision pends), so nobody can make it
+    /// fail by starving it. A remaining-gas test after the call could not tell: the proxies on the way each keep a
+    /// 64th and hand it back.
     function _call(address target, bytes memory data) private returns (bool ok) {
-        uint256 g = gasleft();
-        bytes memory ret;
-        (ok, ret) = target.call(data);
-        if (!ok && ret.length == 0 && gasleft() <= g / 63) revert CallStarved();
+        if (gasleft() < S.RECORD_FLOOR) revert CallStarved();
+        (ok,) = target.call{ gas: S.RECORD_GAS }(data);
     }
 
     /// @notice Whether `target`'s code is the one the decision pins: no code at all reverts (`NoCodeYet`: the decision

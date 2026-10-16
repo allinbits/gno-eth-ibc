@@ -236,7 +236,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (d.bad || !S.knownKind(kind)) return _close(ep, seq, d, S.SPENT, d.bad ? "params" : "unknown kind");
         if (kind == S.KIND_CANCEL) return _close(ep, seq, d, S.EXECUTED, "");
         if (S.isTombstoned(l, ep, seq)) return _close(ep, seq, d, S.CANCELLED, "");
-        (uint8 action, string memory reason) = _atRecording(l, kind, d.params);
+        (uint8 action, string memory reason) = _atRecording(l, kind, seq, d.params);
         if (action == S.DONE_NOW) return _close(ep, seq, d, S.EXECUTED, "");
         if (action == S.SPEND) return _close(ep, seq, d, S.SPENT, reason);
         d.state = S.PENDING;
@@ -266,17 +266,24 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return S.STATUS_RECORDED;
     }
 
-    /// @notice The executor's verdict at recording. A failure with data (bad parameters) spends the decision; one
-    /// that ran out of gas reverts `ExecutionStarved` (an error ack: `ibcgov` re-sends), so no relayer can spend a
-    /// decision by starving it.
-    function _atRecording(S.Layout storage l, uint8 kind, bytes memory params) private returns (uint8, string memory) {
+    /// @notice The executor's verdict at recording, run with a fixed gas budget: a failure (bad parameters) spends
+    /// the decision, and with less gas left than the budget needs the delivery reverts `ExecutionStarved` (an error
+    /// ack: `ibcgov` re-sends), so no relayer can spend a decision by starving it. (A remaining-gas test after the
+    /// call cannot tell: the proxies on the way each keep a 64th and hand it back.)
+    function _atRecording(
+        S.Layout storage l,
+        uint8 kind,
+        uint64 seq,
+        bytes memory params
+    )
+        private
+        returns (uint8, string memory)
+    {
         address x = _exec(l);
-        uint256 g = gasleft();
-        (bool ok, bytes memory ret) = x.delegatecall(abi.encodeCall(IBCAdminExec.atRecording, (kind, params)));
-        if (!ok) {
-            if (ret.length == 0 && gasleft() <= g / 63) revert ExecutionStarved();
-            return (S.SPEND, "params");
-        }
+        if (gasleft() < S.RECORD_FLOOR) revert ExecutionStarved();
+        (bool ok, bytes memory ret) =
+            x.delegatecall{ gas: S.RECORD_GAS }(abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params)));
+        if (!ok) return (S.SPEND, "params");
         return abi.decode(ret, (uint8, string));
     }
 
@@ -329,7 +336,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         bytes memory params = d.params;
         delete d.params;
         string memory spent =
-            abi.decode(_delegate(l, abi.encodeCall(IBCAdminExec.run, (kind, params, d.recordedBlock))), (string));
+            abi.decode(_delegate(l, abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))), (string));
         if (bytes(spent).length != 0) {
             d.state = S.SPENT;
             emit DecisionSpent(ep, seq, kind, spent);
