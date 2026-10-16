@@ -26,9 +26,9 @@ All checked out side by side under `/Volumes/Tendermint/gnolang/` (TS relayer on
 
 | Repo | Branch | Head | Pushed? |
 |---|---|---|---|
-| `gno` (fork remote `clockwork` = clockworkgr/gno) | `feat/secp256k1-validators-ibc` | `038e4c5ed` | no |
-| `gno-realms` (origin allinbits/gno-realms) | `feat/ethereum-light-client` | `39fc86b` | no |
-| `gno-eth-ibc` (this repo, no remote) | `main` | see `git log` | no remote |
+| `gno` (origin gnolang/gno) | `feat/secp256k1-validators-ibc` | see PR | yes — [gnolang/gno#6375](https://github.com/gnolang/gno/pull/6375) |
+| `gno-realms` (origin allinbits/gno-realms) | `feat/ethereum-light-client` | `e0b12e6` | yes (no PR yet) |
+| `gno-eth-ibc` (origin [allinbits/gno-eth-ibc](https://github.com/allinbits/gno-eth-ibc)) | `main` | see `git log` | yes |
 | `ibc-v2-ts-relayer` (origin allinbits) | `feat/ethereum-clients` | `39cbf6f` | yes — PR #40 |
 | `gno` | `fix-realm-param-key-colons` (clockworkgr) | — | yes — gnolang/gno#6358 |
 
@@ -36,9 +36,9 @@ All checked out side by side under `/Volumes/Tendermint/gnolang/` (TS relayer on
 
 | Commit | What |
 |---|---|
-| `9786127c4` feat(tm2) | secp256k1 validator consensus keys allowed by params (both types); `KeyType`, `GenerateFileKeyOfType`; `gnoland secrets init -validator-key-type` (empty = default); **new keys default to secp256k1**. `TestReactorBasicSecp256k1`. ADR `tm2/adr/prxxxx_secp256k1_validator_keys.md` (note `pr5949_remove_secp256k1_validators.md` is the earlier opposite decision). |
-| `d6013ecc3` feat(gnovm) | stdlib `crypto/bls12381.FastAggregateVerify` native (gas row Base 2,024,000 / Slope 1,962,000, draft). ADR `gnovm/adr/prxxxx_bls12381_native.md`. Builds on the BLS idea of gnolang/gno#5583. |
-| `2e1ca74b4` fix(gnovm,vm) | colons allowed in realm param names (`realmFromKey` splits on the first colon). Needed because IBC packet keys contain `:`. ADR `prxxxx_param_key_colons.md`. Also proposed alone as **gnolang/gno#6358** (open, lint fixed, needs a maintainer review). |
+| `9786127c4` feat(tm2) | secp256k1 validator consensus keys allowed by params (both types); `KeyType`, `GenerateFileKeyOfType`; `gnoland secrets init -validator-key-type` (empty = default); **new keys default to secp256k1**. `TestReactorBasicSecp256k1`. ADR `tm2/adr/pr6375_secp256k1_validator_keys.md` (note `pr5949_remove_secp256k1_validators.md` is the earlier opposite decision). |
+| `d6013ecc3` feat(gnovm) | stdlib `crypto/bls12381.FastAggregateVerify` native (gas row Base 2,024,000 / Slope 1,962,000, draft). ADR `gnovm/adr/pr6375_bls12381_native.md`. Builds on the BLS idea of gnolang/gno#5583. |
+| `2e1ca74b4` fix(gnovm,vm) | colons allowed in realm param names (`realmFromKey` splits on the first colon). Needed because IBC packet keys contain `:`. ADR `pr6358_param_key_colons.md`. Also proposed alone as **gnolang/gno#6358** (open, lint fixed, needs a maintainer review). |
 | `038e4c5ed` chore | `strings.Cut` in `realmFromKey` (go fix lint) |
 | `e75f6a699` feat(gnovm) | `bls12381.FastAggregateVerifyExcluding(aggregate, excluded, msg, sig)`: verify against a committee's aggregate key minus non-signers (gas Base 2,116,000 / Slope 1,962,000 per excluded key). App-hash test pin bumped to `9c883b97…dd16`. |
 
@@ -191,7 +191,8 @@ ICS20 carries raw base units; decimals are display metadata.
   needed for now).
 - TS relayer: `findConflictingHeader` for GnoLightClient unsupported; `getConsensusStatesAfter` scans
   `eth_getLogs` from block 0 (public RPCs may refuse); Ethereum-side `maxClockDrift` (20 s) vs block time lag.
-- Publish: push gno and gno-realms branches, open their PRs (with ADRs), give gno-eth-ibc a remote.
+- Publish: gno is PR gnolang/gno#6375 (with the full ADR `gno.land/adr/pr6375_ibc_ethereum.md`); gno-realms
+  `feat/ethereum-light-client` is pushed but has no PR yet; gno-eth-ibc is public at allinbits/gno-eth-ibc.
   gnolang/gno#6358 needs a reviewer. `GnoLightClient` artifacts in the TS relayer record gno-eth-ibc commit
   `ca63b51`.
 - BLS native gas rows are drafts; validate before proposing upstream.
@@ -208,6 +209,7 @@ shown as live node queries.
 
 ## Related
 
+The full design is the ADR in gnolang/gno#6375 (`gno.land/adr/pr6375_ibc_ethereum.md`).
 `docs/bridges-review.md`: review of gnolang/bridges (the Hyperlane-based Solana bridge and its Ethereum draft) and the plan to add its controls to this IBC stack.
 
 ## Conventions for this work
