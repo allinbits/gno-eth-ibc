@@ -44,6 +44,21 @@ library GnoTransferStorage {
         /// Kind 13 under way: its deficits are accepted in batches from `deficitCursor`; the route opens with the last.
         bool reopening;
         uint64 deficitCursor;
+        /// Every ack and timeout processed on the route, in processing order (append-only): the records of the
+        /// suspected compromise interval are found in it by binary search (ADR §7.12).
+        ProcessedRef[] processed;
+        /// The last replacement: its block, the start of its suspected compromise interval, and how many records
+        /// processed in it kind 12 still has to settle before kind 13.
+        uint64 replacedAt;
+        uint64 suspectFrom;
+        uint64 suspectOpen;
+    }
+
+    /// @notice A send record processed by an ack or timeout, at a block.
+    struct ProcessedRef {
+        bytes32 clientHash;
+        uint64 sequence;
+        uint64 blockNumber;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.

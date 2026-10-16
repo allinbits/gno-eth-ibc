@@ -101,8 +101,22 @@ library GovParams {
         return abi.encode(exec, codeHash, migrationCall);
     }
 
+    function route(
+        string memory oldClientId,
+        string memory newClientId,
+        uint64 suspectFrom
+    )
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encode(oldClientId, newClientId, suspectFrom);
+    }
+
+    /// @notice A replacement with no suspected compromise interval (nothing processed through the old client is
+    /// suspect).
     function route(string memory oldClientId, string memory newClientId) internal pure returns (bytes memory) {
-        return abi.encode(oldClientId, newClientId);
+        return route(oldClientId, newClientId, type(uint64).max);
     }
 
     function settings(string memory clientId, uint64 quarantineSeconds) internal pure returns (bytes memory) {

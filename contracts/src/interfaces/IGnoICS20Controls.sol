@@ -98,6 +98,7 @@ interface IGnoICS20ControlsTypes {
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
     error GnoRecordsOpen(string clientId, uint64 open);
+    error GnoSuspectUnsettled(string clientId, uint64 open);
     error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
     error GnoQuarantined(string clientId, uint256 until);
     error GnoQuarantineUnknown(string clientId);
@@ -162,7 +163,10 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function setRecoveryBlock(string calldata clientId, bool blocked) external;
     /// @notice Points `newClientId` at `oldClientId`'s route, retires `oldClientId` and closes the route (constant
     /// work); kind 12 settles its records and kind 13 reopens it.
-    function migrateRoute(string calldata oldClientId, string calldata newClientId) external;
+    /// `suspectFrom`: the Ethereum block from which acks and timeouts processed through the old client are suspect;
+    /// each record processed from then on must be settled by kind 12 before kind 13 (never reaching back past the
+    /// previous replacement). Refused while the route is closed (one replacement at a time).
+    function migrateRoute(string calldata oldClientId, string calldata newClientId, uint64 suspectFrom) external;
     /// @notice Kind 13: starts reopening a closed route, refused while any of its send records is open
     /// (`openRecords`). Every recorded loss not yet accepted becomes an accepted deficit, in batches: the first here,
     /// the rest by `continueReopen`; the route opens when the last batch completes.
@@ -217,6 +221,8 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function routePaused(string calldata clientId) external view returns (bool);
     function routeClosed(string calldata clientId) external view returns (bool);
     function routeReopening(string calldata clientId) external view returns (bool);
+    /// @notice The last replacement's suspected compromise interval start, and its records still to settle.
+    function suspectRecords(string calldata clientId) external view returns (uint64 from, uint64 open);
     /// @notice Losses kind 12 recorded on the route for the token.
     function losses(string calldata clientId, address token) external view returns (uint256);
     /// @notice Escrow of the token reserved for the route's owed refunds (queued, parked or decided but unpaid).

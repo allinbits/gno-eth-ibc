@@ -27,6 +27,8 @@ interface IIBCAdmin {
         bytes[] merklePrefix;
         address lightClient;
         bytes32 codeHash;
+        /// The Ethereum block from which the old client's acks and timeouts are suspect (§7.12).
+        uint64 suspectFrom;
     }
 
     /// @notice The recovery's settings, fixed at deployment. `delay == 0` disables the emergency path.

@@ -178,6 +178,10 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         rec.outcome = outcome;
         rec.processedBlock = uint64(block.number);
         bytes32 route = GnoTransferStorage.routeHash(clientId);
+        g.routes[route].processed
+            .push(GnoTransferStorage.ProcessedRef(keccak256(bytes(clientId)), sequence, uint64(block.number)));
+        // processed while a replacement is being reconciled, inside its suspected interval: one more to settle
+        if (g.routes[route].closed && block.number >= g.routes[route].suspectFrom) ++g.routes[route].suspectOpen;
         if (outcome == Outcome.Success) {
             GnoTransferStorage.closeRecord(rec, route);
             emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
@@ -297,6 +301,24 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         emit GnoQuarantineSet(GnoTransferStorage.routeKey(clientId), seconds_);
     }
 
+    /// @notice The index of the first record processed at or after `fromBlock` (binary search; the list is in
+    /// processing order).
+    function _firstProcessedAt(
+        GnoTransferStorage.ProcessedRef[] storage list,
+        uint64 fromBlock
+    )
+        private
+        view
+        returns (uint256 lo)
+    {
+        uint256 hi = list.length;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (list[mid].blockNumber < fromBlock) lo = mid + 1;
+            else hi = mid;
+        }
+    }
+
     /// @notice See IGnoICS20Controls.
     function checkpointQuarantine(string calldata clientId) external delegated restricted {
         _checkpoint(_route(clientId), clientId);
@@ -339,7 +361,15 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
-    function migrateRoute(string calldata oldClientId, string calldata newClientId) external delegated restricted {
+    function migrateRoute(
+        string calldata oldClientId,
+        string calldata newClientId,
+        uint64 suspectFrom
+    )
+        external
+        delegated
+        restricted
+    {
         GnoTransferStorage.Layout storage g = _g();
         // the new id must be fresh: no alias, not a route key, no escrow of its own, never retired, not the old one
         require(
@@ -350,11 +380,21 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             GnoBadRoute()
         );
         string memory key = GnoTransferStorage.routeKey(oldClientId);
+        GnoTransferStorage.Route storage r = g.routes[keccak256(bytes(key))];
+        // one replacement at a time: the last one's reconciliation completes (kind 13) before the next
+        require(!r.closed, GnoBadRoute());
         g.routeOf[newClientId] = key;
         g.currentOf[key] = newClientId;
         g.retired[oldClientId] = true;
         // closed until its records are reconciled (kind 12) and it is reopened (kind 13)
-        g.routes[keccak256(bytes(key))].closed = true;
+        r.closed = true;
+        // the suspected compromise interval: every ack and timeout processed from `suspectFrom` on must be settled
+        // by kind 12 before kind 13 (ADR §7.12); it never reaches back past the previous replacement, whose own
+        // records were reconciled then
+        if (suspectFrom < r.replacedAt) suspectFrom = r.replacedAt;
+        r.replacedAt = uint64(block.number);
+        r.suspectFrom = suspectFrom;
+        r.suspectOpen = uint64(r.processed.length - _firstProcessedAt(r.processed, suspectFrom));
         emit GnoRouteMigrated(oldClientId, newClientId, key);
     }
 
@@ -419,6 +459,12 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function losses(string calldata clientId, address token) external view delegated returns (uint256) {
         return _g().losses[GnoTransferStorage.routeHash(clientId)][token];
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function suspectRecords(string calldata clientId) external view delegated returns (uint64 from, uint64 open) {
+        GnoTransferStorage.Route storage r = _route(clientId);
+        return (r.suspectFrom, r.suspectOpen);
     }
 
     /// @notice See IGnoICS20Controls.

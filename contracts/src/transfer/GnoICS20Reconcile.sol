@@ -103,6 +103,10 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             SendRecord storage rec = g.records[clientHash][it.sequence];
             // a record (authenticated: written by the send or backfilled), settled at most once
             require(rec.commitment != bytes32(0) && rec.settlement == 0, GnoBadSettlement(i));
+            // a record processed in the suspected compromise interval: one fewer to settle
+            if (rec.processedBlock != 0 && rec.processedBlock >= g.routes[route].suspectFrom) {
+                --g.routes[route].suspectOpen;
+            }
             uint8 action = it.action;
             bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
             uint256 reservedBefore = GnoTransferStorage.reservation(rec);
@@ -127,7 +131,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 // genuine (action 1)
                 require((action == 3 || owed) && rec.refunded == 0, GnoBadSettlement(i));
                 rec.settlement = action;
-                if (owed) _reject(g, rec, clientHash, clientId, it.sequence);
+                if (owed) _reject(rec, clientId, it.sequence);
             } else if (action == 4) {
                 // a forged refund (of a packet that was delivered): its unpaid remainder is rejected and what was
                 // already paid is the loss, at once
@@ -136,7 +140,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                     GnoBadSettlement(i)
                 );
                 rec.settlement = 4;
-                if (owed) _reject(g, rec, clientHash, clientId, it.sequence);
+                if (owed) _reject(rec, clientId, it.sequence);
                 if (it.amount != 0) {
                     if (g.losses[route][rec.token] == 0) g.routes[route].lossTokens.push(rec.token);
                     g.losses[route][rec.token] += it.amount;
@@ -152,15 +156,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     }
 
     /// @notice A queued or parked refund rejected by reconciliation: never paid, its notification dropped.
-    function _reject(
-        GnoTransferStorage.Layout storage g,
-        SendRecord storage rec,
-        bytes32 clientHash,
-        string calldata clientId,
-        uint64 sequence
-    )
-        private
-    {
+    function _reject(SendRecord storage rec, string calldata clientId, uint64 sequence) private {
         rec.payment = Payment.Rejected;
         GnoTransferStorage.dropNotice(clientId, sequence);
         emit GnoRefundRejected(clientId, sequence);
@@ -175,6 +171,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
         // every record of the retired ids reconciled first: no outstanding packet, no refund owed
         require(r.openRecords == 0, GnoRecordsOpen(clientId, r.openRecords));
+        // and every ack or timeout processed in the suspected compromise interval settled
+        require(r.suspectOpen == 0, GnoSuspectUnsettled(clientId, r.suspectOpen));
         r.reopening = true;
         r.deficitCursor = 0;
         _acceptDeficits(r, clientId, REOPEN_BATCH);

@@ -112,8 +112,8 @@ contract GovVectorsTest is ControlsFixture {
             "kind10-route",
             9,
             10,
-            "(string oldClientId = \"client-0\", string newClientId = \"gnoland-2\")",
-            P.route("client-0", "gnoland-2")
+            "(string oldClientId = \"client-0\", string newClientId = \"gnoland-2\", uint64 suspectFrom = 21000000)",
+            P.route("client-0", "gnoland-2", 21_000_000)
         );
         _deliver(
             "kind11-settings-lengthen",
@@ -163,6 +163,13 @@ contract GovVectorsTest is ControlsFixture {
             P.settle("client-0", items)
         );
         _deliver("kind13-reopen", 15, 13, "(string clientId = \"gnoland-2\")", P.reopen("gnoland-2"));
+        _deliver(
+            "kind12-settle-zero",
+            16,
+            12,
+            "(string clientId = \"client-0\", (uint64 sequence, uint8 action, uint256 amount)[] items = [(3, 1, 0)]) - a genuine refund already paid in full",
+            P.settle1("client-0", 3, 1, 0)
+        );
     }
 
     function _json() internal view returns (string memory j) {
@@ -220,7 +227,7 @@ contract GovVectorsTest is ControlsFixture {
     function test_govVectors() public {
         _build();
         // the statuses the protocol must produce
-        uint8[18] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1];
+        uint8[19] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1, 1];
         for (uint256 i = 0; i < vectors.length; i++) {
             (uint32 e, uint64 s, uint8 st,) = _govAck(vectors[i].ack);
             assertEq(e, 1);
@@ -229,7 +236,7 @@ contract GovVectorsTest is ControlsFixture {
         }
         (,,, uint8 redispatch) = _govAck(vectors[15].ack);
         assertEq(redispatch, 1);
-        assertEq(admin.lastSeq(), 15);
+        assertEq(admin.lastSeq(), 16);
 
         if (vm.envOr("WRITE_GOV_VECTORS", false)) {
             vm.writeFile(FILE, _json());

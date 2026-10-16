@@ -59,7 +59,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         address lc9 = address(new MockLightClient());
         vm.startPrank(address(admin));
         router.addClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), lc9);
-        ctl.migrateRoute(clientId, "gnoland-9");
+        ctl.migrateRoute(clientId, "gnoland-9", type(uint64).max);
         vm.stopPrank();
     }
 
@@ -453,7 +453,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         MockLightClient lc9 = new MockLightClient();
         vm.startPrank(address(admin));
         router.addClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), address(lc9));
-        ctl.migrateRoute(clientId, "gnoland-9");
+        ctl.migrateRoute(clientId, "gnoland-9", type(uint64).max);
         ctl.reopenRoute("gnoland-9");
         vm.stopPrank();
         lc9.setTransitionTime(uint64(_now()));
@@ -791,6 +791,87 @@ contract ReviewRegressionsTest is ControlsFixture {
             assertEq(ctl.acceptedDeficit(clientId, tokens[i]), 10);
         }
         assertTrue(_isSuccessAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
+    }
+
+    /// @notice Round 3 #1: kind 10 names the start of the suspected compromise interval; every ack and timeout
+    /// processed from it on (a forged success, a forged refund paid in full, a genuine refund paid in full) must be
+    /// settled by kind 12 before kind 13 reopens the route; one processed before it need not be; and a second
+    /// replacement waits for the first's reconciliation.
+    function test_r3_1_suspectInterval_settledBeforeReopen() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        bytes memory ok = bytes("{\"result\":\"AQ==\"}");
+        IICS26RouterMsgs.Packet memory before = _send(alice, address(usdc), 100, clientId);
+        _ack(before, ok);
+        vm.roll(block.number + 10);
+        uint64 from = uint64(block.number);
+        IICS26RouterMsgs.Packet memory forgedOk = _send(alice, address(usdc), 100, clientId);
+        _ack(forgedOk, ok); // a forged success ack of an undelivered packet
+        IICS26RouterMsgs.Packet memory forgedRefund = _send(alice, address(usdc), 100, clientId);
+        _errorAck(forgedRefund); // paid at once
+        IICS26RouterMsgs.Packet memory genuine = _send(alice, address(usdc), 100, clientId);
+        _timeout(genuine); // paid at once
+        vm.roll(block.number + 5);
+
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        uint64 replace = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-2", from));
+        _skip(7 days);
+        admin.execute(add);
+        admin.execute(replace);
+        assertEq(admin.decision(1, replace).state, S.EXECUTED);
+        (uint64 f, uint64 open) = ctl.suspectRecords(clientId);
+        assertEq(f, from);
+        assertEq(open, 3);
+        assertEq(ctl.openRecords(clientId), 0, "nothing outstanding: the old gate alone would reopen");
+
+        vm.startPrank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-2", 3));
+        ctl.reopenRoute("gnoland-2");
+        // one replacement at a time
+        router.addClient("gnoland-8", IICS02ClientMsgs.CounterpartyInfo("ethereum-8", _prefix()), address(lc2));
+        vm.expectRevert(T.GnoBadRoute.selector);
+        ctl.migrateRoute("gnoland-2", "gnoland-8", 0);
+        // a record processed before the interval does not count
+        ctl.settleRecords(clientId, _item(before.sequence, 3, 0));
+        (, open) = ctl.suspectRecords(clientId);
+        assertEq(open, 3);
+        uint256 paid = usdc.balanceOf(alice);
+        ctl.settleRecords(clientId, _item(forgedOk.sequence, 1, 100)); // refunded now
+        assertEq(usdc.balanceOf(alice), paid + 100);
+        ctl.settleRecords(clientId, _item(forgedRefund.sequence, 4, 100)); // the paid loss, booked
+        vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-2", 1));
+        ctl.reopenRoute("gnoland-2");
+        ctl.settleRecords(clientId, _item(genuine.sequence, 1, 0)); // already paid in full
+        (, open) = ctl.suspectRecords(clientId);
+        assertEq(open, 0);
+        ctl.reopenRoute("gnoland-2");
+        vm.stopPrank();
+        assertFalse(ctl.routeClosed(clientId));
+        assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 100);
+    }
+
+    /// @notice Round 3 #1: an ack processed on the old id after the replacement (here a migration that does not
+    /// freeze the old client) is inside the interval too: counted, and settled like the rest.
+    function test_r3_1_lateAckDuringReconciliation_isCounted() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        address lc9 = address(new MockLightClient());
+        vm.startPrank(address(admin));
+        router.addClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), lc9);
+        ctl.migrateRoute(clientId, "gnoland-9", uint64(block.number));
+        vm.stopPrank();
+        (, uint64 open) = ctl.suspectRecords(clientId);
+        assertEq(open, 0);
+        _errorAck(pkt); // queued: the route is closed
+        (, open) = ctl.suspectRecords(clientId);
+        assertEq(open, 1);
+        vm.startPrank(address(admin));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 2, 0));
+        ctl.reopenRoute("gnoland-9");
+        vm.stopPrank();
+        assertFalse(ctl.routeClosed(clientId));
     }
 
     // ============================================================== #20 send variants and reentrancy ==

@@ -573,7 +573,7 @@ contract GnoICS20TransferTest is ControlsFixture {
         address escrow = ics20.getEscrow(clientId);
         _addClient("gnoland-9", address(new MockLightClient()));
         vm.prank(address(admin));
-        ctl.migrateRoute(clientId, "gnoland-9");
+        ctl.migrateRoute(clientId, "gnoland-9", type(uint64).max);
 
         assertEq(ctl.routeKey("gnoland-9"), clientId);
         assertEq(ctl.currentClient(clientId), "gnoland-9");
@@ -630,7 +630,7 @@ contract GnoICS20TransferTest is ControlsFixture {
     function test_migrateRoute_retiredReceive_errorAck() public {
         _addClient("gnoland-9", address(new MockLightClient()));
         vm.prank(address(admin));
-        ctl.migrateRoute(clientId, "gnoland-9");
+        ctl.migrateRoute(clientId, "gnoland-9", type(uint64).max);
         assertTrue(_isErrorAck(_gnotIn(1, bob)));
     }
 
@@ -638,14 +638,14 @@ contract GnoICS20TransferTest is ControlsFixture {
         _addClient("gnoland-9", address(new MockLightClient()));
         vm.startPrank(address(admin));
         vm.expectRevert(T.GnoBadRoute.selector);
-        ctl.migrateRoute(clientId, clientId);
+        ctl.migrateRoute(clientId, clientId, type(uint64).max);
         vm.expectRevert(T.GnoBadRoute.selector);
-        ctl.migrateRoute(clientId, "");
-        ctl.migrateRoute(clientId, "gnoland-9");
+        ctl.migrateRoute(clientId, "", type(uint64).max);
+        ctl.migrateRoute(clientId, "gnoland-9", type(uint64).max);
         vm.expectRevert(T.GnoBadRoute.selector);
-        ctl.migrateRoute(clientId, "gnoland-10"); // the old id is retired
+        ctl.migrateRoute(clientId, "gnoland-10", type(uint64).max); // the old id is retired
         vm.expectRevert(T.GnoBadRoute.selector);
-        ctl.migrateRoute("gnoland-9", clientId); // a retired id never comes back
+        ctl.migrateRoute("gnoland-9", clientId, type(uint64).max); // a retired id never comes back
         vm.stopPrank();
     }
 }

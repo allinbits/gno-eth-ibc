@@ -150,7 +150,7 @@ contract IBCAdminExec is IIBCAdmin {
             return x != address(0) ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_ROUTE) {
-            (string memory oldId, string memory newId) = abi.decode(p, (string, string));
+            (string memory oldId, string memory newId,) = abi.decode(p, (string, string, uint64));
             bool ok = bytes(oldId).length != 0 && bytes(newId).length != 0
                 && keccak256(bytes(oldId)) != keccak256(bytes(newId));
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
@@ -484,16 +484,17 @@ contract IBCAdminExec is IIBCAdmin {
         }
     }
 
-    /// @notice Kind 10: `oldClientId` must be this epoch's client and `newClientId` a client the router knows (added
-    /// by kind 6 first); retires and freezes the old id, migrates the route, and opens the next epoch over the new id.
+    /// @notice Kind 10 `(oldClientId, newClientId, suspectFrom)`: `oldClientId` must be this epoch's client and
+    /// `newClientId` a custom id a kind 6 enrolled; `suspectFrom` starts the suspected compromise interval; retires and
+    /// freezes the old id, migrates the route, and opens the next epoch over the new id.
     function _route(bytes calldata p) private returns (string memory) {
-        (string memory oldId, string memory newId) = abi.decode(p, (string, string));
+        (string memory oldId, string memory newId, uint64 suspectFrom) = abi.decode(p, (string, string, uint64));
         S.Layout storage l = S.layout();
         if (keccak256(bytes(oldId)) != keccak256(bytes(l.govClient))) return "client";
         // only a custom id a kind 6 enrolled (its verifier code-hash pinned), never one the router generated
         if (!l.enrolled[keccak256(bytes(newId))]) return "client";
         IGnoICS20Controls(ics20).checkpointQuarantine(oldId);
-        if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId)))) return "route";
+        if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId, suspectFrom)))) return "route";
         S.replaceRoute(l, router, frozenClient, oldId, newId);
         return "";
     }

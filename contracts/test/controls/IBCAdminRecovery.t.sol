@@ -56,7 +56,8 @@ contract IBCAdminRecoveryTest is ControlsFixture {
             counterpartyClientId: "ethereum-7",
             merklePrefix: prefix,
             lightClient: address(attested),
-            codeHash: address(attested).codehash
+            codeHash: address(attested).codehash,
+            suspectFrom: 0
         });
     }
 
