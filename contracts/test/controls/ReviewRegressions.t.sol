@@ -275,10 +275,38 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(_isErrorAck(_transferIn("gnoland-9", back, 200, bob)), "would eat alice's refund");
         assertTrue(_isSuccessAck(_transferIn("gnoland-9", back, 100, bob)));
         assertTrue(_isErrorAck(_transferIn("gnoland-9", back, 1, bob)));
+        // bob sends 100 more: outstanding, it is reserved too, so a redemption cannot spend it before its timeout
+        r.mint(bob, 100);
+        IICS26RouterMsgs.Packet memory pc = _send(bob, address(r), 100, "gnoland-9");
+        assertEq(ctl.reserved(clientId, address(r)), 200);
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", back, 100, bob)), "would eat the outstanding send's backing");
+        vm.warp(pc.timeoutTimestamp); // the new client's time
+        router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(pc, "", IICS02ClientMsgs.Height(0, 1)));
+        // not delivered: refunded at once, from its own backing
+        assertEq(r.balanceOf(bob), 200);
+        assertEq(ctl.reserved(clientId, address(r)), 100);
         r.setBlocked(alice, false);
         assertEq(ctl.claimParked(clientId, pa.sequence), 100);
         assertEq(r.balanceOf(alice), 100);
         assertEq(ctl.reserved(clientId, address(r)), 0);
+    }
+
+    /// @notice Round 5 #1: a refund that would release escrow below the other records' reservations is parked, never
+    /// paid from their backing; it is paid once the backing is restored.
+    function test_r5_1_refundBelowOtherReservations_isParked() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 100, clientId);
+        address escrow = ics20.getEscrow(clientId);
+        vm.prank(escrow);
+        usdc.transfer(address(0xdead), 50); // an incident: escrow 150 for 200 outstanding
+        uint256 before = usdc.balanceOf(alice);
+        _timeout(a); // paying it would leave 50 for b's 100
+        assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Parked));
+        assertEq(usdc.balanceOf(alice), before);
+        _ack(b, bytes("{\"result\":\"AQ==\"}")); // b delivered: its backing is free
+        assertEq(ctl.claimParked(clientId, a.sequence), 100);
+        assertEq(usdc.balanceOf(alice), before + 100);
     }
 
     // ================================================================== #2 never spent by starving (proxies) ==

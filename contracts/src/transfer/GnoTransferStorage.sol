@@ -79,8 +79,9 @@ library GnoTransferStorage {
         uint64 head;
         uint64 tail;
         mapping(uint64 index => QueuedRefund) queue;
-        /// Escrow reserved for refunds owed (queued, parked or decided but unpaid) of an escrowed token: a receive
-        /// never releases escrow below it (ADR §7.12). A voucher's refund mints, so it reserves nothing.
+        /// Escrow reserved, for an escrowed token, for refunds owed (queued, parked or decided but unpaid) and for
+        /// outstanding sends, whose refund could still be owed: no receive or refund releases escrow below it (ADR
+        /// §7.12). A voucher's refund mints, so it reserves nothing.
         uint256 reserved;
     }
 
@@ -195,12 +196,25 @@ library GnoTransferStorage {
     }
 
     /// @notice Pays part or all of a record's refund: mints a burned voucher back into the escrow, then releases.
-    /// Returns false, having changed nothing, when the token or the escrow refuses (the mint is undone).
-    function tryPayRefund(IGnoICS20ControlsTypes.SendRecord storage rec, uint256 amount) internal returns (bool) {
+    /// Returns false, having changed nothing, when the token or the escrow refuses (the mint is undone), or when
+    /// releasing escrow would leave less than the route's other reservations (`own` is what this record holds of
+    /// `reserved` now): a refund never consumes the backing of another owed refund or outstanding send (§7.12).
+    function tryPayRefund(
+        IGnoICS20ControlsTypes.SendRecord storage rec,
+        uint256 amount,
+        bytes32 route,
+        uint256 own
+    )
+        internal
+        returns (bool)
+    {
         address token = rec.token;
         address escrow = rec.escrow;
         bool burned = rec.burned;
         bool ok;
+        if (!burned && IERC20(token).balanceOf(escrow) < amount + layout().tokens[route][token].reserved - own) {
+            return false;
+        }
         if (burned) {
             (ok,) = token.call(abi.encodeCall(IMintableAndBurnable.mint, (escrow, amount)));
             if (!ok) return false;
@@ -231,12 +245,17 @@ library GnoTransferStorage {
 
     // ---------------------------------------------------------------------------------------- reservations --
 
-    /// @notice The escrow a record's owed refund reserves: its unpaid remainder while queued or parked, for an
-    /// escrowed token.
+    /// @notice The escrow a record reserves, for an escrowed token: an owed refund's unpaid remainder (queued or
+    /// parked), or an outstanding send's whole amount (no ack or timeout yet, not settled), whose refund could still
+    /// be owed. A voucher's refund mints, so it reserves nothing.
     function reservation(IGnoICS20ControlsTypes.SendRecord storage rec) internal view returns (uint256) {
+        if (rec.burned) return 0;
         IGnoICS20ControlsTypes.Payment pay = rec.payment;
-        bool owed = pay == IGnoICS20ControlsTypes.Payment.Queued || pay == IGnoICS20ControlsTypes.Payment.Parked;
-        return owed && !rec.burned ? rec.amount - rec.refunded : 0;
+        if (pay == IGnoICS20ControlsTypes.Payment.Queued || pay == IGnoICS20ControlsTypes.Payment.Parked) {
+            return rec.amount - rec.refunded;
+        }
+        bool outstanding = rec.outcome == IGnoICS20ControlsTypes.Outcome.Pending && rec.settlement == 0;
+        return outstanding ? rec.amount : 0;
     }
 
     /// @notice Moves the route's reservation of the record's token from `before` to the record's reservation now.

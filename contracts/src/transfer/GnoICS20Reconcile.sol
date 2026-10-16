@@ -76,7 +76,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         got = rec.settlement == 1 ? remaining : LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
         if (got > remaining) got = remaining;
         if (got == 0) return 0;
-        require(GnoTransferStorage.tryPayRefund(rec, got), GnoRefundFailed(clientId, sequence));
+        require(GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore), GnoRefundFailed(clientId, sequence));
         if (rec.settlement != 1) LeakyBucket.charge(t.refunded, t.limits.refundCap, got, now_);
         emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
         if (got == remaining) {
@@ -136,7 +136,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 );
                 rec.settlement = 1;
                 if (left != 0) {
-                    if (GnoTransferStorage.tryPayRefund(rec, left)) {
+                    if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore)) {
                         rec.payment = Payment.Claimed;
                         emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
                         // the notification is due, never loaded here: anyone delivers it by retryNotification
@@ -295,6 +295,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         rec.amount = data.amount;
         rec.legacy = true;
         GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
+        GnoTransferStorage.syncReserve(GnoTransferStorage.routeHash(packet.sourceClient), rec, 0);
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
     }
 

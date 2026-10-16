@@ -156,8 +156,11 @@ contract GnoICS20TransferTest is ControlsFixture {
 
     function test_recv_returningNative_releasesWithinLimits() public {
         _usdcLimits(500e6, 1000e6, 1000e6);
-        _send(alice, address(usdc), 800e6, clientId);
+        IICS26RouterMsgs.Packet memory out = _send(alice, address(usdc), 800e6, clientId);
         assertEq(usdc.balanceOf(ics20.getEscrow(clientId)), 800e6);
+        // outstanding, the send's escrow is reserved: its refund could still be owed
+        assertTrue(_isErrorAck(_transferIn(clientId, _usdcDenomFromGno(), 1, bob)), "reserved");
+        _ack(out, bytes("{\"result\":\"AQ==\"}"));
         assertTrue(_isErrorAck(_transferIn(clientId, _usdcDenomFromGno(), 501e6, bob)), "over max");
         assertTrue(_isSuccessAck(_transferIn(clientId, _usdcDenomFromGno(), 500e6, bob)));
         assertEq(usdc.balanceOf(bob), 500e6);
