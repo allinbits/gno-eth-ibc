@@ -171,8 +171,9 @@ contract GnoICS20Controls is IGnoICS20Controls, ReentrancyGuardTransient, Access
         uint64 b = uint64(block.number);
         uint64 t = uint64(block.timestamp);
         uint64 grace = GnoTransferStorage.GRACE;
+        // refused under a hold of the route's flags; the refunds flags (any one holds refunds) are cleared alike
         cleared = Guardians.unpause(g.keys, r.flags, beforeBlock, b, t, grace)
-            + Guardians.unpause(g.keys, r.refundFlags, beforeBlock, b, t, grace);
+            + Guardians.clearBefore(g.keys, r.refundFlags, beforeBlock, b, t, grace);
         emit GnoRouteUnpaused(GnoTransferStorage.routeKey(clientId), beforeBlock, cleared);
     }
 

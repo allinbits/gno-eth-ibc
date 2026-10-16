@@ -377,6 +377,17 @@ contract GnoICS20TransferTest is ControlsFixture {
         ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber()) + 1);
     }
 
+    function test_unpauseRoute_clearsRefundsFlagsWhateverStands() public {
+        vm.prank(G[0]);
+        ctl.setRefundsFlag(clientId);
+        vm.prank(G[1]);
+        ctl.setRefundsFlag(clientId); // two guardian refunds flags: no hold of the route's own flags
+        _skip(12);
+        vm.prank(address(admin));
+        assertEq(ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber())), 2);
+        assertFalse(ctl.refundsHeld(clientId));
+    }
+
     /// @notice The refund meter never pays more than the bucket allows (cap + cap*t/day over t), and everything
     /// queued is paid in full once time and claims let it, in order.
     function testFuzz_refundMeter(uint256 seed) public {

@@ -234,8 +234,15 @@ contract IBCAdminExec is IIBCAdmin {
         Guardians.replace(l.g, pairs, uint64(block.number), uint64(block.timestamp), S.DAY);
         S.noteHoldEnd(l, hb, ht, db, dt);
         IGnoICS20Controls(ics20).setGuardianKeys(l.g.keys);
+        S.Recovery storage r = l.recovery;
         for (uint256 i = 0; i < pairs.length; i++) {
-            emit GuardiansSet(pairs[i].seat, pairs[i].key);
+            uint8 seat = pairs[i].seat;
+            // a new key never inherits the replaced key's recovery approval or cancel vote
+            if (seat < Guardians.SEATS) {
+                r.approved[seat] = bytes32(0);
+                r.cancels &= ~uint8(1 << seat);
+            }
+            emit GuardiansSet(seat, pairs[i].key);
         }
         return "";
     }

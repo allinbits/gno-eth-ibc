@@ -133,6 +133,22 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         _approve(2, _proposal("gnoland-8"));
     }
 
+    function test_replacedSeat_losesItsApproval() public {
+        IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-7");
+        _approve(0, p);
+        _approve(1, p);
+        address fresh = makeAddr("fresh guardian");
+        _recvGov(_env(admin.lastSeq() + 1, S.KIND_SEATS, P.seat1(1, fresh)));
+        _skip(7 days);
+        admin.execute(admin.lastSeq());
+        lc.setStatus(true, false);
+        _approve(2, p);
+        assertEq(_openedAt(), 0, "seat 1's approval left with its key");
+        vm.prank(fresh);
+        admin.approveRecovery(p);
+        assertTrue(_openedAt() != 0);
+    }
+
     function test_whileOpen_receivesBlocked_authorityKindsSuspended() public {
         uint64 seats = admin.lastSeq() + 1;
         _recvGov(_env(seats, S.KIND_SEATS, P.seat1(0, makeAddr("fresh"))));

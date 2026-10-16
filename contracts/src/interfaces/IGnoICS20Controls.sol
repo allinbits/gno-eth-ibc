@@ -110,7 +110,7 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function setLimits(string calldata clientId, address token, Limits calldata limits) external;
     function setQuarantine(string calldata clientId, uint64 quarantineSeconds) external;
     /// @notice Clears the route's flags and refunds flags set at a block before `beforeBlock`; refused under a hold
-    /// of the route (IGuardians.HoldStands).
+    /// of the route's flags (IGuardians.HoldStands).
     function unpauseRoute(string calldata clientId, uint64 beforeBlock) external returns (uint256 cleared);
     /// @notice Refuses (or allows again) every token receive on the route while an emergency recovery is open.
     function setRecoveryBlock(string calldata clientId, bool blocked) external;

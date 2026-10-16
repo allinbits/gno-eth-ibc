@@ -178,8 +178,27 @@ library Guardians {
     }
 
     /// @notice An unpause: clears every flag last set at a block before `beforeBlock`, refused while a hold stands.
-    /// Returns how many it cleared.
+    /// Returns how many standing flags it cleared.
     function unpause(
+        address[6] storage keys,
+        Flags storage f,
+        uint64 beforeBlock,
+        uint64 nowBlock,
+        uint64 nowTime,
+        uint64 grace
+    )
+        internal
+        returns (uint256)
+    {
+        settle(f, nowTime, grace);
+        (bool stands,,) = hold(keys, f, nowTime, grace);
+        if (stands) revert IGuardians.HoldStands();
+        return clearBefore(keys, f, beforeBlock, nowBlock, nowTime, grace);
+    }
+
+    /// @notice Clears every flag last set at a block before `beforeBlock`, whatever stands (for a flag set whose
+    /// holds mean nothing, like a route's refunds flags). Returns how many standing flags it cleared.
+    function clearBefore(
         address[6] storage keys,
         Flags storage f,
         uint64 beforeBlock,
@@ -191,8 +210,6 @@ library Guardians {
         returns (uint256 n)
     {
         settle(f, nowTime, grace);
-        (bool stands,,) = hold(keys, f, nowTime, grace);
-        if (stands) revert IGuardians.HoldStands();
         for (uint256 i = 0; i < KEYS; i++) {
             uint64 b = f.flagBlock[i];
             if (b != 0 && b < beforeBlock) {
