@@ -87,6 +87,7 @@ contract SenderAdapter is IIBCSenderCallbacks {
 
     function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external {
         while (burn) { } // burns all the gas it is given
+        require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
         notices++;
         if (!success) _forward();
@@ -94,6 +95,7 @@ contract SenderAdapter is IIBCSenderCallbacks {
 
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {
         while (burn) { }
+        require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
         notices++;
         _forward();

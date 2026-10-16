@@ -992,6 +992,43 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(usdc.balanceOf(bob), 600);
     }
 
+    /// @notice Round 4 #6: a contract sender whose packet was still outstanding at the replacement is refunded by
+    /// kind 12 with no ack or timeout, so no notification was ever held; anyone builds it from the authenticated
+    /// packet (`notifySettled`), delivered once, retried after a failure. The adapter takes callbacks only from the
+    /// transfer app and forwards the refund only on one.
+    function test_r4_6_outstandingPacketRefund_notifiesTheSender() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket(); // never acknowledged nor timed out
+        _retire();
+        _settle(_item(pkt.sequence, 1, 100));
+        assertEq(usdc.balanceOf(address(adapter)), 100);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence);
+        // a packet that is not the record's is refused
+        IICS26RouterMsgs.Packet memory other = _sentPacketCopy(pkt);
+        other.timeoutTimestamp += 1;
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(other);
+        adapter.setRefuse(true);
+        vm.prank(makeAddr("anyone"));
+        assertFalse(ctl.notifySettled(pkt));
+        adapter.setRefuse(false);
+        vm.prank(makeAddr("anyone"));
+        assertTrue(ctl.notifySettled(pkt));
+        assertEq(adapter.notices(), 1);
+        assertEq(usdc.balanceOf(bob), 100, "forwarded on the notification");
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt); // once
+    }
+
+    function _sentPacketCopy(IICS26RouterMsgs.Packet memory p) internal pure returns (IICS26RouterMsgs.Packet memory) {
+        return abi.decode(abi.encode(p), (IICS26RouterMsgs.Packet));
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

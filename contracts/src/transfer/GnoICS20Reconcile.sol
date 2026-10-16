@@ -5,6 +5,8 @@ import { ReentrancyGuardTransient } from "@openzeppelin-contracts/utils/Reentran
 import { AccessManagedUpgradeable } from "@openzeppelin-upgradeable/access/manager/AccessManagedUpgradeable.sol";
 
 import { IIBCStore } from "@eureka/interfaces/IIBCStore.sol";
+import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
+import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
@@ -251,6 +253,28 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         rec.legacy = true;
         GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function notifySettled(IICS26RouterMsgs.Packet calldata packet) external delegated nonReentrant returns (bool) {
+        SendRecord storage rec = _g().records[keccak256(bytes(packet.sourceClient))][packet.sequence];
+        require(
+            rec.commitment != bytes32(0) && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment
+                && rec.settlement == 1 && rec.payment == Payment.Claimed
+                && (rec.outcome == Outcome.Pending || rec.outcome == Outcome.Success),
+            GnoNoNotification(packet.sourceClient, packet.sequence)
+        );
+        return GnoTransferStorage.deliverSettled(
+            rec.sender,
+            abi.encodeCall(
+                IIBCSenderCallbacks.onTimeoutPacket,
+                (IIBCAppCallbacks.OnTimeoutPacketCallback(
+                        packet.sourceClient, packet.destClient, packet.sequence, packet.payloads[0], msg.sender
+                    ))
+            ),
+            packet.sourceClient,
+            packet.sequence
+        );
     }
 
     /// @notice See IGnoICS20Controls.

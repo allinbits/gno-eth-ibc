@@ -104,6 +104,8 @@ library GnoTransferStorage {
         /// Losses recorded by kind 12, per route and token, and the part of them kind 13 accepted as a deficit.
         mapping(bytes32 route => mapping(address token => uint256)) losses;
         mapping(bytes32 route => mapping(address token => uint256)) acceptedDeficit;
+        /// A reconciliation refund's notification (`notifySettled`, built from the authenticated packet) delivered.
+        mapping(bytes32 clientHash => mapping(uint64 sequence => bool)) settledNoticeDone;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))
@@ -296,6 +298,27 @@ library GnoTransferStorage {
         bytes32 h = keccak256(bytes(clientId));
         if (ok) layout().noticeDone[h][sequence] = true;
         else if (!stored) layout().notices[h][sequence] = call;
+        emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
+    }
+
+    /// @notice Delivers the notification of a refund kind 12 paid for a packet whose ack or timeout never brought one
+    /// (`notifySettled`): built from the authenticated packet, never stored, delivered once, retried by calling again.
+    function deliverSettled(
+        address sender,
+        bytes memory call,
+        string memory clientId,
+        uint64 sequence
+    )
+        internal
+        returns (bool ok)
+    {
+        bytes32 h = keccak256(bytes(clientId));
+        if (
+            layout().settledNoticeDone[h][sequence]
+                || !ERC165Checker.supportsInterface(sender, type(IIBCSenderCallbacks).interfaceId)
+        ) revert IGnoICS20ControlsTypes.GnoNoNotification(clientId, sequence);
+        if (gasleft() >= CALLBACK_GAS * 64 / 63 + CALLBACK_RESERVE) (ok,) = sender.call{ gas: CALLBACK_GAS }(call);
+        if (ok) layout().settledNoticeDone[h][sequence] = true;
         emit IGnoICS20ControlsTypes.GnoSenderNotified(clientId, sequence, ok);
     }
 

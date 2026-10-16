@@ -190,6 +190,12 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// success ack, or a refund paid in full). Permissionless; it only calls the sender, never pays. Returns whether
     /// the sender took it (if not, it stays kept).
     function retryNotification(string calldata clientId, uint64 sequence) external returns (bool);
+
+    /// @notice Permissionless: notifies the sender of a refund kind 12 paid (action 1, paid in full) for a packet
+    /// whose ack or timeout brought no refund notification (still outstanding, or a success ack). The packet is
+    /// authenticated against its send record's commitment; the notification is `onTimeoutPacket` (the packet was
+    /// not delivered), delivered once with capped gas; false if the sender reverted, and anyone calls again.
+    function notifySettled(IICS26RouterMsgs.Packet calldata packet) external returns (bool);
     /// @notice Makes the send record of a packet sent before the fork was installed, while the router still holds
     /// its commitment (which authenticates the packet). Permissionless.
     function backfill(IICS26RouterMsgs.Packet calldata packet) external;
