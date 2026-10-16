@@ -118,9 +118,22 @@ library GnoTransferStorage {
     }
 
     /// @notice Pays part or all of a record's refund: mints a burned voucher back into the escrow, then releases.
-    function payRefund(IGnoICS20ControlsTypes.SendRecord storage rec, uint256 amount) internal {
+    /// Returns false, having changed nothing, when the token or the escrow refuses (the mint is undone).
+    function tryPayRefund(IGnoICS20ControlsTypes.SendRecord storage rec, uint256 amount) internal returns (bool) {
+        address token = rec.token;
+        address escrow = rec.escrow;
+        bool burned = rec.burned;
+        bool ok;
+        if (burned) {
+            (ok,) = token.call(abi.encodeCall(IMintableAndBurnable.mint, (escrow, amount)));
+            if (!ok) return false;
+        }
+        (ok,) = escrow.call(abi.encodeCall(IEscrow.send, (IERC20(token), rec.sender, amount)));
+        if (!ok) {
+            if (burned) IMintableAndBurnable(token).burn(escrow, amount);
+            return false;
+        }
         rec.refunded += amount;
-        if (rec.burned) IMintableAndBurnable(rec.token).mint(rec.escrow, amount);
-        IEscrow(rec.escrow).send(IERC20(rec.token), rec.sender, amount);
+        return true;
     }
 }

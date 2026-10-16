@@ -64,20 +64,57 @@ contract GnoICS20Controls is IGnoICS20Controls, ReentrancyGuardTransient, Access
         require(!GnoTransferStorage.refundsHeld(route), GnoRefundsHeld(clientId));
         GnoTransferStorage.TokenControls storage t = g.tokens[route][token];
         if (maxCount > MAX_CLAIMS) maxCount = MAX_CLAIMS;
+        uint64 now_ = uint64(block.timestamp);
         while (paid < maxCount && t.head != t.tail) {
             GnoTransferStorage.QueuedRefund storage q = t.queue[t.head];
             SendRecord storage rec = g.records[keccak256(bytes(q.clientId))][q.sequence];
-            uint256 got = LeakyBucket.chargeUpTo(
-                t.refunded, t.limits.refundCap, rec.amount - rec.refunded, uint64(block.timestamp)
-            );
+            uint256 remaining = rec.amount - rec.refunded;
+            uint256 got = LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
+            if (got > remaining) got = remaining;
             if (got == 0) break;
-            GnoTransferStorage.payRefund(rec, got);
-            emit GnoRefundPaid(q.clientId, q.sequence, token, rec.sender, got);
-            if (rec.refunded != rec.amount) break; // an installment: the meter is empty
-            rec.payment = Payment.Claimed;
-            emit GnoOutcomeRecorded(q.clientId, q.sequence, rec.outcome, Payment.Claimed);
+            if (GnoTransferStorage.tryPayRefund(rec, got)) {
+                LeakyBucket.charge(t.refunded, t.limits.refundCap, got, now_);
+                emit GnoRefundPaid(q.clientId, q.sequence, token, rec.sender, got);
+                if (got != remaining) break; // an installment: the meter is empty
+                rec.payment = Payment.Claimed;
+            } else {
+                // a refund the token refuses waits apart, so the refunds behind it are paid
+                rec.payment = Payment.Parked;
+                emit GnoRefundParked(q.clientId, q.sequence, token, remaining);
+            }
+            emit GnoOutcomeRecorded(q.clientId, q.sequence, rec.outcome, rec.payment);
             delete t.queue[t.head++];
             ++paid;
+        }
+    }
+
+    /// @inheritdoc IGnoICS20Controls
+    function claimParked(
+        string calldata clientId,
+        uint64 sequence
+    )
+        external
+        delegated
+        nonReentrant
+        returns (uint256 got)
+    {
+        GnoTransferStorage.Layout storage g = _g();
+        SendRecord storage rec = g.records[keccak256(bytes(clientId))][sequence];
+        require(rec.payment == Payment.Parked, GnoNotParked(clientId, sequence));
+        bytes32 route = GnoTransferStorage.routeHash(clientId);
+        require(!GnoTransferStorage.refundsHeld(route), GnoRefundsHeld(clientId));
+        GnoTransferStorage.TokenControls storage t = g.tokens[route][rec.token];
+        uint64 now_ = uint64(block.timestamp);
+        uint256 remaining = rec.amount - rec.refunded;
+        got = LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
+        if (got > remaining) got = remaining;
+        if (got == 0) return 0;
+        require(GnoTransferStorage.tryPayRefund(rec, got), GnoRefundFailed(clientId, sequence));
+        LeakyBucket.charge(t.refunded, t.limits.refundCap, got, now_);
+        emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
+        if (got == remaining) {
+            rec.payment = Payment.Claimed;
+            emit GnoOutcomeRecorded(clientId, sequence, rec.outcome, Payment.Claimed);
         }
     }
 

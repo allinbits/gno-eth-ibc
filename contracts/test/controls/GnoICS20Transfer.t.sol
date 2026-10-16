@@ -19,6 +19,7 @@ import { GnoTransferStorage } from "../../src/transfer/GnoTransferStorage.sol";
 import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
 import { IBCAdminStorage } from "../../src/admin/IBCAdminStorage.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
+import { RefusingToken } from "../utils/RefusingToken.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
 /// @notice GnoICS20Transfer's controls through the real router: E5 receive limits and default deny, E7 route flags
@@ -386,6 +387,89 @@ contract GnoICS20TransferTest is ControlsFixture {
         vm.prank(address(admin));
         assertEq(ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber())), 2);
         assertFalse(ctl.refundsHeld(clientId));
+    }
+
+    function _refusing() internal returns (RefusingToken r) {
+        r = new RefusingToken();
+        r.mint(alice, 1000);
+        r.mint(bob, 1000);
+        vm.prank(alice);
+        r.approve(address(ics20), type(uint256).max);
+        vm.prank(bob);
+        r.approve(address(ics20), type(uint256).max);
+        _setLimits(address(r), 1000, 1000, 1000);
+    }
+
+    function test_refusedRefund_parked_neverBlocksTheAckOrOthers() public {
+        RefusingToken r = _refusing();
+        IICS26RouterMsgs.Packet memory pa = _send(alice, address(r), 100, clientId);
+        IICS26RouterMsgs.Packet memory pb = _send(bob, address(r), 100, clientId);
+        r.setBlocked(alice, true);
+        _errorAck(pa); // the token refuses alice: the ack still goes through, the refund is parked
+        assertEq(uint8(ctl.sendRecord(clientId, pa.sequence).payment), uint8(T.Payment.Parked));
+        _errorAck(pb);
+        assertEq(r.balanceOf(bob), 1000);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRefundFailed.selector, clientId, pa.sequence));
+        ctl.claimParked(clientId, pa.sequence);
+        r.setBlocked(alice, false);
+        assertEq(ctl.claimParked(clientId, pa.sequence), 100);
+        assertEq(r.balanceOf(alice), 1000);
+        assertEq(uint8(ctl.sendRecord(clientId, pa.sequence).payment), uint8(T.Payment.Claimed));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNotParked.selector, clientId, pa.sequence));
+        ctl.claimParked(clientId, pa.sequence);
+    }
+
+    function test_refusedQueuedRefund_parked_queueMovesOn() public {
+        RefusingToken r = _refusing();
+        _setLimits(address(r), 1000, 1000, 100);
+        IICS26RouterMsgs.Packet memory p0 = _send(bob, address(r), 100, clientId);
+        IICS26RouterMsgs.Packet memory pa = _send(alice, address(r), 100, clientId);
+        IICS26RouterMsgs.Packet memory pb = _send(bob, address(r), 100, clientId);
+        _errorAck(p0); // fills the meter
+        _errorAck(pa); // queued
+        _errorAck(pb); // queued behind alice
+        r.setBlocked(alice, true);
+        _skip(20 days);
+        assertEq(ctl.claim(clientId, address(r), 5), 2);
+        assertEq(uint8(ctl.sendRecord(clientId, pa.sequence).payment), uint8(T.Payment.Parked));
+        assertEq(r.balanceOf(bob), 1000);
+    }
+
+    function test_burnedVoucherRefund_parked_undoesTheMint() public {
+        _gnotIn(5e6, alice);
+        vm.prank(alice);
+        ugnot.approve(address(ics20), type(uint256).max);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(ugnot), 5e6, clientId);
+        // an escrow that refuses to pay: the voucher's re-mint is undone, the refund parked
+        vm.mockCallRevert(
+            ics20.getEscrow(clientId), abi.encodeWithSelector(bytes4(keccak256("send(address,address,uint256)"))), "no"
+        );
+        _errorAck(pkt);
+        assertEq(ugnot.totalSupply(), 0);
+        assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Parked));
+        vm.clearMockedCalls();
+        ctl.claimParked(clientId, pkt.sequence);
+        assertEq(ugnot.balanceOf(alice), 5e6);
+    }
+
+    function test_replacedKeys_leaveNoStaleRouteHold() public {
+        vm.prank(G[0]);
+        ctl.setRouteFlag(clientId);
+        vm.prank(G[1]);
+        ctl.setRouteFlag(clientId);
+        assertTrue(ctl.routeHold(clientId).blockNumber != 0);
+        address[6] memory keys = [G[0], makeAddr("fresh"), G[2], G[3], W[0], W[1]];
+        vm.prank(address(admin));
+        ctl.setGuardianKeys(keys); // G[1]'s flag retires with its key
+        assertEq(ctl.routeHold(clientId).blockNumber, 0);
+        // the next flag on the route finds the stale hold and ends it: no 24-hour dip with the old start
+        vm.prank(W[0]);
+        ctl.setRouteFlag(clientId);
+        assertEq(ctl.routeHold(clientId).blockNumber, 0);
+        _skip(12);
+        vm.prank(address(admin));
+        ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber()));
+        assertFalse(ctl.routePaused(clientId));
     }
 
     /// @notice The refund meter never pays more than the bucket allows (cap + cap*t/day over t), and everything

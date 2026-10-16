@@ -36,12 +36,14 @@ interface IGnoICS20ControlsTypes {
     }
 
     /// @notice The refund state of a send record: none owed, paid at once, queued under the refund meter or the
-    /// refunds hold, or paid in full by `claim`.
+    /// refunds hold, paid in full by `claim`, or parked: its payment reverted (a token that refuses the sender, a
+    /// paused token), so it waits apart and `claimParked` retries it, and no other refund waits behind it.
     enum Payment {
         None,
         Paid,
         Queued,
-        Claimed
+        Claimed,
+        Parked
     }
 
     /// @notice The per-packet send record (§7.13), keyed by (source client id, sequence). Written by every send
@@ -82,6 +84,8 @@ interface IGnoICS20ControlsTypes {
     error GnoRefundsHeld(string clientId);
     error GnoBadLimits();
     error GnoBadRoute();
+    error GnoNotParked(string clientId, uint64 sequence);
+    error GnoRefundFailed(string clientId, uint64 sequence);
 
     // ------------------------------------------------------------------------------------------------ events --
 
@@ -97,6 +101,7 @@ interface IGnoICS20ControlsTypes {
     event GnoOutcomeRecorded(string clientId, uint64 indexed sequence, Outcome outcome, Payment payment);
     event GnoRefundPaid(string clientId, uint64 indexed sequence, address token, address to, uint256 amount);
     event GnoRefundQueued(string clientId, uint64 indexed sequence, address token, uint256 amount);
+    event GnoRefundParked(string clientId, uint64 indexed sequence, address token, uint256 amount);
 }
 
 /// @title The functions of the controls (served by GnoICS20Controls through GnoICS20Transfer's fallback)
@@ -130,6 +135,10 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice Pays queued refunds of a route and token in order, as the refund meter allows (an installment when
     /// it allows part of one). Permissionless.
     function claim(string calldata clientId, address token, uint256 maxCount) external returns (uint256 paid);
+
+    /// @notice Retries a parked refund (as the refund meter allows, an installment if it allows part of it), under
+    /// no refunds hold. Permissionless; reverts if the payment still fails.
+    function claimParked(string calldata clientId, uint64 sequence) external returns (uint256 paid);
 
     // ------------------------------------------------------------------------------------------------- views --
 

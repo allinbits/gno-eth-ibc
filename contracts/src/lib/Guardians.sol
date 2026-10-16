@@ -122,9 +122,14 @@ library Guardians {
         return (false, 0, 0);
     }
 
-    /// @notice Brings the stored moments up to date before a change: a dip that reached the grace ended the hold.
-    function settle(Flags storage f, uint64 nowTime, uint64 grace) internal {
-        if (f.holdBlock != 0 && f.dipBlock != 0 && nowTime >= f.dipTime && nowTime - f.dipTime >= grace) {
+    /// @notice Brings the stored moments up to date before a change: a dip that reached the grace ended the hold,
+    /// and so did a hold left with fewer than two standing guardian flags and no dip (its keys were replaced on
+    /// another flag set's key list, which retires their flags without touching this set's moments).
+    function settle(address[6] storage keys, Flags storage f, uint64 nowTime, uint64 grace) internal {
+        if (f.holdBlock == 0) return;
+        if (f.dipBlock != 0) {
+            if (nowTime >= f.dipTime && nowTime - f.dipTime >= grace) _endHold(f);
+        } else if (guardianFlags(keys, f) < 2) {
             _endHold(f);
         }
     }
@@ -153,7 +158,7 @@ library Guardians {
     {
         i = position(keys, key);
         if (i == KEYS) revert IGuardians.UnknownKey();
-        settle(f, nowTime, grace);
+        settle(keys, f, nowTime, grace);
         (f.flagBlock[i], f.flagTime[i], f.flagKey[i]) = (nowBlock, nowTime, key);
         recompute(keys, f, nowBlock, nowTime);
     }
@@ -172,7 +177,7 @@ library Guardians {
     {
         i = position(keys, key);
         if (i == KEYS) revert IGuardians.UnknownKey();
-        settle(f, nowTime, grace);
+        settle(keys, f, nowTime, grace);
         (f.flagBlock[i], f.flagTime[i], f.flagKey[i]) = (0, 0, address(0));
         recompute(keys, f, nowBlock, nowTime);
     }
@@ -190,7 +195,7 @@ library Guardians {
         internal
         returns (uint256)
     {
-        settle(f, nowTime, grace);
+        settle(keys, f, nowTime, grace);
         (bool stands,,) = hold(keys, f, nowTime, grace);
         if (stands) revert IGuardians.HoldStands();
         return clearBefore(keys, f, beforeBlock, nowBlock, nowTime, grace);
@@ -209,7 +214,7 @@ library Guardians {
         internal
         returns (uint256 n)
     {
-        settle(f, nowTime, grace);
+        settle(keys, f, nowTime, grace);
         for (uint256 i = 0; i < KEYS; i++) {
             uint64 b = f.flagBlock[i];
             if (b != 0 && b < beforeBlock) {
@@ -270,7 +275,7 @@ library Guardians {
             }
         }
         Flags storage f = g.f;
-        settle(f, nowTime, grace);
+        settle(g.keys, f, nowTime, grace);
         bool clearedGuardian;
         for (uint256 p = 0; p < pairs.length; p++) {
             uint256 i = pairs[p].seat;

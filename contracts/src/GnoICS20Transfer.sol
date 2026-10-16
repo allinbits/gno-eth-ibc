@@ -480,7 +480,7 @@ contract GnoICS20Transfer is
             // receiving chain is source of the token, so we've received and mapped this token before
             erc20Address = address($._ibcERC20Contracts[routeDenom]);
             require(erc20Address != address(0), ICS20DenomNotFound(packetData.denom));
-            // GNO: the burned voucher is minted back when the refund is paid (`_payRefund`)
+            // GNO: the burned voucher is minted back when the refund is paid (`tryPayRefund`)
         } else {
             // the receiving chain is not the source of the token, so the token is either a native token
             // or we are a middle chain and the token was minted (and mapped) here.
@@ -775,7 +775,8 @@ contract GnoICS20Transfer is
 
     /// @notice Attaches an error ack or a timeout to the send record and pays the refund at once when the refund
     /// meter has room, no refunds hold stands and nothing is queued before it; otherwise queues it for `claim`
-    /// (§7.13). Never reverts for the meter or the hold: a refund is delayed, never refused.
+    /// (§7.13). Never reverts for the meter, the hold or a token refusing the payment (parked for `claimParked`): a
+    /// refund is delayed, never refused.
     function _settleRefund(
         string calldata clientId,
         uint64 sequence,
@@ -795,13 +796,20 @@ contract GnoICS20Transfer is
         }
         bytes32 route = GnoTransferStorage.routeHash(clientId);
         GnoTransferStorage.TokenControls storage t = _gno().tokens[route][token];
+        uint64 now_ = uint64(block.timestamp);
         if (
             t.head == t.tail && !GnoTransferStorage.refundsHeld(route)
-                && LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, uint64(block.timestamp))
+                && amount <= LeakyBucket.available(t.refunded, t.limits.refundCap, now_)
         ) {
-            GnoTransferStorage.payRefund(rec, amount);
-            rec.payment = Payment.Paid;
-            emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
+            // a payment the token refuses never blocks the acknowledgement: the refund is parked
+            if (GnoTransferStorage.tryPayRefund(rec, amount)) {
+                LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_);
+                rec.payment = Payment.Paid;
+                emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
+            } else {
+                rec.payment = Payment.Parked;
+                emit GnoRefundParked(clientId, sequence, token, amount);
+            }
         } else {
             t.queue[t.tail++] = GnoTransferStorage.QueuedRefund(clientId, sequence);
             rec.payment = Payment.Queued;

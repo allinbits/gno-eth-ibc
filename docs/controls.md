@@ -74,6 +74,7 @@ renounces `ADMIN_ROLE` at the end of `DeployGnoIBC`, which then runs `IBCAdmin.f
 | E6/§7.13 send record in every send variant after `sendPacket` returns the sequence | `_recordSend` (all three variants go through `_sendTransferFromEscrowWithSender`) |
 | §7.13 ack/timeout attach outcome, local processing block and payment state | `_processed`, `_recordOutcome`, `_settleRefund` |
 | §7.13 refund meter per (route, token), queue beyond it, permissionless `claim` (installments) | `_settleRefund`; `GnoICS20Controls.claim` |
+| a refund the token or escrow refuses (blacklisted sender, paused token) is parked, never blocking the ack or the queue; `claimParked` retries it | `GnoTransferStorage.tryPayRefund`; `claim`, `claimParked` |
 | §7.13 refunds hold suspends proof-based refunds and claims, cancels nothing | route `refundFlags`; `setRefundsFlag`/`clearRefundsFlag`; checked in `_settleRefund` and `claim` |
 | §7.3 a pause never blocks acks, timeouts or refunds; PAUSER_ROLE granted to nobody | `whenNotPaused` removed from the ack/timeout callbacks; deployment roles |
 | E7 4 guardian + 2 watch seats, flags, holds (two guardian flags), 24 h hold end, unpause clears earlier flags, refused under a hold | `Guardians`; per route in the fork, on IBCAdmin itself |
@@ -88,6 +89,8 @@ renounces `ADMIN_ROLE` at the end of `DeployGnoIBC`, which then runs `IBCAdmin.f
 | §7.4 unpause spent under a hold of its object | `IBCAdminExec._unpause` |
 | kind 3 at most 2 guardian seats, never a current key; both key copies follow | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule | `IBCAdminExec._loosens` |
+| an older decision maturing later never overwrites a newer setting (kinds 4 and 11) | `IBCAdminStorage.supersede` |
+| no one spends a decision by starving it of gas: recording and refusable calls run with a fixed budget and a floor | `IBCAdmin._atRecording`; `IBCAdminExec._call` (`RECORD_GAS`) |
 | kind 5 voucher registration, code-hash pinned, bound to the fork | `IBCAdminExec._voucher` |
 | kind 6 add (custom id) / migrate a client, code-hash pinned | `IBCAdminExec._client` |
 | kind 7 upgrades (router, transfer app, its two beacons), code-hash pinned, fixed call gas, after-checks | `IBCAdminExec._upgrade` |
@@ -138,6 +141,22 @@ renounces `ADMIN_ROLE` at the end of `DeployGnoIBC`, which then runs `IBCAdmin.f
 15. **Undecodable parameters are spent at recording** (all kinds are decoded then), not only at execution.
 16. **Kind 7's after-checks** read authority and bindings; a UUPS proxy's implementation slot is not readable
     on chain, so "implementation moved" is not checked for the router and the transfer app (it is for beacons).
+
+## Open issues
+
+- **Packets in flight on a retired client id.** A route replacement migrates the old id to `FrozenLightClient`, so
+  acks and timeouts of packets already sent on it can never be processed there. Their send records stay (outcome
+  `Pending`) for the governed reconciliation of ADR §7.12, which has no decision kind yet: paying those refunds today
+  needs a kind 7 upgrade of the transfer app first. A reconciliation-payment kind is future work.
+- **A newly added client starts unquarantined.** `quarantineEnd` is 0 until the client's first live transition, so a
+  client installed by kind 6, kind 10 or the emergency recovery receives at once. Governance can lengthen the
+  route's quarantine (kind 11, immediate) but a lengthening only applies to transitions; marking construction as a
+  transition would also quarantine the launch client.
+- **Parking under starvation.** A relayer giving an ack too little gas for the token transfer can make a refund be
+  parked instead of paid; it stays owed and `claimParked` pays it.
+- **The deployer cannot be the relayer** (`RELAYER_ADDRESS`): check 2 refuses any role left with the deployer.
+- `scripts/e2e-local.sh` was not run end to end (it needs the gno testnet); the deployment it runs was broadcast to a
+  local anvil and `finishSetup` passed.
 
 ## Tests
 
