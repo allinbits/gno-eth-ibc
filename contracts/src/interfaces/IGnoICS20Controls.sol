@@ -104,6 +104,8 @@ interface IGnoICS20ControlsTypes {
         /// replaced), when kind 12 refuses it and a new proof may replace it.
         Proven proven;
         address provenBy;
+        /// The route's verifier generation when it was proven: any re-pointing of the route's client since voids it.
+        uint64 provenGen;
     }
 
     /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.

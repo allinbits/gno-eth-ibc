@@ -55,6 +55,9 @@ library GnoTransferStorage {
         uint64 suspectFrom;
         uint64 suspectStart;
         uint64 suspectOpen;
+        /// Bumped whenever the route's client may be re-pointed (a verifier swap, a replacement): an outcome proven
+        /// under an earlier generation is void, even if the same client comes back.
+        uint64 verifierGen;
     }
 
     /// @notice A send record processed by an ack or timeout, at a block.

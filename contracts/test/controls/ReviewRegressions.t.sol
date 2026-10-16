@@ -33,7 +33,8 @@ import {
     SenderAdapter,
     ReentrantToken,
     BeaconSwappingFork,
-    AllowingExec
+    AllowingExec,
+    HookToken
 } from "../utils/ControlsMocks.sol";
 import { ICS26Router } from "@eureka/ICS26Router.sol";
 import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
@@ -1220,6 +1221,76 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.continueReopen(clientId, 16);
         assertFalse(ctl.routeReopening(clientId));
         assertTrue(ctl.routeClosed(clientId), "stays closed");
+    }
+
+    /// @notice Round 5 #5: the first refund's token freezes the verifier from its transfer hook; the batch, whose
+    /// second outcome was proven by that verifier, rolls back whole. A lone item whose own payment freezes it
+    /// rolls back too (checked after the last payment).
+    function test_r5_5_verifierFrozenByAPaymentHook_rollsTheBatchBack() public {
+        HookToken h = new HookToken();
+        h.mint(alice, 300);
+        vm.prank(alice);
+        h.approve(address(ics20), type(uint256).max);
+        _setLimits(address(h), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(h), 100, clientId);
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(h), 200, clientId);
+        _retire();
+        _proveRefundable(a);
+        _proveRefundable(b);
+        address lc9 = address(router.getClient("gnoland-9"));
+        bytes memory freeze = abi.encodeCall(MockLightClient.setStatus, (true, false));
+        T.SettleItem[] memory items = new T.SettleItem[](2);
+        items[0] = T.SettleItem(a.sequence, 1, 100);
+        items[1] = T.SettleItem(b.sequence, 1, 200);
+        h.setHook(alice, lc9, freeze);
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 1));
+        ctl.settleRecords(clientId, items);
+        h.setHook(alice, lc9, freeze);
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, type(uint256).max));
+        ctl.settleRecords(clientId, _item(a.sequence, 1, 100));
+        // through IBCAdmin: spent, nothing paid
+        h.setHook(alice, lc9, freeze);
+        uint64 seq = _decide(S.KIND_SETTLE, P.settle(clientId, _p(items)));
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.SPENT);
+        assertEq(h.balanceOf(alice), 0);
+        assertEq(ctl.openRecords(clientId), 2);
+    }
+
+    function _p(T.SettleItem[] memory items) internal pure returns (P.SettleItem[] memory out) {
+        out = new P.SettleItem[](items.length);
+        for (uint256 i = 0; i < items.length; i++) {
+            out[i] = P.SettleItem(items[i].sequence, items[i].action, items[i].amount);
+        }
+    }
+
+    /// @notice Round 5 sweep (a): an outcome is bound to its verifier and the route's verifier generation. A kind 6
+    /// swap to another client and back to the same one voids it; it is proven again through the active client.
+    function test_r5_5_verifierSwappedAndBack_voidsTheOutcome() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        _retire();
+        _proveRefundable(pkt);
+        address lc9 = address(router.getClient("gnoland-9"));
+        MockLightClient other = new MockLightClient();
+        uint64 away = _decide(
+            S.KIND_CLIENT, P.client(2, "gnoland-9", "ethereum-9", _prefix(), address(other), address(other).codehash)
+        );
+        uint64 back = _decide(S.KIND_CLIENT, P.client(2, "gnoland-9", "ethereum-9", _prefix(), lc9, lc9.codehash));
+        _skip(7 days);
+        admin.execute(away);
+        admin.execute(back);
+        assertEq(_state(back), S.EXECUTED);
+        assertEq(address(router.getClient("gnoland-9")), lc9, "the same verifier again");
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(pkt.sequence, 1, 100));
+        _proveRefundable(pkt); // void: proven again
+        _settle(_item(pkt.sequence, 1, 100));
+        assertEq(usdc.balanceOf(alice), 1_000_000e6);
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

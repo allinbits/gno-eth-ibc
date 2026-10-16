@@ -160,3 +160,29 @@ contract AllowingExec is IBCAdminExec {
         return proxy != address(0) && selector == IICS02Client.getClient.selector;
     }
 }
+
+/// @notice A token that runs one call when it next pays `hookOn` (a transfer hook a payment cannot stop).
+contract HookToken is ERC20 {
+    address public hookOn;
+    address public target;
+    bytes public data;
+
+    constructor() ERC20("Hook", "HOOK") { }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setHook(address on, address t, bytes calldata d) external {
+        (hookOn, target, data) = (on, t, d);
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        super._update(from, to, value);
+        if (to != address(0) && to == hookOn) {
+            hookOn = address(0);
+            (bool ok,) = target.call(data);
+            require(ok, "hook");
+        }
+    }
+}

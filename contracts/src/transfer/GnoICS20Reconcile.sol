@@ -106,8 +106,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         bytes32 route = GnoTransferStorage.routeHash(clientId);
         // sealed while a reopening accepts the deficits: the loss ledger it walks never changes behind it
         require(!g.routes[route].reopening, GnoRouteReopening(clientId));
-        // an outcome counts only while the client that proved it is still the route's active replacement
+        // an outcome counts only while the client that proved it is still the route's active replacement, under
+        // the same generation; checked again for every outcome consumed and after the last payment, since a
+        // payment runs token code that could freeze or swap it (any change rolls the whole batch back)
         address active = _activeClient(clientId);
+        uint64 gen = g.routes[route].verifierGen;
         for (uint256 i = 0; i < items.length; i++) {
             SettleItem calldata it = items[i];
             if (it.action == 5) {
@@ -117,7 +120,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             SendRecord storage rec = g.records[clientHash][it.sequence];
             // a record (authenticated: written by the send or backfilled), settled at most once
             require(
-                rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active,
+                rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active
+                    && rec.provenGen == gen && _activeClient(clientId) == active && g.routes[route].verifierGen == gen,
                 GnoBadSettlement(i)
             );
             // a record processed in the suspected compromise interval: one fewer to settle
@@ -178,6 +182,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             GnoTransferStorage.syncReserve(route, rec, reservedBefore);
             emit GnoSettled(clientId, it.sequence, action, it.amount);
         }
+        require(
+            _activeClient(clientId) == active && g.routes[route].verifierGen == gen, GnoBadSettlement(type(uint256).max)
+        );
     }
 
     /// @notice Kind 12 action 5: a forged receive at an inbound sequence of the retired client, whose release or
@@ -336,7 +343,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(
             address(lc) != address(0) && rec.commitment != bytes32(0)
                 && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && rec.settlement == 0
-                && (rec.proven == Proven.None || rec.provenBy != address(lc)),
+                && (rec.proven == Proven.None
+                    || rec.provenBy != address(lc)
+                    || rec.provenGen != g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen),
             GnoBadProof()
         );
         bytes memory receiptPath = ICS24Host.packetReceiptCommitmentPathCalldata(packet.destClient, packet.sequence);
@@ -383,6 +392,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         }
         rec.proven = proven;
         rec.provenBy = address(lc);
+        rec.provenGen = g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen;
         emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
     }
 

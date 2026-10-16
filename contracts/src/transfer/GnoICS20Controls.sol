@@ -325,7 +325,10 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function checkpointQuarantine(string calldata clientId) external delegated restricted {
-        _checkpoint(_route(clientId), clientId);
+        GnoTransferStorage.Route storage r = _route(clientId);
+        _checkpoint(r, clientId);
+        // called before every verifier swap: outcomes proven through the old verifier are void
+        ++r.verifierGen;
     }
 
     /// @notice Stores the deadline the route's current client's transitions set so far (each with the duration in
@@ -392,6 +395,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         g.retired[oldClientId] = true;
         // closed until its records are reconciled (kind 12) and it is reopened (kind 13)
         r.closed = true;
+        ++r.verifierGen;
         // the suspected compromise interval: every ack and timeout processed from `suspectFrom` on must be settled
         // by kind 12 before kind 13 (ADR §7.12); it never reaches below the records the previous reopening left
         // reconciled
