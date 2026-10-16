@@ -62,6 +62,8 @@ interface IGnoICS20ControlsTypes {
         uint64 timeoutTimestamp;
         uint64 sendBlock;
         uint64 processedBlock;
+        /// The record's index in its route's list of processed records (meaningful once `processedBlock` is set).
+        uint64 processedIndex;
         bool burned;
         Outcome outcome;
         Payment payment;

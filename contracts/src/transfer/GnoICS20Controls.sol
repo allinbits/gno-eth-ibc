@@ -178,10 +178,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         rec.outcome = outcome;
         rec.processedBlock = uint64(block.number);
         bytes32 route = GnoTransferStorage.routeHash(clientId);
-        g.routes[route].processed
-            .push(GnoTransferStorage.ProcessedRef(keccak256(bytes(clientId)), sequence, uint64(block.number)));
-        // processed while a replacement is being reconciled, inside its suspected interval: one more to settle
-        if (g.routes[route].closed && block.number >= g.routes[route].suspectFrom) ++g.routes[route].suspectOpen;
+        GnoTransferStorage.Route storage r = g.routes[route];
+        rec.processedIndex = uint64(r.processed.length);
+        r.processed.push(GnoTransferStorage.ProcessedRef(keccak256(bytes(clientId)), sequence, uint64(block.number)));
+        // processed while a replacement is being reconciled: inside its suspected interval, one more to settle
+        if (r.closed) ++r.suspectOpen;
         if (outcome == Outcome.Success) {
             GnoTransferStorage.closeRecord(rec, route);
             emit GnoOutcomeRecorded(clientId, sequence, outcome, rec.payment);
@@ -196,7 +197,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         uint64 now_ = uint64(block.timestamp);
         bool paid;
         if (
-            t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !g.routes[route].closed
+            t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !r.closed
                 && amount <= LeakyBucket.available(t.refunded, t.limits.refundCap, now_)
         ) {
             if (GnoTransferStorage.tryPayRefund(rec, amount)) {
@@ -389,12 +390,13 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         // closed until its records are reconciled (kind 12) and it is reopened (kind 13)
         r.closed = true;
         // the suspected compromise interval: every ack and timeout processed from `suspectFrom` on must be settled
-        // by kind 12 before kind 13 (ADR §7.12); it never reaches back past the previous replacement, whose own
-        // records were reconciled then
-        if (suspectFrom < r.replacedAt) suspectFrom = r.replacedAt;
-        r.replacedAt = uint64(block.number);
+        // by kind 12 before kind 13 (ADR §7.12); it never reaches below the records the previous reopening left
+        // reconciled
+        uint256 start = _firstProcessedAt(r.processed, suspectFrom);
+        if (start < r.processedFloor) start = r.processedFloor;
         r.suspectFrom = suspectFrom;
-        r.suspectOpen = uint64(r.processed.length - _firstProcessedAt(r.processed, suspectFrom));
+        r.suspectStart = uint64(start);
+        r.suspectOpen = uint64(r.processed.length - start);
         emit GnoRouteMigrated(oldClientId, newClientId, key);
     }
 

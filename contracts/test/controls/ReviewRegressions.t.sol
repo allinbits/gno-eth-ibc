@@ -874,6 +874,34 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertFalse(ctl.routeClosed(clientId));
     }
 
+    // ====================================================================================== round 4 ==
+
+    /// @notice Round 4 #3: a record processed in the block of the first replacement is reconciled by it; a second
+    /// replacement, whatever its `suspectFrom`, never counts it again (it could not be settled twice, so the route
+    /// could never reopen).
+    function test_r4_3_secondReplacement_skipsRecordsAlreadyReconciled() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 100, clientId);
+        _ack(pkt, bytes("{\"result\":\"AQ==\"}"));
+        address lc9 = address(new MockLightClient());
+        vm.startPrank(address(admin));
+        router.addClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), lc9);
+        ctl.migrateRoute(clientId, "gnoland-9", uint64(block.number)); // the same block as the ack
+        (, uint64 open) = ctl.suspectRecords(clientId);
+        assertEq(open, 1);
+        ctl.settleRecords(clientId, _item(pkt.sequence, 3, 0));
+        ctl.reopenRoute("gnoland-9");
+        assertFalse(ctl.routeClosed(clientId));
+        vm.roll(block.number + 1);
+        router.addClient("gnoland-8", IICS02ClientMsgs.CounterpartyInfo("ethereum-8", _prefix()), lc9);
+        ctl.migrateRoute("gnoland-9", "gnoland-8", 0);
+        (, open) = ctl.suspectRecords("gnoland-8");
+        assertEq(open, 0, "already reconciled");
+        ctl.reopenRoute("gnoland-8");
+        vm.stopPrank();
+        assertFalse(ctl.routeClosed(clientId));
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

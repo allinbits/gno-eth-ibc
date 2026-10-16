@@ -104,7 +104,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             // a record (authenticated: written by the send or backfilled), settled at most once
             require(rec.commitment != bytes32(0) && rec.settlement == 0, GnoBadSettlement(i));
             // a record processed in the suspected compromise interval: one fewer to settle
-            if (rec.processedBlock != 0 && rec.processedBlock >= g.routes[route].suspectFrom) {
+            if (rec.processedBlock != 0 && rec.processedIndex >= g.routes[route].suspectStart) {
                 --g.routes[route].suspectOpen;
             }
             uint8 action = it.action;
@@ -175,6 +175,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(r.suspectOpen == 0, GnoSuspectUnsettled(clientId, r.suspectOpen));
         r.reopening = true;
         r.deficitCursor = 0;
+        // every record processed so far is reconciled: a later replacement's interval starts above them
+        r.processedFloor = uint64(r.processed.length);
         _acceptDeficits(r, clientId, REOPEN_BATCH);
     }
 
