@@ -253,11 +253,15 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         emit GnoRouteMigrated(oldClientId, newClientId, key);
     }
 
-    /// @notice The route's light client and its latest live transition (zero when the router or the client cannot
-    /// tell: a client without the quarantine views has no transitions to keep).
+    /// @notice The route's current light client and its latest live transition (zero when the router or the client
+    /// cannot tell: a client without the quarantine views has no transitions to keep).
     function _lastTransition(string calldata clientId) private view returns (address lc, uint64 id, uint64 time) {
+        // the route's current client, whichever of its ids names it: a retired id's client is frozen
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        string memory current = _g().currentOf[key];
+        if (bytes(current).length == 0) current = key;
         (bool ok, bytes memory ret) =
-            GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (clientId)));
+            GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
         if (!ok || ret.length != 32) return (address(0), 0, 0);
         lc = abi.decode(ret, (address));
         (ok, ret) = lc.staticcall(abi.encodeCall(IGnoLightClientStatus.lastTransition, ()));

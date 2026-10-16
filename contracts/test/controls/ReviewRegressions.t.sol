@@ -340,6 +340,23 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(_isSuccessAck(_gnotIn(1, bob)));
     }
 
+    /// @notice Round 2 #6: a duration change named by a retired id reads the route's current client, so an active
+    /// quarantine of the new client keeps its deadline.
+    function test_r2_6_quarantineChangeThroughARetiredId() public {
+        MockLightClient lc9 = new MockLightClient();
+        vm.startPrank(address(admin));
+        router.addClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), address(lc9));
+        ctl.migrateRoute(clientId, "gnoland-9");
+        ctl.reopenRoute("gnoland-9");
+        vm.stopPrank();
+        lc9.setTransitionTime(uint64(_now()));
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
+        _setQ(0); // named by the retired id
+        assertTrue(_isErrorAck(_transferIn("gnoland-9", "ugnot", 1, bob)), "the started quarantine stands");
+        _skip(7 days);
+        assertTrue(_isSuccessAck(_transferIn("gnoland-9", "ugnot", 1, bob)));
+    }
+
     // ================================================================ #16, #18 port and envelope boundary ==
 
     function test_r18_envelope1024Recorded_1025Spent() public {
