@@ -577,6 +577,24 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(ctl.routePaused(clientId));
     }
 
+    /// @notice Round 3 #8: replacements C -> A -> B -> A executed in one block through IBCAdmin, A flagging the route
+    /// while it held the seat the first time: the flag stays dead.
+    function test_r3_8_sameBlockReturningKey_throughIBCAdmin() public {
+        address a = makeAddr("key A");
+        address b = makeAddr("key B");
+        uint64 s1 = _decide(S.KIND_SEATS, P.seat1(5, a));
+        uint64 s2 = _decide(S.KIND_SEATS, P.seat1(5, b));
+        uint64 s3 = _decide(S.KIND_SEATS, P.seat1(5, a));
+        _skip(7 days);
+        admin.execute(s1);
+        vm.prank(a);
+        ctl.setRouteFlag(clientId);
+        assertTrue(ctl.routePaused(clientId));
+        admin.execute(s2);
+        admin.execute(s3); // the same block: A holds the seat again
+        assertFalse(ctl.routePaused(clientId), "A's old flag stays dead");
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

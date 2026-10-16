@@ -266,7 +266,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     function _setKeys(address[6] calldata keys) private {
-        Guardians.setKeys(_g().keys, keys, uint64(block.number));
+        Guardians.setKeys(_g().keys, keys);
         emit GnoGuardianKeysSet(keys);
     }
 

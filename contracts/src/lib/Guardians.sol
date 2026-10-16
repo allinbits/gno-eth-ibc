@@ -32,6 +32,8 @@ library Guardians {
         uint64[6] flagBlock;
         uint64[6] flagTime;
         address[6] flagKey;
+        /// The seat's key generation when the flag was set (see Keys.gen).
+        uint64[6] flagGen;
         /// The object's hold: when its standing guardian flags reached two (block zero: none stands).
         uint64 holdBlock;
         uint64 holdTime;
@@ -40,12 +42,13 @@ library Guardians {
         uint64 dipTime;
     }
 
-    /// @notice The keys: seats 0-3 (guardians) then watch keys 4-5, and the block each seat's key was set at. A flag
-    /// stands only if the seat's current key set it at or after that block, so a key that is replaced and later put
-    /// back never revives its old flags.
+    /// @notice The keys: seats 0-3 (guardians) then watch keys 4-5, and each seat's key generation. A flag stands
+    /// only if the seat's current key set it in the current generation, so a key that is replaced and later put back
+    /// never revives its old flags, even within one block.
     struct Keys {
         address[6] keys;
-        uint64[6] since;
+        /// Each seat's key generation: raised by every change of the seat's key, never reused.
+        uint64[6] gen;
     }
 
     /// @notice The keys and one object's flags.
@@ -77,13 +80,13 @@ library Guardians {
     }
 
     /// @notice Replaces the whole key list (a copy kept by another object): every seat whose key changes starts a
-    /// new generation at `nowBlock`, retiring the old key's flags on every flag set over this list.
-    function setKeys(Keys storage keys, address[6] memory next, uint64 nowBlock) internal {
+    /// new generation, retiring the old key's flags on every flag set over this list.
+    function setKeys(Keys storage keys, address[6] memory next) internal {
         checkKeys(next);
         for (uint256 i = 0; i < KEYS; i++) {
             if (keys.keys[i] != next[i]) {
                 keys.keys[i] = next[i];
-                keys.since[i] = nowBlock;
+                ++keys.gen[i];
             }
         }
     }
@@ -105,7 +108,7 @@ library Guardians {
 
     /// @notice Whether seat i's flag stands: set, by the key that holds the seat now.
     function standing(Keys storage keys, Flags storage f, uint256 i) internal view returns (bool) {
-        return f.flagBlock[i] != 0 && f.flagKey[i] == keys.keys[i] && f.flagBlock[i] >= keys.since[i];
+        return f.flagBlock[i] != 0 && f.flagKey[i] == keys.keys[i] && f.flagGen[i] == keys.gen[i];
     }
 
     function anyFlag(Keys storage keys, Flags storage f) internal view returns (bool) {
@@ -178,7 +181,7 @@ library Guardians {
         i = position(keys, key);
         if (i == KEYS) revert IGuardians.UnknownKey();
         settle(keys, f, nowTime, grace);
-        (f.flagBlock[i], f.flagTime[i], f.flagKey[i]) = (nowBlock, nowTime, key);
+        (f.flagBlock[i], f.flagTime[i], f.flagKey[i], f.flagGen[i]) = (nowBlock, nowTime, key, keys.gen[i]);
         recompute(keys, f, nowBlock, nowTime);
     }
 
@@ -301,7 +304,7 @@ library Guardians {
             if (isGuardian(i) && standing(g.k, f, i)) clearedGuardian = true;
             (f.flagBlock[i], f.flagTime[i], f.flagKey[i]) = (0, 0, address(0));
             g.k.keys[i] = pairs[p].key;
-            g.k.since[i] = nowBlock;
+            ++g.k.gen[i];
         }
         // the 24-hour grace is for a holder's own clearing, never for GovDAO's replacement of the holders; a
         // replacement of nobody holding (a watch key, a seat whose flag is down) during a dip ends nothing
