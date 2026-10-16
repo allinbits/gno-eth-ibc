@@ -1408,6 +1408,58 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(_state(add), S.EXECUTED);
     }
 
+    /// @notice Kind 5 takes a gno.land base denom only in the exact form gno-realms' transfer app puts on the wire
+    /// (a native denom, or a GRC20 alias as `GRC20Alias` makes it: gno-realms' TestGRC20AliasRoundTrip aliases are
+    /// accepted); anything else is spent at recording.
+    function test_r5_kind5_canonicalGnoDenomOnly() public {
+        string[6] memory good = [
+            "ugnot",
+            "gno.land:r:demo:foo",
+            "gno.land:r:demo:foo.FOO",
+            "gno.land:r:demo:foo.Bar123",
+            "gno.land:r:nt:grc20_v0:tok.T-1_x",
+            "abcdefghijklmnop"
+        ];
+        for (uint256 i = 0; i < good.length; i++) {
+            assertTrue(S.canonicalGnoDenom(good[i]), good[i]);
+        }
+        string[18] memory bad = [
+            "",
+            "ug",
+            "Ugnot",
+            "u_gnot",
+            "1gnot",
+            "abcdefghijklmnopq",
+            "ibc/ABC123",
+            "transfer/client-0/ugnot",
+            "gno.land/r/demo/foo.FOO",
+            "gno.land:r:demo.FOO",
+            "gno.land:p:demo:foo.FOO",
+            "gno.land:r:demo:foo.",
+            "gno.land:r:Demo:foo.FOO",
+            "gno.land:r:demo::foo.FOO",
+            "gno.land:r:demo:foo.FO O",
+            "gno.land:r:demo:foo.FOO.x",
+            "gno.land:r:demo:foo.ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456",
+            "gno.land:r:demo:_foo.FOO"
+        ];
+        for (uint256 i = 0; i < bad.length; i++) {
+            assertFalse(S.canonicalGnoDenom(bad[i]), bad[i]);
+        }
+        for (uint256 i = 0; i < 3; i++) {
+            uint64 seq = admin.lastSeq() + 1;
+            bytes memory params = P.voucher(clientId, bad[i + 6], address(0x4444), bytes32(uint256(1)));
+            assertEq(_status(_recvGov(_env(seq, S.KIND_VOUCHER, params))), S.STATUS_SPENT, bad[i + 6]);
+        }
+        uint64 ok = admin.lastSeq() + 1;
+        assertEq(
+            _status(
+                _recvGov(_env(ok, S.KIND_VOUCHER, P.voucher(clientId, "gno.land:r:demo:foo.FOO", address(0x4444), 0)))
+            ),
+            S.STATUS_RECORDED
+        );
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {

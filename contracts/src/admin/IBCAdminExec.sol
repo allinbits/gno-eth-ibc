@@ -124,7 +124,7 @@ contract IBCAdminExec is IIBCAdmin {
         if (kind == S.KIND_VOUCHER) {
             (string memory clientId, string memory baseDenom, address voucher,) =
                 abi.decode(p, (string, string, address, bytes32));
-            bool ok = bytes(clientId).length != 0 && bytes(baseDenom).length != 0 && voucher != address(0);
+            bool ok = bytes(clientId).length != 0 && S.canonicalGnoDenom(baseDenom) && voucher != address(0);
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_CLIENT) {
@@ -332,6 +332,7 @@ contract IBCAdminExec is IIBCAdmin {
         (string memory clientId, string memory baseDenom, address voucher, bytes32 codeHash) =
             abi.decode(p, (string, string, address, bytes32));
         if (!_codeIs(voucher, codeHash)) return "codehash";
+        if (!S.canonicalGnoDenom(baseDenom)) return "denom";
         (bool ok, bytes memory ret) = voucher.staticcall(abi.encodeCall(IVoucherLike.ics20, ()));
         if (!ok || ret.length != 32 || abi.decode(ret, (address)) != ics20) return "voucher";
         string memory denom = string.concat(ICS20Lib.DEFAULT_PORT_ID, "/", clientId, "/", baseDenom);
