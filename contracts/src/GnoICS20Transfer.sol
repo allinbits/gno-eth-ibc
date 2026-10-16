@@ -98,6 +98,7 @@ contract GnoICS20Transfer is
     // natlint-disable-next-line MissingNotice
     /// GNO: takes the GnoICS20Controls the fallback serves.
     constructor(address controls) {
+        require(controls.code.length != 0, GnoBadModule());
         _disableInitializers();
         CONTROLS = controls;
     }

@@ -1354,10 +1354,23 @@ contract ReviewRegressionsTest is ControlsFixture {
         address controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile())));
         address older = address(new OlderFork(controls));
         address fork = address(new GnoICS20Transfer(controls));
+        vm.expectRevert(T.GnoBadModule.selector);
+        new GnoICS20Transfer(address(0));
+        vm.expectRevert(T.GnoBadModule.selector);
+        new GnoICS20Controls(address(0));
+        // round 6 #2: a fork whose controls, or whose controls' reconciliation module, is not a module of its version
+        address noControls = address(new GnoICS20Transfer(address(usdc)));
+        address noReconcile = address(new GnoICS20Transfer(address(new GnoICS20Controls(address(usdc)))));
+        uint64 toNoControls = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), noControls, noControls.codehash, ""));
+        uint64 toNoReconcile = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), noReconcile, noReconcile.codehash, ""));
         uint64 toStock = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), stock, stock.codehash, ""));
         uint64 toOlder = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), older, older.codehash, ""));
         uint64 toFork = _decide(S.KIND_UPGRADE, P.upgrade(address(ics20), fork, fork.codehash, ""));
         _skip(7 days);
+        admin.execute(toNoControls);
+        admin.execute(toNoReconcile);
+        assertEq(_state(toNoControls), S.SPENT, "missing controls");
+        assertEq(_state(toNoReconcile), S.SPENT, "missing reconciliation");
         admin.execute(toStock);
         admin.execute(toOlder);
         assertEq(_state(toStock), S.SPENT);

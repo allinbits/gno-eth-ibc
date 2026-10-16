@@ -35,8 +35,14 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     error NotDelegated();
 
     constructor(address reconcile) {
+        require(reconcile.code.length != 0, GnoBadModule());
         _self = address(this);
         RECONCILE = reconcile;
+    }
+
+    /// @notice The controls version this module implements (kind 7 checks it on the module and through the proxy).
+    function gnoControlsModuleVersion() external pure returns (uint256) {
+        return 1;
     }
 
     /// @notice Serves the reconciliation functions (claimParked, settleRecords, reopenRoute, backfill) from

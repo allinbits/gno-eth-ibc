@@ -129,6 +129,7 @@ interface IGnoICS20ControlsTypes {
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
     error GnoBadProof();
+    error GnoBadModule();
     error GnoRouteReopening(string clientId);
     error GnoRecordsOpen(string clientId, uint64 open);
     error GnoSuspectUnsettled(string clientId, uint64 open);

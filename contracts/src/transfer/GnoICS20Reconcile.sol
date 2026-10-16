@@ -34,6 +34,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         _self = address(this);
     }
 
+    /// @notice The controls version this module implements (kind 7 checks it on the module and through the proxy).
+    function gnoReconcileModuleVersion() external pure returns (uint256) {
+        return 1;
+    }
+
     modifier delegated() {
         if (address(this) == _self) revert NotDelegated();
         _;
