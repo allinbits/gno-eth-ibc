@@ -106,7 +106,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     }
                     rec.payment = Payment.Claimed;
                     GnoTransferStorage.closeRecord(rec, route);
-                    GnoTransferStorage.releaseNotice(rec, q.clientId, q.sequence);
+                    GnoTransferStorage.releaseNotice(q.clientId, q.sequence);
                 } else if (got != 0) {
                     // a refund the token refuses waits apart, so the refunds behind it are paid
                     rec.payment = Payment.Parked;

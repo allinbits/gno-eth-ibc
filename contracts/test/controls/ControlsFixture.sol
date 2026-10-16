@@ -13,6 +13,8 @@ import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
+import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
+import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 
 import { DeployGnoIBC } from "../../script/DeployGnoIBC.s.sol";
@@ -239,6 +241,34 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
                 timeoutTimestamp: uint64(_now() + 1 hours),
                 memo: ""
             })
+        );
+    }
+
+    /// @notice The notification the router's error ack carried to the sender (this test is the relayer).
+    function _errorNotice(IICS26RouterMsgs.Packet memory pkt) internal view returns (bytes memory) {
+        return abi.encodeCall(
+            IIBCSenderCallbacks.onAckPacket,
+            (
+                false,
+                IIBCAppCallbacks.OnAcknowledgementPacketCallback(
+                    pkt.sourceClient,
+                    pkt.destClient,
+                    pkt.sequence,
+                    pkt.payloads[0],
+                    ICS24Host.UNIVERSAL_ERROR_ACK,
+                    address(this)
+                )
+            )
+        );
+    }
+
+    /// @notice The notification the router's timeout carried to the sender (this test is the relayer).
+    function _timeoutNotice(IICS26RouterMsgs.Packet memory pkt) internal view returns (bytes memory) {
+        return abi.encodeCall(
+            IIBCSenderCallbacks.onTimeoutPacket,
+            (IIBCAppCallbacks.OnTimeoutPacketCallback(
+                    pkt.sourceClient, pkt.destClient, pkt.sequence, pkt.payloads[0], address(this)
+                ))
         );
     }
 

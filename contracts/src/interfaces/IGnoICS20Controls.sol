@@ -178,8 +178,8 @@ interface IGnoICS20ControlsTypes {
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).
     event GnoSenderNotified(string clientId, uint64 indexed sequence, bool ok);
-    /// @notice A refund paid by reconciliation (kind 12): its sender's notification is due, delivered by
-    /// `retryNotification` (a settlement never loads it).
+    /// @notice A refund paid by a claim or by kind 12: its sender's held notification is due, delivered by
+    /// `retryNotification` (only its hash is stored).
     event GnoNotificationDue(string clientId, uint64 indexed sequence);
 }
 
@@ -221,10 +221,12 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// 4 forged refund: reject the unpaid remainder and record what was already paid as a loss (`amount` must equal
     /// what was paid). All or nothing.
     function settleRecords(string calldata clientId, SettleItem[] calldata items) external;
-    /// @notice Delivers a sender notification kept after it failed, once its outcome is final for the sender (a
-    /// success ack, or a refund paid in full). Permissionless; it only calls the sender, never pays. Returns whether
-    /// the sender took it (if not, it stays kept).
-    function retryNotification(string calldata clientId, uint64 sequence) external returns (bool);
+    /// @notice Delivers a sender notification held or kept after it failed, once its outcome is final for the sender
+    /// (a success ack, or a refund paid in full). Only its hash is stored: `call` is the IIBCSenderCallbacks calldata
+    /// the router's callback carried (`onAckPacket(success, msg)` or `onTimeoutPacket(msg)`, the router's message
+    /// with the relayer of that ack or timeout), authenticated against it. Permissionless; it only calls the sender,
+    /// never pays. Returns whether the sender took it (if not, it stays kept).
+    function retryNotification(string calldata clientId, uint64 sequence, bytes calldata call) external returns (bool);
 
     /// @notice Permissionless: notifies the sender of a refund kind 12 paid (action 1, paid in full) for a packet
     /// whose ack or timeout brought no refund notification (still outstanding, or a success ack). The packet is

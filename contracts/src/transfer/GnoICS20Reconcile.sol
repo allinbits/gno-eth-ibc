@@ -83,7 +83,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             rec.payment = Payment.Claimed;
             GnoTransferStorage.closeRecord(rec, route);
             emit GnoOutcomeRecorded(clientId, sequence, rec.outcome, Payment.Claimed);
-            GnoTransferStorage.releaseNotice(rec, clientId, sequence);
+            GnoTransferStorage.releaseNotice(clientId, sequence);
         }
         GnoTransferStorage.syncReserve(route, rec, reservedBefore);
     }
@@ -145,8 +145,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                     if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore)) {
                         rec.payment = Payment.Claimed;
                         emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
-                        // the notification is due, never loaded here: anyone delivers it by retryNotification
-                        emit GnoNotificationDue(clientId, it.sequence);
+                        // the notification is due: anyone delivers it by retryNotification
+                        GnoTransferStorage.releaseNotice(clientId, it.sequence);
                     } else {
                         rec.payment = Payment.Parked;
                         emit GnoRefundParked(clientId, it.sequence, rec.token, left);
@@ -441,13 +441,17 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     }
 
     /// @notice See IGnoICS20Controls.
-    function retryNotification(string calldata clientId, uint64 sequence)
+    function retryNotification(
+        string calldata clientId,
+        uint64 sequence,
+        bytes calldata call
+    )
         external
         delegated
         nonReentrant
         returns (bool)
     {
         SendRecord storage rec = _g().records[keccak256(bytes(clientId))][sequence];
-        return GnoTransferStorage.retryNotice(rec, clientId, sequence);
+        return GnoTransferStorage.retryNotice(rec, clientId, sequence, call);
     }
 }
