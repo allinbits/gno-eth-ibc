@@ -50,6 +50,12 @@ library GnoTransferStorage {
         /// open only when all are (docs/controls.md, the reconciliation state machine).
         IGnoICS20ControlsTypes.Incident[] incidents;
         uint64 resolvedUpTo;
+        /// Incidents below it (from `resolvedUpTo`) are reopening: kind 13 under way. Statuses are derived from the
+        /// two bounds, so no transition walks the incidents.
+        uint64 reopenUpTo;
+        /// Unresolved replacement incidents whose client still has an open or unsettled suspect record: kind 13
+        /// waits for zero (kept by every change of those counts, so no transition walks the incidents).
+        uint64 pendingIncidents;
     }
 
     /// @notice Incident kinds and statuses.
@@ -68,6 +74,7 @@ library GnoTransferStorage {
         uint32 incident;
         uint64 suspectStart;
         uint64 suspectOpen;
+        bytes32 route;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.
@@ -264,33 +271,52 @@ library GnoTransferStorage {
     /// @notice A record of client `clientHash` now open (written by a send or a backfill).
     function openRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 clientHash) internal {
         rec.open = true;
-        ++layout().clients[clientHash].open;
+        ClientRecon storage c = layout().clients[clientHash];
+        bool had = hasWork(c);
+        ++c.open;
+        noteWork(c, had);
     }
 
     /// @notice A record closed: its packet acknowledged with success, its refund paid in full, or settled by kind 12.
     function closeRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 clientHash) internal {
         if (!rec.open) return;
         rec.open = false;
-        --layout().clients[clientHash].open;
+        ClientRecon storage c = layout().clients[clientHash];
+        bool had = hasWork(c);
+        --c.open;
+        noteWork(c, had);
     }
 
     // ---------------------------------------------------------------------------------------------- incidents --
 
-    /// @notice Whether an incident's reconciliation is complete: a replacement's client has no open and no
-    /// unsettled suspect record; a late loss always is (it needs only its losses accepted).
-    function incidentSettled(IGnoICS20ControlsTypes.Incident storage inc) internal view returns (bool) {
-        if (inc.kind == LATE_LOSS) return true;
-        ClientRecon storage c = layout().clients[inc.client];
-        return c.open == 0 && c.suspectOpen == 0;
+    /// @notice Whether a client id still has reconciliation work: an open record or an unsettled suspect one.
+    function hasWork(ClientRecon storage c) internal view returns (bool) {
+        return c.open != 0 || c.suspectOpen != 0;
     }
 
-    /// @notice Aborts a reopening under way: its incidents back to open, the route stays closed.
+    /// @notice Keeps its route's pending-incident count after a change of a retired client's work (`had` before):
+    /// constant work, only for an unresolved incident.
+    function noteWork(ClientRecon storage c, bool had) internal {
+        if (c.incident == 0) return;
+        bool has = hasWork(c);
+        if (had == has) return;
+        Route storage r = layout().routes[c.route];
+        if (c.incident - 1 < r.resolvedUpTo) return;
+        if (has) ++r.pendingIncidents;
+        else --r.pendingIncidents;
+    }
+
+    /// @notice An incident's status, from the route's two bounds.
+    function incidentStatus(Route storage r, uint256 i) internal view returns (uint8) {
+        if (i < r.resolvedUpTo) return RESOLVED;
+        return i < r.reopenUpTo ? REOPENING : OPEN;
+    }
+
+    /// @notice Aborts a reopening under way (constant work): its incidents open again, the route stays closed.
     function abortReopening(Route storage r, string memory key) internal {
         if (!r.reopening) return;
         r.reopening = false;
-        for (uint256 i = r.resolvedUpTo; i < r.incidents.length; i++) {
-            if (r.incidents[i].status == REOPENING) r.incidents[i].status = OPEN;
-        }
+        r.reopenUpTo = r.resolvedUpTo;
         emit IGnoICS20ControlsTypes.GnoReopenAborted(key);
     }
 

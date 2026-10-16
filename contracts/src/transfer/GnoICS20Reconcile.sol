@@ -132,7 +132,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         // sealed while its incident reopens: the records kind 13 found settled never change behind it
         uint32 inc = g.clients[clientHash].incident;
         require(
-            inc != 0 && g.routes[route].incidents[inc - 1].status != GnoTransferStorage.REOPENING,
+            inc != 0 && GnoTransferStorage.incidentStatus(g.routes[route], inc - 1) != GnoTransferStorage.REOPENING,
             GnoRouteReopening(clientId)
         );
         // an outcome counts only while the client that proved it is still the route's active replacement, under
@@ -173,7 +173,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         );
         // a record processed in the suspected compromise interval: one fewer to settle
         GnoTransferStorage.ClientRecon storage c = g.clients[clientHash];
-        if (rec.processedBlock != 0 && rec.processedIndex >= c.suspectStart) --c.suspectOpen;
+        if (rec.processedBlock != 0 && rec.processedIndex >= c.suspectStart) {
+            bool had = GnoTransferStorage.hasWork(c);
+            --c.suspectOpen;
+            GnoTransferStorage.noteWork(c, had);
+        }
         uint8 action = it.action;
         bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
@@ -292,18 +296,12 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     function reopenRoute(string calldata clientId) external delegated restricted nonReentrant {
         GnoTransferStorage.Route storage r = _route(clientId);
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
-        // every unresolved incident settled: its client's records reconciled (no outstanding packet, no refund owed,
-        // no unsettled suspect record); a late loss needs only its loss accepted
-        for (uint256 i = r.resolvedUpTo; i < r.incidents.length; i++) {
-            Incident storage inc = r.incidents[i];
-            if (inc.kind == GnoTransferStorage.REPLACEMENT) {
-                GnoTransferStorage.ClientRecon storage c = _g().clients[inc.client];
-                require(c.open == 0, GnoRecordsOpen(clientId, c.open));
-                require(c.suspectOpen == 0, GnoSuspectUnsettled(clientId, c.suspectOpen));
-            }
-            inc.status = GnoTransferStorage.REOPENING;
-        }
+        // every unresolved incident settled (constant work: the count is kept as records settle): its client's
+        // records reconciled (no outstanding packet, no refund owed, no unsettled suspect record); a late loss needs
+        // only its loss accepted
+        require(r.pendingIncidents == 0, GnoIncidentsPending(clientId, r.pendingIncidents));
         r.reopening = true;
+        r.reopenUpTo = uint64(r.incidents.length);
         r.deficitCursor = 0;
         _acceptDeficits(r, clientId, REOPEN_BATCH);
     }
@@ -335,17 +333,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         r.deficitCursor = uint64(i);
         if (i == r.lossTokens.length) {
             // every reopening incident again before the route opens: nothing opened or became suspect meanwhile
-            uint256 n = r.incidents.length;
-            for (uint256 k = r.resolvedUpTo; k < n; k++) {
-                if (!GnoTransferStorage.incidentSettled(r.incidents[k])) {
-                    GnoTransferStorage.abortReopening(r, key);
-                    return;
-                }
+            if (r.pendingIncidents != 0) {
+                GnoTransferStorage.abortReopening(r, key);
+                return;
             }
-            for (uint256 k = r.resolvedUpTo; k < n; k++) {
-                r.incidents[k].status = GnoTransferStorage.RESOLVED;
-            }
-            r.resolvedUpTo = uint64(n);
+            r.resolvedUpTo = r.reopenUpTo;
             r.reopening = false;
             r.closed = false;
             emit GnoRouteReopened(key);

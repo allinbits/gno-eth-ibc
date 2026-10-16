@@ -194,7 +194,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         c.processed.push(uint64(block.number));
         // processed on a retired client (its incident's reconciliation under way): one more suspect record; the live
         // client's never count
-        if (c.incident != 0) ++c.suspectOpen;
+        if (c.incident != 0) {
+            bool had = GnoTransferStorage.hasWork(c);
+            ++c.suspectOpen;
+            GnoTransferStorage.noteWork(c, had);
+        }
         if (outcome == Outcome.Success) {
             GnoTransferStorage.closeRecord(rec, clientHash);
             GnoTransferStorage.syncReserve(route, rec, reservedBefore);
@@ -422,8 +426,10 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         GnoTransferStorage.ClientRecon storage c = g.clients[oldHash];
         uint256 start = _firstProcessedAt(c.processed, suspectFrom);
         c.incident = uint32(r.incidents.length);
+        c.route = keccak256(bytes(key));
         c.suspectStart = uint64(start);
         c.suspectOpen = uint64(c.processed.length - start);
+        if (GnoTransferStorage.hasWork(c)) ++r.pendingIncidents;
         emit GnoRouteMigrated(oldClientId, newClientId, key);
     }
 

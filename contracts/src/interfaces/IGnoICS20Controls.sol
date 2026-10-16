@@ -145,6 +145,8 @@ interface IGnoICS20ControlsTypes {
     /// @notice Less gas left than a caller-funded notification's budget and reserve.
     error GnoNotificationStarved();
     error GnoRouteReopening(string clientId);
+    /// @notice Kind 13 waits: `pending` unresolved incidents still have an open or unsettled suspect record.
+    error GnoIncidentsPending(string clientId, uint64 pending);
     error GnoRecordsOpen(string clientId, uint64 open);
     error GnoSuspectUnsettled(string clientId, uint64 open);
     error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
@@ -331,8 +333,12 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).
     function openRecords(string calldata clientId) external view returns (uint64);
 
-    /// @notice The incidents of `clientId`'s route, and how many of them (from the first) are resolved.
-    function incidents(string calldata clientId) external view returns (Incident[] memory, uint64 resolvedUpTo);
+    /// @notice The incidents of `clientId`'s route (statuses derived), how many of them (from the first) are
+    /// resolved, and how many unresolved ones kind 13 still waits for.
+    function incidents(string calldata clientId)
+        external
+        view
+        returns (Incident[] memory, uint64 resolvedUpTo, uint64 pending);
 
     /// @notice A client id's reconciliation counters: open records, the incident covering it (1-based, 0 while
     /// live), its first suspect index and suspect count, and how many acks and timeouts it processed.

@@ -137,7 +137,7 @@ contract ReconcileHandler is Test {
         if (done[i]) return;
         MockLightClient c = MockLightClient(address(router.getClient(packets[i].sourceClient)));
         try c.setTimestamp(packets[i].timeoutTimestamp) { }
-            catch {
+        catch {
             return;
         }
         try router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(packets[i], "", IICS02ClientMsgs.Height(0, 1))) {
@@ -386,7 +386,19 @@ contract ReconcileInvariantsTest is ControlsFixture {
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 100
     function invariant_openOnlyWhenResolved_lossesAccepted() public view {
-        (T.Incident[] memory inc, uint64 resolved) = ctl.incidents(clientId);
+        (T.Incident[] memory inc, uint64 resolved, uint64 pending) = ctl.incidents(clientId);
+        // the pending count kind 13 reads equals a recomputation: unresolved replacements with work left
+        uint64 p;
+        for (uint256 i = resolved; i < inc.length; i++) {
+            if (inc[i].kind != 1) continue;
+            for (uint256 k = 0; k < h.clientCount(); k++) {
+                string memory c = h.clients(k);
+                if (keccak256(bytes(c)) != inc[i].client) continue;
+                (uint64 open,,, uint64 suspect,) = ctl.clientRecon(c);
+                if (open != 0 || suspect != 0) p++;
+            }
+        }
+        assertEq(pending, p, "pending incidents");
         if (!ctl.routeClosed(clientId)) {
             assertEq(resolved, inc.length, "every incident resolved");
             assertEq(ctl.losses(clientId, address(usdc)), ctl.acceptedDeficit(clientId, address(usdc)));

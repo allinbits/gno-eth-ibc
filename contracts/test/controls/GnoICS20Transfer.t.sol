@@ -599,7 +599,7 @@ contract GnoICS20TransferTest is ControlsFixture {
         // reopening waits for every record of the retired id: the packet still in flight is open
         assertEq(ctl.openRecords(clientId), 1);
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, "gnoland-9", 1));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, "gnoland-9", 1));
         ctl.reopenRoute("gnoland-9");
         _proveDelivered(out);
         T.SettleItem[] memory items = new T.SettleItem[](1);

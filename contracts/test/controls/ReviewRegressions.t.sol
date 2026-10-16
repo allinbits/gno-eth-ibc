@@ -235,11 +235,11 @@ contract ReviewRegressionsTest is ControlsFixture {
         _proveDelivered(inFlight);
         assertEq(ctl.openRecords(clientId), 2);
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, clientId, 2));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, clientId, 1));
         ctl.reopenRoute(clientId);
         _settle(_item(forged.sequence, 4, 10)); // the forged refund: 10 lost
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoRecordsOpen.selector, clientId, 1));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, clientId, 1));
         ctl.reopenRoute(clientId);
         _settle(_item(inFlight.sequence, 3, 0));
         vm.expectEmit(true, true, false, true, address(ics20));
@@ -904,7 +904,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _proveDelivered(forgedRefund);
         _proveRefundable(genuine);
         vm.startPrank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-2", 3));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, "gnoland-2", 1));
         ctl.reopenRoute("gnoland-2");
         // only the route's current client is replaced (a replacement while closed is test_r7_1_…)
         vm.expectRevert(T.GnoBadRoute.selector);
@@ -917,7 +917,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.settleRecords(clientId, _item(forgedOk.sequence, 1, 100)); // refunded now
         assertEq(usdc.balanceOf(alice), paid + 100);
         ctl.settleRecords(clientId, _item(forgedRefund.sequence, 4, 100)); // the paid loss, booked
-        vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-2", 1));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, "gnoland-2", 1));
         ctl.reopenRoute("gnoland-2");
         ctl.settleRecords(clientId, _item(genuine.sequence, 1, 0)); // already paid in full
         (, open) = ctl.suspectRecords(clientId);
@@ -1860,7 +1860,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         (, uint64 open) = ctl.suspectRecords("gnoland-9");
         assertEq(open, 1);
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoSuspectUnsettled.selector, "gnoland-8", 1));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, "gnoland-8", 1));
         ctl.reopenRoute("gnoland-8");
         _proveRefundable(b);
         vm.startPrank(address(admin));
@@ -1892,6 +1892,56 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.prank(address(admin));
         ctl.reopenRoute("gnoland-9");
         assertFalse(ctl.routeClosed(clientId));
+    }
+
+    // ====================================================================================== round 8 ==
+
+    /// @notice Round 8 sweep (b): kind 13 and a replacement do constant work whatever the number of incidents (and
+    /// records): twelve replacements while the route is closed, each with an open record to reconcile, then kind 13
+    /// through IBCAdmin (its fixed frame and the 1M call budget) reopens; its gas does not grow with the incidents.
+    function test_r8_b_constantWorkReopen_manyIncidents() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet[] memory pkts = new IICS26RouterMsgs.Packet[](12);
+        for (uint256 i = 0; i < 12; i++) {
+            pkts[i] = _send(alice, address(usdc), 10, clientId);
+        }
+        string memory live = clientId;
+        for (uint256 i = 0; i < 12; i++) {
+            string memory next = string.concat("gnoland-", vm.toString(40 + i));
+            vm.startPrank(address(admin));
+            router.addClient(
+                next, IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), address(new MockLightClient())
+            );
+            ctl.migrateRoute(live, next, 0); // the later ones while the route is closed
+            vm.stopPrank();
+            live = next;
+        }
+        (T.Incident[] memory inc,, uint64 pending) = ctl.incidents(clientId);
+        assertEq(inc.length, 12);
+        assertEq(pending, 1, "only client-0 has records to reconcile");
+        for (uint256 i = 0; i < 12; i++) {
+            _proveRefundable(pkts[i]);
+        }
+        vm.prank(address(admin));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, live, 1));
+        ctl.reopenRoute(live);
+        for (uint256 i = 0; i < 12; i++) {
+            _settle(_item(pkts[i].sequence, 1, 10));
+        }
+        (,, pending) = ctl.incidents(clientId);
+        assertEq(pending, 0);
+        uint64 seq = _decide(S.KIND_REOPEN, P.reopen(live));
+        _skip(7 days);
+        uint256 g = gasleft();
+        admin.execute(seq);
+        uint256 used = g - gasleft();
+        assertEq(_state(seq), S.EXECUTED);
+        assertFalse(ctl.routeClosed(clientId));
+        (inc,,) = ctl.incidents(clientId);
+        for (uint256 i = 0; i < 12; i++) {
+            assertEq(inc[i].status, 3);
+        }
+        assertLt(used, 300_000, "constant work: no walk of the twelve incidents");
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

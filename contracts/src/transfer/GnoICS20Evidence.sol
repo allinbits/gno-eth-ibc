@@ -179,10 +179,14 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         external
         view
         delegated
-        returns (Incident[] memory, uint64 resolvedUpTo)
+        returns (Incident[] memory, uint64 resolvedUpTo, uint64 pending)
     {
         GnoTransferStorage.Route storage r = _g().routes[GnoTransferStorage.routeHash(clientId)];
-        return (r.incidents, r.resolvedUpTo);
+        Incident[] memory list = r.incidents;
+        for (uint256 i = 0; i < list.length; i++) {
+            list[i].status = GnoTransferStorage.incidentStatus(r, i);
+        }
+        return (list, r.resolvedUpTo, r.pendingIncidents);
     }
 
     /// @notice See IGnoICS20Controls.

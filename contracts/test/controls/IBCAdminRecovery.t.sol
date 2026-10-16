@@ -331,7 +331,7 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         _skip(DELAY);
         admin.executeRecovery();
         assertEq(admin.govClient(), "gnoland-8");
-        (IGnoICS20ControlsTypes.Incident[] memory inc, uint64 resolved) = ctl.incidents(clientId);
+        (IGnoICS20ControlsTypes.Incident[] memory inc, uint64 resolved,) = ctl.incidents(clientId);
         assertEq(inc.length, 2);
         assertEq(resolved, 0);
         assertEq(ctl.openRecords(clientId), 1, "carried over");
@@ -345,7 +345,7 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         vm.stopPrank();
         assertEq(usdc.balanceOf(alice), before + 100);
         assertFalse(ctl.routeClosed(clientId));
-        (, resolved) = ctl.incidents(clientId);
+        (, resolved,) = ctl.incidents(clientId);
         assertEq(resolved, 2);
     }
 
