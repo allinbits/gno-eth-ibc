@@ -99,11 +99,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             if (rec.payment == Payment.Queued) {
                 uint256 reservedBefore = GnoTransferStorage.reservation(rec);
                 uint256 remaining = GnoTransferStorage.refundable(rec);
-                uint256 got = LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
-                if (got > remaining) got = remaining;
+                // the meter charged first (checks-effects-interactions), given back if the payment fails
+                LeakyBucket.Bucket memory meter = t.refunded;
+                uint256 got = LeakyBucket.chargeUpTo(t.refunded, t.limits.refundCap, remaining, now_);
                 if (got == 0 && remaining != 0) break;
                 if (got != 0 && GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore)) {
-                    LeakyBucket.charge(t.refunded, t.limits.refundCap, got, now_);
                     emit GnoRefundPaid(q.clientId, q.sequence, token, rec.sender, got);
                     if (got != remaining) {
                         // an installment: the meter is empty
@@ -115,6 +115,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     GnoTransferStorage.releaseNotice(q.clientId, q.sequence);
                 } else if (got != 0) {
                     // a refund the token refuses waits apart, so the refunds behind it are paid
+                    t.refunded = meter;
                     rec.payment = Payment.Parked;
                     emit GnoRefundParked(q.clientId, q.sequence, token, remaining);
                 }
@@ -205,17 +206,19 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         GnoTransferStorage.TokenControls storage t = g.tokens[route][token];
         uint64 now_ = uint64(block.timestamp);
         bool paid;
+        LeakyBucket.Bucket memory meter = t.refunded;
+        // the meter charged first (checks-effects-interactions), given back if the payment fails
         if (
             t.head == t.tail && !GnoTransferStorage.refundsHeld(route) && !r.closed
-                && amount <= LeakyBucket.available(t.refunded, t.limits.refundCap, now_)
+                && LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_)
         ) {
             if (GnoTransferStorage.tryPayRefund(rec, amount, route, reservedBefore)) {
-                LeakyBucket.charge(t.refunded, t.limits.refundCap, amount, now_);
                 rec.payment = Payment.Paid;
                 GnoTransferStorage.closeRecord(rec, route);
                 paid = true;
                 emit GnoRefundPaid(clientId, sequence, token, refundee, amount);
             } else {
+                t.refunded = meter;
                 rec.payment = Payment.Parked;
                 emit GnoRefundParked(clientId, sequence, token, amount);
             }
@@ -248,34 +251,34 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
-    function setRouteFlag(string calldata clientId) external delegated {
+    function setRouteFlag(string calldata clientId) external delegated nonReentrant {
         _flag(clientId, false, true);
     }
 
     /// @notice See IGnoICS20Controls.
-    function clearRouteFlag(string calldata clientId) external delegated {
+    function clearRouteFlag(string calldata clientId) external delegated nonReentrant {
         _flag(clientId, false, false);
     }
 
     /// @notice See IGnoICS20Controls.
-    function setRefundsFlag(string calldata clientId) external delegated {
+    function setRefundsFlag(string calldata clientId) external delegated nonReentrant {
         _flag(clientId, true, true);
     }
 
     /// @notice See IGnoICS20Controls.
-    function clearRefundsFlag(string calldata clientId) external delegated {
+    function clearRefundsFlag(string calldata clientId) external delegated nonReentrant {
         _flag(clientId, true, false);
     }
 
     // -------------------------------------------------------------------------------------------- governance --
 
     /// @notice See IGnoICS20Controls.
-    function initializeGno(address[6] calldata keys) external delegated restricted reinitializer(3) {
+    function initializeGno(address[6] calldata keys) external delegated restricted nonReentrant reinitializer(3) {
         _setKeys(keys);
     }
 
     /// @notice See IGnoICS20Controls.
-    function setGuardianKeys(address[6] calldata keys) external delegated restricted {
+    function setGuardianKeys(address[6] calldata keys) external delegated restricted nonReentrant {
         _setKeys(keys);
     }
 
@@ -285,7 +288,16 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
-    function setLimits(string calldata clientId, address token, Limits calldata l) external delegated restricted {
+    function setLimits(
+        string calldata clientId,
+        address token,
+        Limits calldata l
+    )
+        external
+        delegated
+        restricted
+        nonReentrant
+    {
         require(
             token != address(0) && l.dayCap <= LeakyBucket.MAX_CAP && l.refundCap <= LeakyBucket.MAX_CAP
                 && (l.sendMax == 0 || l.sendMin <= l.sendMax),
@@ -302,7 +314,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
-    function setQuarantine(string calldata clientId, uint64 seconds_) external delegated restricted {
+    function setQuarantine(string calldata clientId, uint64 seconds_) external delegated restricted nonReentrant {
         require(seconds_ <= MAX_QUARANTINE, GnoBadLimits());
         GnoTransferStorage.Route storage r = _route(clientId);
         // the transitions accepted so far keep the deadline the old duration gave them
@@ -330,7 +342,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
-    function checkpointQuarantine(string calldata clientId) external delegated restricted {
+    function checkpointQuarantine(string calldata clientId) external delegated restricted nonReentrant {
         GnoTransferStorage.Route storage r = _route(clientId);
         _checkpoint(r, clientId);
         // called before every verifier swap: outcomes proven through the old verifier are void
@@ -354,6 +366,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         external
         delegated
         restricted
+        nonReentrant
         returns (uint256 cleared)
     {
         GnoTransferStorage.Layout storage g = _g();
@@ -368,7 +381,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     }
 
     /// @notice See IGnoICS20Controls.
-    function setRecoveryBlock(string calldata clientId, bool blocked) external delegated restricted {
+    function setRecoveryBlock(string calldata clientId, bool blocked) external delegated restricted nonReentrant {
         _route(clientId).recoveryBlocked = blocked;
         emit GnoRecoveryBlockSet(GnoTransferStorage.routeKey(clientId), blocked);
     }
@@ -382,6 +395,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         external
         delegated
         restricted
+        nonReentrant
     {
         GnoTransferStorage.Layout storage g = _g();
         // the new id must be fresh: no alias, not a route key, no escrow of its own, never retired, not the old one

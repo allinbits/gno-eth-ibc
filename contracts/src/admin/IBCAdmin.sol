@@ -44,6 +44,12 @@ import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 /// lands through flags and lands through a hold no sooner than day 21 of it; an unpause (kind 2) waits 24 hours and is
 /// spent under a hold of its object. The kinds' logic runs in IBCAdminExec, delegatecalled at a pinned code hash and
 /// replaced only by kind 9.
+
+/// @notice The transfer app's reentrancy lock, read by IBCAdmin.
+interface IGnoICS20Busy {
+    function gnoBusy() external view returns (bool);
+}
+
 contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// @notice This app's port on the Ethereum router. ADR §5.4 names it `gov`, but eureka v3.0.2's router refuses a
     /// custom port id shorter than 4 characters (IBCIdentifiers.validateCustomIBCIdentifier), so it is `ibcgov`; the
@@ -324,6 +330,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         uint32 ep = l.epoch;
         Decision storage d = l.decisions[ep][seq];
         if (d.state != S.PENDING) revert NotPending(seq);
+        // never from inside a transfer-app entry point (a token or sender hook): it pends, for a later call
+        if (IGnoICS20Busy(ics20).gnoBusy()) revert Busy();
         if (S.isTombstoned(l, ep, seq)) {
             d.state = S.CANCELLED;
             delete d.params;

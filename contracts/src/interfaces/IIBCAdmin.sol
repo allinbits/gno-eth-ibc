@@ -58,6 +58,8 @@ interface IIBCAdmin {
     error NotPending(uint64 seq);
     error NotMature(uint64 matureAt);
     error Deferred();
+    /// @notice A transfer-app entry point is running (a hook called in): the decision pends.
+    error Busy();
     error Suspended();
     error NotDelegated();
     error NoCodeYet(address target);

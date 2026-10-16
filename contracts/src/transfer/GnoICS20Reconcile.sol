@@ -78,11 +78,10 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         uint256 remaining = GnoTransferStorage.refundable(rec);
         // a refund kind 12 decided is not metered; one from an ack or timeout is
-        got = rec.settlement == 1 ? remaining : LeakyBucket.available(t.refunded, t.limits.refundCap, now_);
-        if (got > remaining) got = remaining;
+        // the meter charged first (checks-effects-interactions); a failed payment reverts it all
+        got = rec.settlement == 1 ? remaining : LeakyBucket.chargeUpTo(t.refunded, t.limits.refundCap, remaining, now_);
         if (got == 0) return 0;
         require(GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore), GnoRefundFailed(clientId, sequence));
-        if (rec.settlement != 1) LeakyBucket.charge(t.refunded, t.limits.refundCap, got, now_);
         emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
         if (got == remaining) {
             rec.payment = Payment.Claimed;
@@ -244,7 +243,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     uint256 private constant REOPEN_BATCH = 16;
 
     /// @notice See IGnoICS20Controls.
-    function reopenRoute(string calldata clientId) external delegated restricted {
+    function reopenRoute(string calldata clientId) external delegated restricted nonReentrant {
         GnoTransferStorage.Route storage r = _route(clientId);
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
         // every record of the retired ids reconciled first: no outstanding packet, no refund owed (a route closed

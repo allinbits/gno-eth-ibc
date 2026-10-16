@@ -135,12 +135,12 @@ contract GnoICS20Transfer is
     }
 
     /// @inheritdoc IPausable
-    function pause() external restricted {
+    function pause() external restricted nonReentrant {
         _pause();
     }
 
     /// @inheritdoc IPausable
-    function unpause() external restricted {
+    function unpause() external restricted nonReentrant {
         _unpause();
     }
 
@@ -320,7 +320,7 @@ contract GnoICS20Transfer is
     }
 
     /// @inheritdoc IICS20TransferAccessControlled
-    function setCustomERC20(string calldata denom, address token) external restricted {
+    function setCustomERC20(string calldata denom, address token) external restricted nonReentrant {
         ICS20TransferStorage storage $ = _getICS20TransferStorage();
         string memory routeDenom = string(_toRouteDenom(bytes(denom))); // GNO: stored by route key
         require(address($._ibcERC20Contracts[routeDenom]) == address(0), IICS20Errors.ICS20DenomAlreadyExists(denom));
@@ -640,15 +640,24 @@ contract GnoICS20Transfer is
 
     /// @inheritdoc UUPSUpgradeable
     // solhint-disable-next-line no-empty-blocks
-    function _authorizeUpgrade(address) internal override restricted { }
+    // GNO: never from inside another entry point of the transfer app (the shared reentrancy lock)
+    function _authorizeUpgrade(address) internal override restricted {
+        require(!_reentrancyGuardEntered(), ReentrancyGuardReentrantCall());
+    }
+
+    /// @notice Whether an entry point of the transfer app (its controls included) is running: IBCAdmin executes no
+    /// decision then, so a token or sender hook can neither reach a governed setter nor spend a decision.
+    function gnoBusy() external view returns (bool) {
+        return _reentrancyGuardEntered();
+    }
 
     /// @inheritdoc IICS20TransferAccessControlled
-    function upgradeEscrowTo(address newEscrowLogic) external restricted {
+    function upgradeEscrowTo(address newEscrowLogic) external restricted nonReentrant {
         _getICS20TransferStorage()._escrowBeacon.upgradeTo(newEscrowLogic);
     }
 
     /// @inheritdoc IICS20TransferAccessControlled
-    function upgradeIBCERC20To(address newIBCERC20Logic) external restricted {
+    function upgradeIBCERC20To(address newIBCERC20Logic) external restricted nonReentrant {
         _getICS20TransferStorage()._ibcERC20Beacon.upgradeTo(newIBCERC20Logic);
     }
 

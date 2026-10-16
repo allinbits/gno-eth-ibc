@@ -177,12 +177,21 @@ contract HookToken is ERC20 {
         (hookOn, target, data) = (on, t, d);
     }
 
+    /// @notice Whether the last hook call succeeded, and what it returned.
+    bool public hookOk;
+    bytes public hookRet;
+    mapping(address => bool) public blocked;
+
+    function setBlocked(address a, bool b) external {
+        blocked[a] = b;
+    }
+
     function _update(address from, address to, uint256 value) internal override {
+        require(!blocked[to], "blocked");
         super._update(from, to, value);
         if (to != address(0) && to == hookOn) {
             hookOn = address(0);
-            (bool ok,) = target.call(data);
-            require(ok, "hook");
+            (hookOk, hookRet) = target.call(data);
         }
     }
 }

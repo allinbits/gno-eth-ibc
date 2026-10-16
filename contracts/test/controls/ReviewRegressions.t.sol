@@ -1542,6 +1542,60 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 30);
     }
 
+    /// @notice Round 6 #1: on each refund payment path (paid at once by the ack hook, by `claim`, by `claimParked`)
+    /// the meter is charged before the token moves, and a token hook cannot execute a matured kind 4 that changes
+    /// the limits mid-payment: IBCAdmin refuses while a transfer-app entry point runs (`Busy`), the decision pends,
+    /// and the payment is metered in full.
+    function test_r6_1_paymentHooks_cannotChangeLimitsMidPayment() public {
+        for (uint8 path = 0; path < 3; path++) {
+            _hookPath(path);
+        }
+    }
+
+    function _hookPath(uint8 path) internal {
+        HookToken h = new HookToken();
+        h.mint(alice, 300);
+        vm.prank(alice);
+        h.approve(address(ics20), type(uint256).max);
+        _setLimits(address(h), 1000, 1000, 100);
+        uint64 seq = _decide(
+            S.KIND_LIMITS,
+            P.limits(clientId, address(h), 2000, 1000, 50, 0, 0) // loosens: waits 7 days
+        );
+        _skip(7 days);
+        bytes memory exec = abi.encodeCall(IBCAdmin.execute, (seq));
+        IICS26RouterMsgs.Packet memory pkt;
+        if (path == 0) {
+            pkt = _send(alice, address(h), 100, clientId);
+            h.setHook(alice, address(admin), exec);
+            _timeout(pkt); // paid at once
+            assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Paid));
+        } else if (path == 1) {
+            _timeout(_send(alice, address(h), 100, clientId)); // the meter full
+            pkt = _send(alice, address(h), 100, clientId);
+            _timeout(pkt); // queued
+            _skip(1 days);
+            h.setHook(alice, address(admin), exec);
+            ctl.claim(clientId, address(h), 1);
+            assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Claimed));
+        } else {
+            pkt = _send(alice, address(h), 100, clientId);
+            h.setBlocked(alice, true);
+            _timeout(pkt); // the token refuses: parked, the meter given back
+            assertEq(ctl.limits(clientId, address(h)).refundLevel, 0);
+            h.setBlocked(alice, false);
+            h.setHook(alice, address(admin), exec);
+            assertEq(ctl.claimParked(clientId, pkt.sequence), 100);
+        }
+        assertFalse(h.hookOk(), "IBCAdmin refused inside the payment");
+        assertEq(bytes4(h.hookRet()), IIBCAdmin.Busy.selector);
+        assertEq(_state(seq), S.PENDING);
+        assertEq(ctl.limits(clientId, address(h)).refundLevel, 100, "metered in full");
+        admin.execute(seq); // outside any payment it executes
+        assertEq(_state(seq), S.EXECUTED);
+        assertEq(ctl.limits(clientId, address(h)).limits.refundCap, 50);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {
