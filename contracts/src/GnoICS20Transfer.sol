@@ -361,6 +361,8 @@ contract GnoICS20Transfer is
         IICS20TransferMsgs.FungibleTokenPacketData memory packetData =
             abi.decode(msg_.payload.value, (IICS20TransferMsgs.FungibleTokenPacketData));
         require(packetData.amount > 0, ICS20InvalidAmount(0));
+        // GNO: a receive's amount is recorded in 96 bits (kind 12 books a forged one); every limit is far below
+        require(packetData.amount <= type(uint96).max, ICS20InvalidAmount(packetData.amount));
         bytes32 route = _checkReceiveRoute(msg_.destinationClient); // GNO: retired, recovery, flags, quarantine
 
         address receiver = ICS20Lib.mustHexStringToAddress(packetData.receiver);
@@ -416,6 +418,9 @@ contract GnoICS20Transfer is
             _chargeReceive(route, msg_.destinationClient, erc20Address, packetData.amount); // GNO: E5
             IMintableAndBurnable(erc20Address).mint(address(escrow), packetData.amount);
         }
+
+        // GNO: the receive recorded, for a reconciliation that finds it forged (kind 12 action 5)
+        GnoTransferStorage.recordReceive(msg_.destinationClient, msg_.sequence, erc20Address, packetData.amount);
 
         // transfer the tokens to the receiver
         escrow.send(IERC20(erc20Address), receiver, packetData.amount);

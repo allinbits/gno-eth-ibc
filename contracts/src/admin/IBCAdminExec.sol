@@ -160,7 +160,7 @@ contract IBCAdminExec is IIBCAdmin {
                 abi.decode(p, (string, IGnoICS20ControlsTypes.SettleItem[]));
             bool ok = bytes(sid).length != 0 && items.length != 0;
             for (uint256 i = 0; ok && i < items.length; i++) {
-                ok = items[i].action >= 1 && items[i].action <= 4;
+                ok = items[i].action >= 1 && items[i].action <= 5;
             }
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
         }

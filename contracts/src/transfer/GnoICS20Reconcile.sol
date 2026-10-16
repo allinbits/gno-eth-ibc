@@ -102,6 +102,10 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         bytes32 route = GnoTransferStorage.routeHash(clientId);
         for (uint256 i = 0; i < items.length; i++) {
             SettleItem calldata it = items[i];
+            if (it.action == 5) {
+                _bookForgedReceive(g, route, clientHash, clientId, it, i);
+                continue;
+            }
             SendRecord storage rec = g.records[clientHash][it.sequence];
             // a record (authenticated: written by the send or backfilled), settled at most once
             require(rec.commitment != bytes32(0) && rec.settlement == 0, GnoBadSettlement(i));
@@ -156,6 +160,29 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             GnoTransferStorage.syncReserve(route, rec, reservedBefore);
             emit GnoSettled(clientId, it.sequence, action, it.amount);
         }
+    }
+
+    /// @notice Kind 12 action 5: a forged receive at an inbound sequence of the retired client, whose release or
+    /// mint is booked as a loss once, for exactly the amount the receive recorded.
+    function _bookForgedReceive(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        bytes32 clientHash,
+        string calldata clientId,
+        SettleItem calldata it,
+        uint256 i
+    )
+        private
+    {
+        uint256 r = g.receives[clientHash][it.sequence];
+        uint256 amount = r >> 160;
+        require(amount != 0 && amount == it.amount, GnoBadSettlement(i));
+        address token = address(uint160(r));
+        g.receives[clientHash][it.sequence] = uint160(token); // booked: never again
+        if (g.losses[route][token] == 0) g.routes[route].lossTokens.push(token);
+        g.losses[route][token] += amount;
+        emit GnoLossRecorded(GnoTransferStorage.routeKey(clientId), token, it.sequence, amount);
+        emit GnoSettled(clientId, it.sequence, 5, amount);
     }
 
     /// @notice A queued or parked refund rejected by reconciliation: never paid, its notification dropped.
@@ -253,6 +280,20 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         rec.legacy = true;
         GnoTransferStorage.openRecord(rec, GnoTransferStorage.routeHash(packet.sourceClient));
         emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function receiveRecord(
+        string calldata clientId,
+        uint64 sequence
+    )
+        external
+        view
+        delegated
+        returns (address, uint256)
+    {
+        uint256 r = _g().receives[keccak256(bytes(clientId))][sequence];
+        return (address(uint160(r)), r >> 160);
     }
 
     /// @notice See IGnoICS20Controls.

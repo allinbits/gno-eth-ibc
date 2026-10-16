@@ -236,6 +236,10 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     function suspectRecords(string calldata clientId) external view returns (uint64 from, uint64 open);
     /// @notice Losses kind 12 recorded on the route for the token.
     function losses(string calldata clientId, address token) external view returns (uint256);
+
+    /// @notice A receive at an inbound `sequence` of `clientId`: the token released or minted and its amount (zero
+    /// once kind 12 action 5 booked it as forged, or if there was none).
+    function receiveRecord(string calldata clientId, uint64 sequence) external view returns (address, uint256);
     /// @notice Escrow of the token reserved for the route's owed refunds (queued, parked or decided but unpaid).
     function reserved(string calldata clientId, address token) external view returns (uint256);
     /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).

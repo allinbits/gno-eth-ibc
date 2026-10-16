@@ -1029,6 +1029,43 @@ contract ReviewRegressionsTest is ControlsFixture {
         return abi.decode(abi.encode(p), (IICS26RouterMsgs.Packet));
     }
 
+    /// @notice Round 4 #5: a forged receive that released escrow has no send record; kind 12 action 5 books it as a
+    /// loss, once, for exactly the amount the receive recorded, and kind 13 accepts it as a deficit.
+    function test_r4_5_forgedEscrowRelease_bookedAndAccepted() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory sent = _send(alice, address(usdc), 100, clientId);
+        _ack(sent, bytes("{\"result\":\"AQ==\"}"));
+        // a forged packet the compromised client accepted: it releases the escrow to bob
+        string memory usdcBack = string.concat("transfer/", CP, "/", Strings.toHexString(address(usdc)));
+        assertTrue(_isSuccessAck(_transferIn(clientId, usdcBack, 100, bob)));
+        uint64 inbound = nextRecvSeq[keccak256(bytes(clientId))];
+        (address token, uint256 amount) = ctl.receiveRecord(clientId, inbound);
+        assertEq(token, address(usdc));
+        assertEq(amount, 100);
+        uint64 replace = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-2", 0));
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        _skip(7 days);
+        admin.execute(add);
+        admin.execute(replace);
+        vm.startPrank(address(admin));
+        ctl.settleRecords(clientId, _item(sent.sequence, 3, 0)); // the honest send was delivered
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(inbound, 5, 99)); // not the recorded amount
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(inbound + 1, 5, 100)); // no such receive
+        ctl.settleRecords(clientId, _item(inbound, 5, 100));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 0));
+        ctl.settleRecords(clientId, _item(inbound, 5, 100)); // once
+        assertEq(ctl.losses(clientId, address(usdc)), 100);
+        ctl.reopenRoute("gnoland-2");
+        vm.stopPrank();
+        assertFalse(ctl.routeClosed(clientId));
+        assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 100);
+    }
+
     // ============================================================== #20 send variants and reentrancy ==
 
     function test_r20_permit2Send_isControlledAndRecorded() public {

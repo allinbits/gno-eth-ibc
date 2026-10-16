@@ -106,6 +106,9 @@ library GnoTransferStorage {
         mapping(bytes32 route => mapping(address token => uint256)) acceptedDeficit;
         /// A reconciliation refund's notification (`notifySettled`, built from the authenticated packet) delivered.
         mapping(bytes32 clientHash => mapping(uint64 sequence => bool)) settledNoticeDone;
+        /// Every receive, per (destination client id, inbound sequence), in one slot: the token released or minted
+        /// (low 160 bits) and the amount (high 96 bits; zero once kind 12 booked it as a forged receive).
+        mapping(bytes32 clientHash => mapping(uint64 sequence => uint256)) receives;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.GnoICS20Transfer")) - 1)) & ~bytes32(uint256(0xff))
@@ -240,6 +243,13 @@ library GnoTransferStorage {
     function syncReserve(bytes32 route, IGnoICS20ControlsTypes.SendRecord storage rec, uint256 before) internal {
         TokenControls storage t = layout().tokens[route][rec.token];
         t.reserved = t.reserved - before + reservation(rec);
+    }
+
+    // ------------------------------------------------------------------------------------------- receives --
+
+    /// @notice Records a receive's token and amount (an amount above 96 bits is refused before: never truncated).
+    function recordReceive(string memory clientId, uint64 sequence, address token, uint256 amount) internal {
+        layout().receives[keccak256(bytes(clientId))][sequence] = (amount << 160) | uint160(token);
     }
 
     // ---------------------------------------------------------------------------------------- notifications --

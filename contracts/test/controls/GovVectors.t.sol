@@ -170,6 +170,13 @@ contract GovVectorsTest is ControlsFixture {
             "(string clientId = \"client-0\", (uint64 sequence, uint8 action, uint256 amount)[] items = [(3, 1, 0)]) - a genuine refund already paid in full",
             P.settle1("client-0", 3, 1, 0)
         );
+        _deliver(
+            "kind12-settle-forged-receive",
+            17,
+            12,
+            "(string clientId = \"client-0\", (uint64 sequence, uint8 action, uint256 amount)[] items = [(7, 5, 100000000)]) - action 5: a forged receive at inbound sequence 7 that released 100000000",
+            P.settle1("client-0", 7, 5, 100_000_000)
+        );
     }
 
     function _json() internal view returns (string memory j) {
@@ -227,7 +234,7 @@ contract GovVectorsTest is ControlsFixture {
     function test_govVectors() public {
         _build();
         // the statuses the protocol must produce
-        uint8[19] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1, 1];
+        uint8[20] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1, 1, 1];
         for (uint256 i = 0; i < vectors.length; i++) {
             (uint32 e, uint64 s, uint8 st,) = _govAck(vectors[i].ack);
             assertEq(e, 1);
@@ -236,7 +243,7 @@ contract GovVectorsTest is ControlsFixture {
         }
         (,,, uint8 redispatch) = _govAck(vectors[15].ack);
         assertEq(redispatch, 1);
-        assertEq(admin.lastSeq(), 16);
+        assertEq(admin.lastSeq(), 17);
 
         if (vm.envOr("WRITE_GOV_VECTORS", false)) {
             vm.writeFile(FILE, _json());
