@@ -127,6 +127,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// @inheritdoc IIBCApp
     function onRecvPacket(IIBCAppCallbacks.OnRecvPacketCallback calldata m) external returns (bytes memory) {
         if (msg.sender != router) revert NotRouter(msg.sender);
+        // never recorded from inside a transfer-app entry point (a token or sender hook): a decision acting at
+        // recording would find the transfer app locked and be spent; an error ack, and ibcgov re-sends
+        if (IGnoICS20Busy(ics20).gnoBusy()) revert Busy();
         IICS26RouterMsgs.Payload calldata p = m.payload;
         if (
             keccak256(bytes(p.sourcePort)) != COUNTERPARTY_PORT_HASH || keccak256(bytes(p.destPort)) != PORT_HASH
@@ -316,6 +319,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Records buffered decisions that follow the last recorded one, at most DRAIN. Permissionless.
     function drain() external returns (uint256) {
+        // inside a transfer-app entry point it records nothing (see onRecvPacket)
+        if (IGnoICS20Busy(ics20).gnoBusy()) return 0;
         S.Layout storage l = S.layout();
         return _drain(l, l.epoch);
     }

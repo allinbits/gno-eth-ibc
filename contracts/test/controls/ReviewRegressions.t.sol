@@ -1710,6 +1710,38 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(_state(seq), S.SPENT);
     }
 
+    // ====================================================================================== round 7 ==
+
+    /// @notice Round 7 #3: a token hook calling drain() while the transfer app is busy records nothing, so a
+    /// buffered tightening (kind 4, applied at recording) is never spent by the locked setter; drained later, it
+    /// applies. A delivery from inside the hook is an error ack (Busy), its number not consumed.
+    function test_r7_3_drainFromATokenHook_recordsNothing() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        uint64 first = admin.lastSeq() + 1;
+        for (uint64 s = first + 1; s < first + 9; s++) {
+            assertEq(_status(_recvGov(_env(s, S.KIND_UNPAUSE, P.unpause(1, clientId)))), S.STATUS_BUFFERED);
+        }
+        uint64 tight = first + 9;
+        bytes memory tightening = P.limits(clientId, address(usdc), 500, 1000, 1000, 0, 0);
+        assertEq(_status(_recvGov(_env(tight, S.KIND_LIMITS, tightening))), S.STATUS_BUFFERED);
+        _recvGov(_env(first, S.KIND_UNPAUSE, P.unpause(1, clientId))); // records first and drains eight
+        assertEq(admin.lastSeq(), tight - 1);
+        HookToken h = new HookToken();
+        h.mint(alice, 100);
+        vm.prank(alice);
+        h.approve(address(ics20), type(uint256).max);
+        _setLimits(address(h), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(h), 100, clientId);
+        h.setHook(alice, address(admin), abi.encodeCall(IBCAdmin.drain, ()));
+        _timeout(pkt); // the refund's transfer runs the hook
+        assertTrue(h.hookOk());
+        assertEq(abi.decode(h.hookRet(), (uint256)), 0, "nothing recorded");
+        assertEq(admin.lastSeq(), tight - 1);
+        assertEq(admin.drain(), 1);
+        assertEq(admin.decision(admin.epoch(), tight).state, S.EXECUTED);
+        assertEq(ctl.limits(clientId, address(usdc)).limits.maxPerMessage, 500);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {
