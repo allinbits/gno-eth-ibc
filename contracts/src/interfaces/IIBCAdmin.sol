@@ -33,15 +33,17 @@ interface IIBCAdmin {
 
     /// @notice The recovery's settings, fixed at deployment. `delay == 0` disables the emergency path.
     /// @notice What the deployment created, for `finishSetup` to check against the chain (ADR E11): the launch
-    /// client's id, its verifier (address and code hash), the verifier's initial trusted state (the hashes of its
-    /// encoded client state and of its consensus state at that state's latest height; zero: not checked, for a
-    /// verifier the deployment did not create), gno.land's client id on the other side, the ugnot voucher and the
-    /// route's quarantine.
+    /// client's id, its verifier (address and code hash), the verifier's original checkpoint (its launch height and
+    /// the hash of the consensus state stored there) and its parameters no update changes (the hash of
+    /// `abi.encode(chainId, revisionNumber, trustLevel, trustingPeriod, maxClockDrift)`), gno.land's client id on
+    /// the other side, the ugnot voucher and the route's quarantine. Verified updates since the launch height are
+    /// allowed: anyone may relay one. Zero hashes are not checked (a verifier the deployment did not create).
     struct Launch {
         string clientId;
         address lightClient;
         bytes32 lightClientCodeHash;
-        bytes32 clientStateHash;
+        uint64 launchHeight;
+        bytes32 clientParamsHash;
         bytes32 consensusStateHash;
         string counterpartyClientId;
         address ugnotVoucher;

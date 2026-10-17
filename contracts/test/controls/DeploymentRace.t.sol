@@ -17,6 +17,9 @@ import { IBCAdmin } from "../../src/admin/IBCAdmin.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
+import { Fixtures } from "../utils/Fixtures.sol";
+import { GnoLightClient } from "../../src/GnoLightClient.sol";
+import { IGnoLightClientMsgs as Msgs } from "../../src/msgs/IGnoLightClientMsgs.sol";
 
 /// @notice Round 15 #1: the launch client binding against an attacker registering a client between the deployer's
 /// transactions (eureka's generated-id `addClient` is permissionless).
@@ -154,5 +157,64 @@ contract DeploymentRaceOldFlowTest is RaceBase {
         assertEq(admin.lastSeq(), 0);
         vm.expectRevert(IIBCAdmin.SetupPending.selector);
         admin.execute(1);
+    }
+}
+
+/// @notice Round 16 #1: the launch record names the verifier's original checkpoint, not its current state. With the
+/// real GnoLightClient, anyone relays an honest update between the deployment and `finishSetup`: setup still passes.
+contract DeploymentRealClientTest is Fixtures, DeployGnoIBC {
+    address internal deployer = makeAddr("deployer");
+    address internal relayer = makeAddr("anyone");
+    Deployed internal d;
+
+    function _finish(Params memory p, Deployed memory dd) internal override {
+        vm.stopPrank();
+        vm.prank(relayer);
+        GnoLightClient(dd.gnoLightClient).updateClient(_msg("h11")); // a verified forward update, front-running
+        vm.startPrank(deployer);
+        super._finish(p, dd);
+    }
+
+    function test_r16_1_honestUpdateBeforeFinishSetup_setupPasses() public {
+        _loadFixtures();
+        vm.warp(t0Seconds + 120);
+        Params memory p;
+        p.deployer = deployer;
+        p.clientState = _initialClientState();
+        p.consensusState = _initialConsensusState();
+        p.counterparty = "ethereum-1";
+        for (uint256 i = 0; i < 4; i++) {
+            p.guardians[i] = makeAddr(string.concat("guardian", vm.toString(i)));
+        }
+        p.watch = [makeAddr("watch0"), makeAddr("watch1")];
+        p.expectedLock = 1_000_000e6;
+        p.gnotLimits = IGnoICS20ControlsTypes.Limits(25_000e6, 100_000e6, 100_000e6, 0, 0);
+        p.quarantineSeconds = 7 days;
+        vm.startPrank(deployer);
+        d = _deploy(p);
+        vm.stopPrank();
+        Msgs.ClientState memory cs = abi.decode(GnoLightClient(d.gnoLightClient).getClientState(), (Msgs.ClientState));
+        assertEq(cs.latestHeight, 11, "advanced past the launch height");
+        assertTrue(IBCAdmin(d.ibcAdmin).setupDone(), "the original checkpoint still checks");
+    }
+}
+
+/// @notice Round 16 #1, the sweep of `finishSetup` for state a third party can advance: two guardians flagging
+/// IBCAdmin before setup would leave a hold in its history (check 40). Flags wait for setup.
+contract DeploymentFlagsBeforeSetupTest is RaceBase {
+    function _finish(Params memory p, Deployed memory dd) internal override {
+        vm.stopPrank();
+        for (uint256 g = 0; g < 2; g++) {
+            vm.prank(p.guardians[g]);
+            vm.expectRevert(IIBCAdmin.SetupPending.selector);
+            IBCAdmin(dd.ibcAdmin).setFlag();
+        }
+        vm.startPrank(deployer);
+        super._finish(p, dd);
+    }
+
+    function test_r16_1_flagsBeforeSetup_cannotBlockIt() public {
+        _deployAll();
+        assertTrue(IBCAdmin(d.ibcAdmin).setupDone());
     }
 }

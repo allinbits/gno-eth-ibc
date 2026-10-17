@@ -745,7 +745,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         l.lightClientCodeHash = bytes32(uint256(1));
         _expectSetup(l, 11);
         l = launch;
-        l.clientStateHash = bytes32(uint256(1));
+        l.clientParamsHash = bytes32(uint256(1));
         _expectSetup(l, 12);
         lc.setChainId("other-chain");
         _expectSetup(launch, 12);

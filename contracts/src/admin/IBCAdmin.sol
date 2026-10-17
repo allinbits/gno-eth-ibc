@@ -427,6 +427,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// @notice A guardian's or watch key's own flag on IBCAdmin: defers every 7-day decision.
     function setFlag() external {
         S.Layout storage l = S.layout();
+        // before setup there is no governance to defer, and a hold's history would fail `finishSetup` (check 40)
+        if (!l.setupDone) revert SetupPending();
         (uint64 hb, uint64 ht, uint64 db, uint64 dt) = S.moments(l);
         uint256 i = Guardians.setFlag(l.g.k, l.g.f, msg.sender, uint64(block.number), uint64(block.timestamp), S.DAY);
         S.noteHoldEnd(l, hb, ht, db, dt);
@@ -499,6 +501,12 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         emit SetupDone();
     }
 
+    /// @notice The hash of a client state's parameters no update changes (everything but its latest height and its
+    /// frozen flag).
+    function clientParamsHash(Msgs.ClientState memory s) public pure returns (bytes32) {
+        return keccak256(abi.encode(s.chainId, s.revisionNumber, s.trustLevel, s.trustingPeriod, s.maxClockDrift));
+    }
+
     /// @notice Checks 11 to 15: the launch client and every component naming it are the deployment's own.
     function _checkLaunch(Launch calldata launch) private view {
         string memory id = launch.clientId;
@@ -507,10 +515,13 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         _check(lc == launch.lightClient && lc.code.length != 0 && lc.codehash == launch.lightClientCodeHash, 11);
         bytes memory cs = IGnoVerifierViews(lc).getClientState();
         Msgs.ClientState memory state = abi.decode(cs, (Msgs.ClientState));
-        _check(keccak256(bytes(state.chainId)) == keccak256(bytes(S.layout().gnoChainId)), 12);
-        if (launch.clientStateHash != bytes32(0)) _check(keccak256(cs) == launch.clientStateHash, 12);
+        // the immutable parameters and the original checkpoint, never the current height or consensus state: a
+        // verified update anyone relays advances those, and must not stop the launch; a frozen client must
+        _check(keccak256(bytes(state.chainId)) == keccak256(bytes(S.layout().gnoChainId)) && !state.isFrozen, 12);
+        if (launch.clientParamsHash != bytes32(0)) _check(clientParamsHash(state) == launch.clientParamsHash, 12);
         if (launch.consensusStateHash != bytes32(0)) {
-            Msgs.ConsensusState memory c = IGnoVerifierViews(lc).getConsensusState(state.latestHeight);
+            _check(state.latestHeight >= launch.launchHeight, 12);
+            Msgs.ConsensusState memory c = IGnoVerifierViews(lc).getConsensusState(launch.launchHeight);
             _check(keccak256(abi.encode(c)) == launch.consensusStateHash, 12);
         }
         IICS02ClientMsgs.CounterpartyInfo memory cp = IICS02Client(router).getCounterparty(id);

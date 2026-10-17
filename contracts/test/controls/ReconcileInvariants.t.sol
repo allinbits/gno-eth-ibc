@@ -86,6 +86,10 @@ contract ReconcileHandler is Test {
     // token; the hook token last
     uint256 internal constant LOSS_TOKENS = 33;
     address public partialToken; // only `partialBacking` sends it
+    address public twinToken; // only `twinEligibleRefunds` sends it
+    // each record's refund paid as of the last step's start: a record paid since must have left every other
+    // record's reservation backed (the payment's own postcondition)
+    mapping(uint256 => uint256) public refundedAt;
     // the permitted shortfall per token: what reconciliation recognized as compromise losses (the refunds a forged
     // success ack hid, owed again), never raised by a receive or a payment, lowered as the escrow covers it again
     mapping(address => uint256) public permittedShortfall;
@@ -164,12 +168,13 @@ contract ReconcileHandler is Test {
         (router, ctl, ics20, admin, alice, bob, G) = (router_, ctl_, ics20_, admin_, alice_, bob_, guardians);
         clients.push(clientId);
         tokens.push(usdc);
-        for (uint256 i = 0; i <= LOSS_TOKENS; i++) {
+        for (uint256 i = 0; i <= LOSS_TOKENS + 1; i++) {
             ERC20Mock t = new ERC20Mock();
             t.mint(alice, 1e30);
             tokens.push(address(t));
         }
         partialToken = tokens[LOSS_TOKENS + 1];
+        twinToken = tokens[LOSS_TOKENS + 2];
         hookToken = new HookToken();
         hookToken.mint(alice, 1e30);
         tokens.push(address(hookToken));
@@ -207,6 +212,9 @@ contract ReconcileHandler is Test {
         for (uint256 t = 0; t < tokens.length; t++) {
             uint256 u = uncovered(tokens[t]);
             if (permittedShortfall[tokens[t]] > u) permittedShortfall[tokens[t]] = u;
+        }
+        for (uint256 i = 0; i < packets.length; i++) {
+            refundedAt[i] = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence).refunded;
         }
     }
 
@@ -531,7 +539,7 @@ contract ReconcileHandler is Test {
     /// @notice A random token, never the partial-backing one.
     function _pick(uint256 seed) internal view returns (address token) {
         token = tokens[seed % 2 == 0 ? 0 : bound(seed, 0, tokens.length - 1)];
-        if (token == partialToken && !partialDone) token = tokens[0];
+        if ((token == partialToken && !partialDone) || token == twinToken) token = tokens[0];
     }
 
     /// @notice A receive of `amount` of `token` to bob over the live client; whether it was received.
@@ -1915,12 +1923,12 @@ contract ReconcileHandler is Test {
             vm.prank(G[g]);
             if (refunds) {
                 try ctl.setRefundsFlag(live) { }
-                    catch {
+                catch {
                     return;
                 }
             } else {
                 try ctl.setRouteFlag(live) { }
-                    catch {
+                catch {
                     return;
                 }
             }
@@ -1948,10 +1956,57 @@ contract ReconcileHandler is Test {
         }
     }
 
+    // ------------------------------------------------------------------------------------- round 16 actions --
+
+    /// @notice Two refunds a forged success ack hid, both owed again by reconciliation and unpaid against too little
+    /// backing; the backing then replenished in part (a delivered send acknowledged: gno.land holds those tokens).
+    /// A retry of one of them must not take the other's backing.
+    function twinEligibleRefunds() external {
+        calls++;
+        _ratchet();
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        address p = twinToken;
+        _limits(p);
+        if (!_send(alice, p, 100, false) || !_send(alice, p, 100, false)) return;
+        uint256 a = packets.length - 2;
+        this.relay(a, true, false);
+        this.relay(a + 1, true, false); // two forged success acks: both reservations released
+        if (!ghost[a].forgedSuccess || !ghost[a + 1].forgedSuccess) return;
+        address escrow = ics20.getEscrow(_live());
+        uint256 bal = IERC20(p).balanceOf(escrow);
+        uint256 reserved = ctl.reserved(_live(), p);
+        if (bal < reserved + 50) return;
+        if (bal - reserved - 50 != 0 && !_receiveToken(p, bal - reserved - 50, true)) return;
+        if (!_replace(true)) return;
+        _reconcile(0, true); // both owed again: 200 against 50
+        if (!_reopen()) {
+            _ensureOpen();
+            return;
+        }
+        // replenished: a delivered send of 100, acknowledged (no reservation: gno.land holds it)
+        if (!_send(alice, p, 100, true)) return;
+        this.relay(packets.length - 1, false, false);
+        T.SendRecord memory ra = ctl.sendRecord(packets[a].sourceClient, packets[a].sequence);
+        T.SendRecord memory rb = ctl.sendRecord(packets[a + 1].sourceClient, packets[a + 1].sequence);
+        if (ra.settlement != 1 || rb.settlement != 1 || ra.refunded != 0 || rb.refunded != 0) {
+            _ensureOpen();
+            return;
+        }
+        // 150 against two reservations of 100: a retry of either must leave the other's 100 backed
+        try ctl.claim(_live(), p, 20) { } catch { }
+        try ctl.claimParked(packets[a].sourceClient, packets[a].sequence, 300_000) { } catch { }
+        uint256 paid = ctl.sendRecord(packets[a].sourceClient, packets[a].sequence).refunded
+            + ctl.sendRecord(packets[a + 1].sourceClient, packets[a + 1].sequence).refunded;
+        _checkpoint(); // the payments' postconditions, if any was made
+        if (paid == 0) ok["twinRefundHeld"]++;
+        _ensureOpen();
+    }
+
     // ----------------------------------------------------------------------------------- coverage sweep --
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["twinRefundHeld"] == 0) this.twinEligibleRefunds();
         if (ok["replaceInDipRefunds"] == 0) replaceDuringDip(true);
         if (ok["replaceInDipRoute"] == 0) replaceDuringDip(false);
         if (ok["olderRefundHeld"] == 0) this.partialBacking();
@@ -2265,6 +2320,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
             }
         }
         _checkFlows(f, tn, open);
+        _checkPayments(n, tn);
         _checkCounters();
         // invariant 7: no loss changes while a reopening runs (the snapshot is taken when its kind 13 executes)
         if (ctl.routeReopening(clientId) && keccak256(bytes(h.snapshotClient())) == keccak256(bytes(h.liveClientId())))
@@ -2278,6 +2334,26 @@ contract ReconcileInvariantsTest is ControlsFixture {
                 ctl.losses(clientId, address(ugnot)),
                 h.lossSnapshot(address(ugnot)),
                 "voucher losses changed while reopening"
+            );
+        }
+    }
+
+    /// @notice Every refund paid since the last step left every other record's reservation backed, other refunds
+    /// owed again included: the escrow covers the reservation of all records but the paid one (only it may stay
+    /// short, by its own permitted shortfall). Independent of the aggregate checks, which a payment taking another
+    /// refund's backing could leave unchanged.
+    function _checkPayments(uint256 n, uint256 tn) internal view {
+        address escrow = ics20.getEscrow(clientId);
+        for (uint256 i = 0; i < n; i++) {
+            IICS26RouterMsgs.Packet memory pkt = h.packet(i);
+            T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+            if (rec.burned || rec.refunded <= h.refundedAt(i)) continue;
+            if (_tokenIndex(rec.token, tn) == tn) continue;
+            uint256 own = _reserveOf(rec, rec.amount);
+            assertGe(
+                IERC20(rec.token).balanceOf(escrow) + own,
+                ctl.reserved(clientId, rec.token),
+                "a payment took another record's backing"
             );
         }
     }
@@ -2380,7 +2456,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[58] memory names = [
+        string[59] memory names = [
+            "twinRefundHeld",
             "replaceInDipRefunds",
             "replaceInDipRoute",
             "olderRefundHeld",
@@ -2445,7 +2522,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[41] memory required = [
+        string[42] memory required = [
+            "twinRefundHeld",
             "replaceInDipRefunds",
             "replaceInDipRoute",
             "olderRefundHeld",

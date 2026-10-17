@@ -207,7 +207,10 @@ bounds (constant work whatever the number of incidents).
    The invariant campaign checks this from its own ghost. It marks the eligible refunds when kind 12 owes them
    again, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
    every step, never raised but by kind 12). It asserts that the escrow covers every reservation but the eligible
-   refunds' unpaid part. `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
+   refunds' unpaid part. It also checks every payment's own postcondition: a record paid since the previous step
+   left every other record's reservation backed, other refunds owed again included. Only the paid record may stay
+   short. `twinEligibleRefunds` drives that: two such refunds unpaid against 150 of backing, one retried.
+   `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
    receives on the new live client, which must be refused. A new outstanding send of 100 follows, then a retry of
    the older refund, which must not take the new send's backing. Removing either the receive path's or the payment's
    reservation guard fails the campaign.
@@ -427,7 +430,11 @@ a kind 9 hand-over installed an executor whose allow-list admits it.
    and IBCAdmin checks 11 to 15 against the chain (before `IBCAdminSetupCheck`'s list):
    - the epoch's client is that id;
    - its verifier is exactly the address the deployment created, with the recorded code hash;
-   - its initial client and consensus state are the deployment's inputs, and its chain id is IBCAdmin's;
+   - its original checkpoint, the consensus state stored at the launch height, is the deployment's input; its
+     parameters no update changes (chain id, revision, trust level, trusting period, clock drift) are too; its chain
+     id is IBCAdmin's, and it is not frozen. Verified updates since the launch, which anyone may relay, are allowed:
+     `finishSetup` never compares against state a third party can advance. For the same reason, IBCAdmin's guardian
+     flags wait for setup, since a hold before it would fail check 40;
    - its counterparty is the named gno.land client, with the exact merkle prefix;
    - the ugnot voucher is registered for that id and answers to the transfer app;
    - the controls set the voucher's limits and the quarantine on that id.
