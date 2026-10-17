@@ -98,7 +98,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         (address r, address am, address t) = IBCAdminExec(c.exec).bindings();
         if (r != c.router || am != c.accessManager || t != c.ics20) revert ForeignExec();
         RecoveryConfig memory rc = c.recovery;
-        if (rc.delay != 0 && (rc.threshold < 3 || rc.threshold > 4 || rc.cancelThreshold < 2 || rc.cancelThreshold > 4))
+        if (rc.delay != 0 && (rc.threshold < 3 || rc.threshold > 4 || rc.cancelThreshold < 3 || rc.cancelThreshold > 4))
         {
             revert RecoveryState();
         }
@@ -181,8 +181,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         bool prebound; // a cancel seen beyond the window: its number is bound to its hash, not yet held
         if (seq <= last || d.hash != bytes32(0)) {
             if (d.hash != hash) {
-                // the first bytes stand and these are never applied; the flag defers every 7-day decision
-                if (l.conflictBlock == 0) l.conflictBlock = uint64(block.number);
+                // the first bytes stand and these are never applied; the flag defers every 7-day decision. Refreshed
+                // on every conflict: an unpause clears only conflicts strictly earlier than its own recording
+                l.conflictBlock = uint64(block.number);
                 emit Conflict(ep, seq, d.hash, hash);
                 return (S.STATUS_CONFLICT, false);
             }

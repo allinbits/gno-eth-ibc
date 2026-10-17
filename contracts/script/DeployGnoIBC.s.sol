@@ -160,7 +160,7 @@ contract DeployGnoIBC is Script {
         p.recovery = IIBCAdmin.RecoveryConfig({
             delay: _u64(vm.envOr("RECOVERY_DELAY", uint256(0)), "RECOVERY_DELAY"),
             threshold: _u8(vm.envOr("RECOVERY_THRESHOLD", uint256(3)), "RECOVERY_THRESHOLD"),
-            cancelThreshold: _u8(vm.envOr("RECOVERY_CANCEL_THRESHOLD", uint256(2)), "RECOVERY_CANCEL_THRESHOLD"),
+            cancelThreshold: _u8(vm.envOr("RECOVERY_CANCEL_THRESHOLD", uint256(3)), "RECOVERY_CANCEL_THRESHOLD"),
             silence: _u64(vm.envOr("RECOVERY_SILENCE", uint256(30 days)), "RECOVERY_SILENCE"),
             holdPeriod: _u64(vm.envOr("RECOVERY_HOLD_PERIOD", uint256(14 days)), "RECOVERY_HOLD_PERIOD")
         });

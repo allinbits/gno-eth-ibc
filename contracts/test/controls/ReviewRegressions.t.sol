@@ -457,7 +457,10 @@ contract ReviewRegressionsTest is ControlsFixture {
         _adminWith(3, 1);
         vm.expectRevert(IIBCAdmin.RecoveryState.selector);
         _adminWith(5, 2);
+        // r11 #4: cancelling needs a guardian majority too, three of four (ADR §7.12 step 3)
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
         _adminWith(3, 2);
+        _adminWith(3, 3);
         _adminWith(4, 4);
     }
 
@@ -2283,5 +2286,27 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertTrue(tok.reentryRefused());
         assertEq(tok.balanceOf(alice), 1000, "each refund paid exactly once");
         assertEq(ctl.sendRecord(clientId, b.sequence).refunded, 100);
+    }
+
+    // ================================================================================================ round 11 ==
+
+    /// @notice r11 #1: a conflict after an unpause was recorded survives that unpause (the conflict block is
+    /// refreshed on every conflict, not kept from the first one), so 7-day decisions stay deferred.
+    function test_r11_1_laterConflict_survivesAnOlderUnpause() public {
+        _recvGov(_env(1, S.KIND_SETTINGS, P.settings(clientId, 1)));
+        _recvGov(_env(1, S.KIND_SETTINGS, P.settings(clientId, 2))); // conflict A
+        _skip(12);
+        _recvGov(_env(2, S.KIND_UNPAUSE, P.unpause(2, "")));
+        uint64 recorded = admin.decision(admin.epoch(), 2).recordedBlock;
+        _skip(12);
+        _recvGov(_env(1, S.KIND_SETTINGS, P.settings(clientId, 3))); // conflict B, after the unpause's recording
+        assertGt(admin.conflictBlock(), recorded, "refreshed by the later conflict");
+        _skip(1 days);
+        admin.execute(2);
+        assertEq(admin.decision(admin.epoch(), 2).state, S.EXECUTED);
+        assertGt(admin.conflictBlock(), 0, "the later conflict stands");
+        _skip(7 days);
+        vm.expectRevert(IIBCAdmin.Deferred.selector);
+        admin.execute(1);
     }
 }
