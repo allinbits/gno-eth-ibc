@@ -49,6 +49,12 @@ attribution terms extend to works that use those files.
   verifier swap and replacement). Guardian keys carry a monotonic generation per
   seat, and each flag stores the generation of the key that set it, so a flag stands only if the seat's current key
   set it.
+  - A replacement on IBCAdmin's key list reaches the transfer app's copy (`setGuardianKeys`), which retires the
+    replaced keys' flags by generation without touching that flag set's hold moments.
+  - The hold reads them lazily: a hold left with fewer than two standing guardian flags and no dip ends.
+  - So does a dip in which a guardian flag that stood when the dip started is still set but no longer stands. Its
+    key was replaced (`dipMask` records the seats standing at the dip's start), and this ends the hold at once, as a
+    replacement on the same flag set does. An owner's own clear keeps the 24-hour grace.
 - **`gno.storage.IBCAdmin`** (`IBCAdminStorage.Layout`): epoch, last seq, epoch client, last record time, conflict
   flag, executor and its code hash, decisions and tombstones keyed by epoch, guardian keys and flags, hold history,
   recovery state, `setupDone`, the decision that last set each setting (`appliedSeq`), gno.land's chain id, the client

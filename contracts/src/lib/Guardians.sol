@@ -40,6 +40,10 @@ library Guardians {
         /// While a hold stands, when its guardian flags last dipped below two (block zero: at two or more).
         uint64 dipBlock;
         uint64 dipTime;
+        /// The guardian seats whose flags stood when the dip started (bit i: seat i). One of them later found set
+        /// but no longer standing was invalidated by a replacement of its key on another flag set's key list, which
+        /// ends the hold at once, as a replacement on this set does (`replace`).
+        uint8 dipMask;
     }
 
     /// @notice The keys: seats 0-3 (guardians) then watch keys 4-5, and each seat's key generation. A flag stands
@@ -138,6 +142,7 @@ library Guardians {
     {
         if (f.holdBlock == 0) return (false, 0, 0);
         if (guardianFlags(keys, f) >= 2) return (true, f.holdBlock, f.holdTime);
+        if (f.dipBlock != 0 && lostInDip(keys, f)) return (false, 0, 0);
         if (f.dipBlock != 0 && (nowTime < f.dipTime || nowTime - f.dipTime < grace)) {
             return (true, f.holdBlock, f.holdTime);
         }
@@ -150,7 +155,7 @@ library Guardians {
     function settle(Keys storage keys, Flags storage f, uint64 nowTime, uint64 grace) internal {
         if (f.holdBlock == 0) return;
         if (f.dipBlock != 0) {
-            if (nowTime >= f.dipTime && nowTime - f.dipTime >= grace) _endHold(f);
+            if (lostInDip(keys, f) || (nowTime >= f.dipTime && nowTime - f.dipTime >= grace)) _endHold(f);
         } else if (guardianFlags(keys, f) < 2) {
             _endHold(f);
         }
@@ -160,10 +165,26 @@ library Guardians {
     function recompute(Keys storage keys, Flags storage f, uint64 nowBlock, uint64 nowTime) internal {
         if (guardianFlags(keys, f) >= 2) {
             if (f.holdBlock == 0) (f.holdBlock, f.holdTime) = (nowBlock, nowTime);
-            (f.dipBlock, f.dipTime) = (0, 0);
+            (f.dipBlock, f.dipTime, f.dipMask) = (0, 0, 0);
         } else if (f.holdBlock != 0 && f.dipBlock == 0) {
             (f.dipBlock, f.dipTime) = (nowBlock, nowTime);
+            uint8 mask;
+            for (uint256 i = 0; i < SEATS; i++) {
+                if (standing(keys, f, i)) mask |= uint8(1 << i);
+            }
+            f.dipMask = mask;
         }
+    }
+
+    /// @notice During a dip: whether a guardian flag that stood when it started is still set but no longer stands
+    /// (its key replaced on another flag set's key list since). Its holder's own clear or an unpause would have
+    /// cleared it instead.
+    function lostInDip(Keys storage keys, Flags storage f) internal view returns (bool) {
+        uint8 mask = f.dipMask;
+        for (uint256 i = 0; mask != 0 && i < SEATS; i++) {
+            if (mask & (1 << i) != 0 && f.flagBlock[i] != 0 && !standing(keys, f, i)) return true;
+        }
+        return false;
     }
 
     /// @notice A key sets its own flag at now (fresh on every set). Returns its seat.
@@ -318,6 +339,7 @@ library Guardians {
         f.holdTime = 0;
         f.dipBlock = 0;
         f.dipTime = 0;
+        f.dipMask = 0;
     }
 
     // ------------------------------------------------------------------------------------------------ views --

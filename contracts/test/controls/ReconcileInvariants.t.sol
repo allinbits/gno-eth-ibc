@@ -1899,10 +1899,61 @@ contract ReconcileHandler is Test {
         if (_reconcile(0, true) && ctl.routeClosed(_live())) _reopen();
     }
 
+    // ------------------------------------------------------------------------------------- round 15 actions --
+
+    /// @notice A guardian replaced (kind 3) during a dip of the live route's flags, on IBCAdmin's key list (the
+    /// transfer app's copy follows): G0 and G1 flag, G1 clears (a dip), G0's key is replaced. No guardian flag
+    /// stands any more, so the hold ends at once. G0's key is then put back (another kind 3).
+    function replaceDuringDip(bool refunds) public {
+        calls++;
+        _ratchet();
+        if (!_ensureOpen()) return;
+        (, uint64 openedAt,,) = admin.recovery();
+        if (openedAt != 0) return; // kind 3 waits while a recovery is open
+        string memory live = _live();
+        for (uint256 g = 0; g < 2; g++) {
+            vm.prank(G[g]);
+            if (refunds) {
+                try ctl.setRefundsFlag(live) { }
+                    catch {
+                    return;
+                }
+            } else {
+                try ctl.setRouteFlag(live) { }
+                    catch {
+                    return;
+                }
+            }
+        }
+        address fresh = makeAddr(string.concat("replacement-", vm.toString(++nonce)));
+        uint64 out = _decide(S.KIND_SEATS, P.seat1(0, fresh));
+        // the dip starts a little before the replacement matures (well within the 24-hour grace)
+        _skip(7 days - 1 hours);
+        vm.prank(G[1]);
+        if (refunds) ctl.clearRefundsFlag(live);
+        else ctl.clearRouteFlag(live);
+        bool dip = (refunds ? ctl.refundsHold(live) : ctl.routeHold(live)).blockNumber != 0;
+        _skip(1 hours + 1);
+        try admin.execute(out) { } catch { }
+        bool ended = admin.decision(admin.epoch(), out).state == S.EXECUTED
+            && (refunds ? ctl.refundsHold(live) : ctl.routeHold(live)).blockNumber == 0;
+        _checkpoint();
+        if (dip && ended) ok[refunds ? "replaceInDipRefunds" : "replaceInDipRoute"]++;
+        // G0's key back (recorded now: a kind 3 naming a seat's current key is spent at recording), a matured kind 3
+        _executeAll(_one(_decide(S.KIND_SEATS, P.seat1(0, G[0]))));
+        if (!refunds) {
+            // nobody's route flag stands; an unpause clears the stale records (none stands, so nothing changes)
+            vm.prank(address(admin));
+            try ctl.unpauseRoute(live, uint64(vm.getBlockNumber()) + 1) { } catch { }
+        }
+    }
+
     // ----------------------------------------------------------------------------------- coverage sweep --
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["replaceInDipRefunds"] == 0) replaceDuringDip(true);
+        if (ok["replaceInDipRoute"] == 0) replaceDuringDip(false);
         if (ok["olderRefundHeld"] == 0) this.partialBacking();
         if (ok["partialBackingHeld"] == 0) this.partialBacking();
         if (ok["lossResolvedIncidentSealed"] == 0) this.lossResolvedIncidentDuringReopening();
@@ -2329,7 +2380,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[56] memory names = [
+        string[58] memory names = [
+            "replaceInDipRefunds",
+            "replaceInDipRoute",
             "olderRefundHeld",
             "partialBackingHeld",
             "lossResolvedIncidentSealed",
@@ -2392,7 +2445,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[39] memory required = [
+        string[41] memory required = [
+            "replaceInDipRefunds",
+            "replaceInDipRoute",
             "olderRefundHeld",
             "partialBackingHeld",
             "lossResolvedIncidentSealed",

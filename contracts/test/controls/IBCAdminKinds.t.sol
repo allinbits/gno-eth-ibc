@@ -763,4 +763,63 @@ contract IBCAdminKindsTest is ControlsFixture {
         vm.expectRevert(IIBCAdmin.SetupAlreadyDone.selector);
         admin.finishSetup(launch);
     }
+
+    /// @notice r15 #2, refund flags: G0, G1 and W0 set them; G1 clears, starting a dip; a matured kind 3 replaces G0
+    /// during the dip. No guardian refund flag stands any more, so the hold ends at once (as a replacement on the same
+    /// flag set does), and a matured unpause executes instead of being spent as "hold", clearing W0's flag.
+    function test_r15_2_replacementDuringADip_endsTheRefundsHold() public {
+        vm.prank(G[0]);
+        ctl.setRefundsFlag(clientId);
+        vm.prank(G[1]);
+        ctl.setRefundsFlag(clientId);
+        vm.prank(W[0]);
+        ctl.setRefundsFlag(clientId);
+        assertTrue(ctl.refundsHold(clientId).blockNumber != 0);
+        uint64 seats = _decidePending(S.KIND_SEATS, P.seat1(0, makeAddr("fresh")));
+        uint64 unpause = _decidePending(S.KIND_UNPAUSE, P.unpause(1, clientId));
+        _skip(7 days - 2 hours);
+        vm.prank(G[1]);
+        ctl.clearRefundsFlag(clientId); // a dip: the hold stands for its grace
+        assertTrue(ctl.refundsHold(clientId).blockNumber != 0, "the dip's grace");
+        _skip(2 hours + 1);
+        admin.execute(seats); // G0 replaced during the dip
+        assertEq(_state(seats), S.EXECUTED);
+        assertEq(ctl.refundsHold(clientId).blockNumber, 0, "the hold ended at once");
+        admin.execute(unpause);
+        assertEq(_state(unpause), S.EXECUTED, "not spent as a hold");
+    }
+
+    /// @notice r15 #2, route flags, through the transfer app's key copy directly: the same, and an owner's own clear
+    /// during the dip keeps its grace.
+    function test_r15_2_replacementDuringADip_endsTheRouteHold() public {
+        vm.prank(G[0]);
+        ctl.setRouteFlag(clientId);
+        vm.prank(G[1]);
+        ctl.setRouteFlag(clientId);
+        vm.prank(G[2]);
+        ctl.setRouteFlag(clientId);
+        vm.prank(G[2]);
+        ctl.clearRouteFlag(clientId); // still two: no dip
+        vm.prank(G[1]);
+        ctl.clearRouteFlag(clientId); // a dip: G0 alone
+        assertTrue(ctl.routeHold(clientId).blockNumber != 0, "the dip's grace");
+        // a replacement of a seat whose flag was down at the dip's start ends nothing
+        address[6] memory keys = [G[0], G[1], makeAddr("fresh2"), G[3], W[0], W[1]];
+        vm.prank(address(admin));
+        ctl.setGuardianKeys(keys);
+        assertTrue(ctl.routeHold(clientId).blockNumber != 0, "G2 held no flag in the dip");
+        // G0's key replaced: its standing flag gone, the hold ends now
+        keys[0] = makeAddr("fresh0");
+        vm.prank(address(admin));
+        ctl.setGuardianKeys(keys);
+        assertEq(ctl.routeHold(clientId).blockNumber, 0, "the hold ended at once");
+        // and the lazily kept moments agree on the next change
+        vm.prank(W[0]);
+        ctl.setRouteFlag(clientId);
+        assertEq(ctl.routeHold(clientId).blockNumber, 0);
+        _skip(12);
+        vm.prank(address(admin));
+        ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber()));
+        assertFalse(ctl.routePaused(clientId));
+    }
 }
