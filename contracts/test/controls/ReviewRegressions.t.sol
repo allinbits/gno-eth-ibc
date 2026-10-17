@@ -2309,4 +2309,108 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.expectRevert(IIBCAdmin.Deferred.selector);
         admin.execute(1);
     }
+
+    function _ackNotice(
+        IICS26RouterMsgs.Packet memory pkt,
+        bytes memory ack,
+        address relayer
+    )
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodeCall(
+            IIBCSenderCallbacks.onAckPacket,
+            (
+                true,
+                IIBCAppCallbacks.OnAcknowledgementPacketCallback(
+                    pkt.sourceClient, pkt.destClient, pkt.sequence, pkt.payloads[0], ack, relayer
+                )
+            )
+        );
+    }
+
+    /// @notice r11 #2: a forged success ack A of a delivered packet, whose notification the sender refused, is
+    /// replaced by the proven success ack B once action 3 settles it: A can no longer be retried, B is delivered,
+    /// exactly once.
+    function test_r11_2_provenSuccessAck_replacesAForgedOne() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        bytes memory forged = bytes("{\"result\":\"Zm9yZ2Vk\"}");
+        bytes memory proven = bytes("{\"result\":\"AQ==\"}");
+        adapter.setRefuse(true);
+        _ack(pkt, forged); // A: accepted by the compromised verifier; its notification fails and is kept
+        adapter.setRefuse(false);
+        assertEq(adapter.successes(), 0);
+        _retire();
+        _proveDelivered(pkt); // B
+        _settle(_item(pkt.sequence, 3, 0));
+        // A is never announced once B is proven
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence, _ackNotice(pkt, forged, address(this)), 0);
+        // nor any ack but the proven one
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, forged, 0);
+        // B: a failed attempt keeps it, then it is delivered once
+        adapter.setRefuse(true);
+        assertFalse(ctl.notifySettled(pkt, proven, 0));
+        adapter.setRefuse(false);
+        assertTrue(ctl.notifySettled(pkt, proven, 0));
+        assertEq(adapter.successes(), 1);
+        assertEq(adapter.lastAck(), keccak256(proven));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, proven, 0);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence, _ackNotice(pkt, forged, address(this)), 0);
+        assertEq(adapter.successes(), 1);
+    }
+
+    /// @notice r11 #2, the other order: the transport's success notification, retried after action 3 proved the same
+    /// ack, is delivered once; a settled notification of it after that is refused.
+    function test_r11_2_sameAck_retriedOnce() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        bytes memory ok = bytes("{\"result\":\"AQ==\"}");
+        adapter.setRefuse(true);
+        _ack(pkt, ok);
+        adapter.setRefuse(false);
+        _retire();
+        _proveDelivered(pkt);
+        _settle(_item(pkt.sequence, 3, 0));
+        assertTrue(ctl.retryNotification(clientId, pkt.sequence, _ackNotice(pkt, ok, address(this)), 0));
+        assertEq(adapter.successes(), 1);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, ok, 0);
+        assertEq(adapter.successes(), 1);
+    }
+
+    /// @notice r11 #2: the same ack delivered through `notifySettled` first; the transport's kept notification is
+    /// then done and never retried.
+    function test_r11_2_sameAck_settledFirst_neverRetried() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        bytes memory ok = bytes("{\"result\":\"AQ==\"}");
+        adapter.setRefuse(true);
+        _ack(pkt, ok);
+        adapter.setRefuse(false);
+        _retire();
+        _proveDelivered(pkt);
+        _settle(_item(pkt.sequence, 3, 0));
+        assertTrue(ctl.notifySettled(pkt, ok, 0));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.retryNotification(clientId, pkt.sequence, _ackNotice(pkt, ok, address(this)), 0);
+        assertEq(adapter.successes(), 1);
+    }
 }

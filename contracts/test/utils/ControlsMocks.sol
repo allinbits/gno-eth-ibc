@@ -102,14 +102,20 @@ contract SenderAdapter is IIBCSenderCallbacks {
         }
     }
 
-    function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external {
+    bytes32 public lastAck; // the hash of the last success ack announced
+
+    function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata cb) external {
         while (burn) { } // burns all the gas it is given
         require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
         _book();
         notices++;
-        if (success) successes++;
-        else _forward();
+        if (success) {
+            successes++;
+            lastAck = keccak256(cb.acknowledgement);
+        } else {
+            _forward();
+        }
     }
 
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {

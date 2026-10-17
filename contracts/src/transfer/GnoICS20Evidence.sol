@@ -201,11 +201,16 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         bytes32 h = keccak256(bytes(packet.sourceClient));
         SendRecord storage rec = _g().records[h][packet.sequence];
         (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+        // a success the transport's ack announced but never delivered (the sender refused it): the settlement's
+        // proven ack replaces it, which may differ from the transport's (a forged ack of a delivered packet). Exactly
+        // once: delivering either marks the transport's notification done
+        bool replace = terminal == 1 && transport == 1 && _g().notices[h][packet.sequence] != bytes32(0)
+            && !_g().noticeDone[h][packet.sequence];
         // the settlement's terminal outcome, when the transport brought another kind (or none): a refund once paid in
         // full, or a success with the ack proven for it
         require(
             rec.commitment != bytes32(0) && ICS24Host.packetCommitmentBytes32(packet) == rec.commitment && terminal != 0
-                && terminal != transport
+                && (terminal != transport || replace)
                 && (terminal == 2
                         ? rec.payment == Payment.Claimed
                         : keccak256(ack) == _g().provenAck[h][packet.sequence]),
@@ -227,7 +232,9 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     )
                 )
             );
-        return GnoTransferStorage.deliverSettled(rec.sender, call, packet.sourceClient, packet.sequence, gasBudget);
+        bool ok = GnoTransferStorage.deliverSettled(rec.sender, call, packet.sourceClient, packet.sequence, gasBudget);
+        if (ok && replace) _g().noticeDone[h][packet.sequence] = true;
+        return ok;
     }
 
     /// @notice See IGnoICS20Controls.
@@ -242,7 +249,24 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         nonReentrant
         returns (bool)
     {
-        SendRecord storage rec = _g().records[keccak256(bytes(clientId))][sequence];
+        bytes32 h = keccak256(bytes(clientId));
+        SendRecord storage rec = _g().records[h][sequence];
+        (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+        if (transport == 1 && terminal == 1) {
+            // settled as delivered: only the proven ack is announced (a forged transport ack never is)
+            require(
+                bytes4(call) == IIBCSenderCallbacks.onAckPacket.selector
+                    && _ackOf(call[4:]) == _g().provenAck[h][sequence],
+                GnoNoNotification(clientId, sequence)
+            );
+        }
         return GnoTransferStorage.retryNotice(rec, clientId, sequence, call, gasBudget);
+    }
+
+    /// @notice The ack hash of an encoded `onAckPacket(bool, OnAcknowledgementPacketCallback)` argument list.
+    function _ackOf(bytes calldata args) private pure returns (bytes32) {
+        (, IIBCAppCallbacks.OnAcknowledgementPacketCallback memory cb) =
+            abi.decode(args, (bool, IIBCAppCallbacks.OnAcknowledgementPacketCallback));
+        return keccak256(cb.acknowledgement);
     }
 }
