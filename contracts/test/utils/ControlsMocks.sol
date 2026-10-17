@@ -298,3 +298,52 @@ contract StatusMock {
         return abi.encode(false);
     }
 }
+
+/// @notice A contract sender whose IIBCSenderCallbacks callback tries to re-enter the transfer app (a claim): the
+/// shared lock refuses it; the revert data it got is kept.
+contract ReentrantSender is IIBCSenderCallbacks {
+    IICS20Transfer public immutable ics20;
+    IERC20 public immutable token;
+    bytes public reentryReason;
+    uint256 public callbacks;
+
+    constructor(IICS20Transfer ics20_, IERC20 token_) {
+        (ics20, token) = (ics20_, token_);
+        token_.approve(address(ics20_), type(uint256).max);
+    }
+
+    function send(uint256 amount, string calldata clientId) external returns (uint64) {
+        return ics20.sendTransfer(
+            IICS20TransferMsgs.SendTransferMsg({
+                denom: address(token),
+                amount: amount,
+                receiver: "g1receiver",
+                sourceClient: clientId,
+                destPort: "transfer",
+                timeoutTimestamp: uint64(block.timestamp + 600),
+                memo: ""
+            })
+        );
+    }
+
+    function _reenter() private {
+        callbacks++;
+        try IGnoICS20Controls(address(ics20)).claim("client-0", address(token), 1) {
+            reentryReason = "";
+        } catch (bytes memory r) {
+            reentryReason = r;
+        }
+    }
+
+    function onAckPacket(bool, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external {
+        _reenter();
+    }
+
+    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {
+        _reenter();
+    }
+
+    function supportsInterface(bytes4 id) external pure returns (bool) {
+        return id == type(IIBCSenderCallbacks).interfaceId || id == type(IERC165).interfaceId;
+    }
+}
