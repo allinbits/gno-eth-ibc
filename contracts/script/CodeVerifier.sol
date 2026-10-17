@@ -140,7 +140,10 @@ abstract contract CodeVerifier is Script {
         IIBCAdmin.RecoveryConfig memory rc = a.recoveryConfig();
         bytes memory config =
             abi.encode(IBCAdminConfigLike(router, am, ics20, exec, a.govClient(), a.gnoChainId(), seats, watch, rc));
-        ok = rebuilds(ibcAdmin, "IBCAdmin.sol:IBCAdmin", config, a.deployer(), 0, new address[](0));
+        // its constructor deploys the launch check at its first nonce
+        address[] memory created = new address[](1);
+        created[0] = _word(ibcAdmin, "launchCheck()");
+        ok = rebuilds(ibcAdmin, "IBCAdmin.sol:IBCAdmin", config, a.deployer(), 1, created);
         console2.log(ok ? "ok      " : "MISMATCH", "IBCAdmin.sol:IBCAdmin", ibcAdmin);
         console2.log("  deployer", a.deployer());
         console2.log("  recovery delay, threshold, cancel threshold", rc.delay, rc.threshold, rc.cancelThreshold);

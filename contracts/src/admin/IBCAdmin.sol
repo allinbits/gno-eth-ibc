@@ -14,6 +14,7 @@ import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { IICS20Transfer } from "@eureka/interfaces/IICS20Transfer.sol";
 import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
+import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
 
 import { IIBCAdmin } from "../interfaces/IIBCAdmin.sol";
 import { IGuardians } from "../interfaces/IGuardians.sol";
@@ -23,6 +24,7 @@ import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
 import { IBCAdminExec } from "./IBCAdminExec.sol";
 import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
+import { IBCAdminLaunchCheck } from "./IBCAdminLaunchCheck.sol";
 
 /// @title IBCAdmin: the permanent governance app on port `ibcgov` (gno.land's `gov`)
 /// @notice Plain code, never behind a proxy, so immutable from its deployment; router ports can never be registered
@@ -52,15 +54,6 @@ import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 /// replaced only by kind 9.
 
 /// @notice The transfer app's reentrancy lock, read by IBCAdmin.
-interface IGnoVerifierViews {
-    function getClientState() external view returns (bytes memory);
-    function getConsensusState(uint64 height) external view returns (Msgs.ConsensusState memory);
-}
-
-interface IVoucherBinding {
-    function ics20() external view returns (address);
-}
-
 interface IGnoICS20Busy {
     function gnoBusy() external view returns (bool);
 }
@@ -98,6 +91,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     address public immutable ics20;
     /// @notice The account that deployed this contract: `finishSetup` checks it holds no role any more.
     address public immutable deployer;
+    /// @notice `finishSetup`'s launch checks (11 to 15), deployed by this contract's constructor.
+    address public immutable launchCheck;
 
     uint64 internal immutable _recoveryDelay;
     uint8 internal immutable _recoveryThreshold;
@@ -127,6 +122,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         accessManager = c.accessManager;
         ics20 = c.ics20;
         deployer = msg.sender;
+        launchCheck = address(new IBCAdminLaunchCheck());
         (_recoveryDelay, _recoveryThreshold, _recoveryCancelThreshold, _recoverySilence, _recoveryHoldPeriod) =
         (rc.delay, rc.threshold, rc.cancelThreshold, rc.silence, rc.holdPeriod);
 
@@ -184,14 +180,87 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return abi.encodePacked(ep, seq, status, redispatch ? uint8(1) : uint8(0));
     }
 
-    /// @notice IBCAdmin sends no packets.
-    function onAcknowledgementPacket(IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external pure {
-        revert NotSupported();
+    // ========================================================================================= epoch notice ==
+
+    /// @notice The epoch notice's timeout: a fixed 23 hours, inside the router's one-day cap.
+    uint64 private constant NOTICE_TIMEOUT = 23 hours;
+
+    /// @notice Epoch `ep`'s notice (§7.12): `version u8 (1) ‖ epoch u32 ‖ clientId`, big-endian, the epoch's
+    /// client id as raw trailing bytes (no length: the payload's own length bounds it). Empty if none is owed.
+    function epochNotice(uint32 ep) public view returns (bytes memory) {
+        S.Layout storage l = S.layout();
+        if (!l.notices[ep].owed) return "";
+        return abi.encodePacked(uint8(1), ep, bytes(l.notices[ep].client));
     }
 
-    /// @notice IBCAdmin sends no packets.
-    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external pure {
-        revert NotSupported();
+    /// @notice Sends epoch `ep`'s notice again, while gno.land has not acknowledged it (never relayed, an error
+    /// ack, timed out, or the router refused it). Permissionless; the same bytes every time. Every epoch keeps its
+    /// own notice: after consecutive replacements each one stays re-sendable.
+    function resendEpochNotice(uint32 ep) external {
+        S.Notice storage n = S.layout().notices[ep];
+        if (!n.owed || n.acked) revert NoNoticeOwed();
+        _sendNotice(ep);
+    }
+
+    /// @notice Sends the notice from `ibcgov` to gno.land's `gov` port over the epoch's client. A refusal by the
+    /// router (the client unusable for now) never undoes the epoch switch: the notice stays owed, for a resend.
+    function _sendNotice(uint32 ep) private {
+        S.Notice storage n = S.layout().notices[ep];
+        IICS26RouterMsgs.MsgSendPacket memory m = IICS26RouterMsgs.MsgSendPacket({
+            sourceClient: n.client,
+            timeoutTimestamp: uint64(block.timestamp) + NOTICE_TIMEOUT,
+            payload: IICS26RouterMsgs.Payload(PORT, COUNTERPARTY_PORT, VERSION, ENCODING, epochNotice(ep))
+        });
+        (bool ok, bytes memory ret) = router.call(abi.encodeCall(IICS26Router.sendPacket, (m)));
+        uint64 seq = ok && ret.length == 32 ? abi.decode(ret, (uint64)) : 0;
+        if (seq != 0) n.seq = seq;
+        emit EpochNoticeSent(ep, n.client, seq);
+    }
+
+    /// @notice A new epoch (kind 10, the emergency recovery): its own notice owed and sent over its new client.
+    function _openNotice(S.Layout storage l) private {
+        S.Notice storage n = l.notices[l.epoch];
+        (n.owed, n.client) = (true, l.govClient);
+        _sendNotice(l.epoch);
+    }
+
+    /// @notice An acknowledgement of an epoch's notice (any of its sends: the bytes are the same). gno.land answers in
+    /// IBCAdmin's own ack layout, `epoch u32 ‖ seq u64 (0) ‖ status u8 ‖ redispatch u8 (0)`: status 1 (switched)
+    /// or 3 (already switched) for that epoch ends it; anything else (eureka's universal error ack) leaves it owed,
+    /// for a resend. Acks of anything else are ignored, never reverted.
+    function onAcknowledgementPacket(IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata m) external {
+        if (msg.sender != router) revert NotRouter(msg.sender);
+        uint32 ep = _noticeEpoch(m.sourceClient, m.payload);
+        if (ep == 0) return;
+        bytes calldata a = m.acknowledgement;
+        bool done = a.length == 14 && uint32(bytes4(a[0:4])) == ep && (a[12] == 0x01 || a[12] == 0x03);
+        if (done) S.layout().notices[ep].acked = true;
+        emit EpochNoticeAcknowledged(ep, m.sequence, done);
+    }
+
+    /// @notice A timeout of an epoch's notice: it stays owed, for a resend.
+    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata m) external {
+        if (msg.sender != router) revert NotRouter(msg.sender);
+        uint32 ep = _noticeEpoch(m.sourceClient, m.payload);
+        if (ep != 0) emit EpochNoticeAcknowledged(ep, m.sequence, false);
+    }
+
+    /// @notice The epoch whose notice this packet is (sent over that epoch's client, with its exact bytes), or 0.
+    function _noticeEpoch(
+        string calldata sourceClient,
+        IICS26RouterMsgs.Payload calldata p
+    )
+        private
+        view
+        returns (uint32 ep)
+    {
+        if (p.value.length < 5) return 0;
+        ep = uint32(bytes4(p.value[1:5]));
+        S.Notice storage n = S.layout().notices[ep];
+        if (
+            !n.owed || keccak256(bytes(sourceClient)) != keccak256(bytes(n.client))
+                || keccak256(p.value) != keccak256(epochNotice(ep))
+        ) return 0;
     }
 
     function _deliver(
@@ -409,6 +478,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             emit DecisionSpent(ep, seq, kind, spent);
         } else {
             emit DecisionExecuted(ep, seq, kind);
+            if (l.epoch != ep) _openNotice(l); // a kind 10: the new epoch's notice
         }
     }
 
@@ -476,9 +546,12 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Executes the open proposal after its delay. Permissionless.
     function executeRecovery() external {
-        if (!S.layout().setupDone) revert SetupPending();
+        S.Layout storage l = S.layout();
+        if (!l.setupDone) revert SetupPending();
         RecoveryConfig memory c = _recoveryConfig();
+        uint32 ep = l.epoch;
         _delegateRecovery(abi.encodeCall(IBCAdminRecovery.executeRecovery, (c)));
+        if (l.epoch != ep) _openNotice(l);
     }
 
     /// @notice Runs the executor as this contract from the executor itself, in a call frame of its own, so that a
@@ -498,7 +571,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (l.setupDone) revert SetupAlreadyDone();
         // the deployer's own record of what it created: nobody else can attest a launch
         if (msg.sender != deployer) revert SetupIncomplete(0);
-        _checkLaunch(launch);
+        IBCAdminLaunchCheck(launchCheck).check(address(this), launch);
         _delegate(l, abi.encodeCall(IBCAdminExec.checkSetup, (deployer)));
         if (l.epoch != 1 || l.lastSeq != 0 || l.holds.length != 0 || l.conflictBlock != 0 || l.recovery.openedAt != 0) {
             revert SetupIncomplete(40);
@@ -509,50 +582,6 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice The hash of a client state's parameters no update changes (everything but its latest height and its
     /// frozen flag).
-    function clientParamsHash(Msgs.ClientState memory s) public pure returns (bytes32) {
-        return keccak256(abi.encode(s.chainId, s.revisionNumber, s.trustLevel, s.trustingPeriod, s.maxClockDrift));
-    }
-
-    /// @notice Checks 11 to 15: the launch client and every component naming it are the deployment's own.
-    function _checkLaunch(Launch calldata launch) private view {
-        string memory id = launch.clientId;
-        _check(keccak256(bytes(S.layout().govClient)) == keccak256(bytes(id)), 11);
-        address lc = address(IICS02Client(router).getClient(id));
-        _check(lc == launch.lightClient && lc.code.length != 0 && lc.codehash == launch.lightClientCodeHash, 11);
-        bytes memory cs = IGnoVerifierViews(lc).getClientState();
-        Msgs.ClientState memory state = abi.decode(cs, (Msgs.ClientState));
-        // the immutable parameters and the original checkpoint, never the current height or consensus state: a
-        // verified update anyone relays advances those, and must not stop the launch; a frozen client must
-        _check(keccak256(bytes(state.chainId)) == keccak256(bytes(S.layout().gnoChainId)) && !state.isFrozen, 12);
-        if (launch.clientParamsHash != bytes32(0)) _check(clientParamsHash(state) == launch.clientParamsHash, 12);
-        if (launch.consensusStateHash != bytes32(0)) {
-            _check(state.latestHeight >= launch.launchHeight, 12);
-            Msgs.ConsensusState memory c = IGnoVerifierViews(lc).getConsensusState(launch.launchHeight);
-            _check(keccak256(abi.encode(c)) == launch.consensusStateHash, 12);
-        }
-        IICS02ClientMsgs.CounterpartyInfo memory cp = IICS02Client(router).getCounterparty(id);
-        _check(
-            keccak256(bytes(cp.clientId)) == keccak256(bytes(launch.counterpartyClientId))
-                && S.canonicalCounterparty(cp.clientId, cp.merklePrefix),
-            13
-        );
-        address voucher = launch.ugnotVoucher;
-        _check(
-            IICS20Transfer(ics20).ibcERC20Contract(string.concat(ICS20Lib.DEFAULT_PORT_ID, "/", id, "/ugnot"))
-                    == voucher && IVoucherBinding(voucher).ics20() == ics20,
-            14
-        );
-        _check(
-            IGnoICS20Controls(ics20).limits(id, voucher).set
-                && IGnoICS20Controls(ics20).quarantineSeconds(id) == launch.quarantineSeconds,
-            15
-        );
-    }
-
-    function _check(bool ok, uint8 n) private pure {
-        if (!ok) revert SetupIncomplete(n);
-    }
-
     // ============================================================================================== executor ==
 
     function _exec(S.Layout storage l) private view returns (address x) {

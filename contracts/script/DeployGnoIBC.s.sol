@@ -308,7 +308,10 @@ contract DeployGnoIBC is Script {
         l.lightClientCodeHash = d.gnoLightClient.codehash;
         if (p.lightClient == address(0)) {
             l.launchHeight = p.clientState.latestHeight;
-            l.clientParamsHash = IBCAdmin(d.ibcAdmin).clientParamsHash(p.clientState);
+            Msgs.ClientState memory c = p.clientState;
+            // as IBCAdmin hashes the parameters no update changes
+            l.clientParamsHash =
+                keccak256(abi.encode(c.chainId, c.revisionNumber, c.trustLevel, c.trustingPeriod, c.maxClockDrift));
             l.consensusStateHash = keccak256(abi.encode(p.consensusState));
         }
         l.counterpartyClientId = p.counterparty;

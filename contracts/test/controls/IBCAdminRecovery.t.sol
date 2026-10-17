@@ -2,6 +2,8 @@
 pragma solidity ^0.8.28;
 
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
+import { Vm } from "forge-std/Vm.sol";
 
 import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessManager.sol";
 import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
@@ -403,5 +405,26 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         _skip(DELAY);
         vm.expectRevert(IIBCAdmin.RecoveryState.selector);
         admin.executeRecovery();
+    }
+
+    /// @notice ADR §7.12: the emergency recovery opens the next epoch and sends its notice over the attested client.
+    function test_recovery_sendsTheEpochNotice() public {
+        _openFrozen();
+        _skip(DELAY + 1);
+        vm.recordLogs();
+        admin.executeRecovery();
+        assertEq(admin.epoch(), 2);
+        assertEq(admin.epochNotice(2), abi.encodePacked(uint8(1), uint32(2), "gnoland-7"));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool sent;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
+                IICS26RouterMsgs.Packet memory pkt = abi.decode(logs[i].data, (IICS26RouterMsgs.Packet));
+                sent = keccak256(bytes(pkt.sourceClient)) == keccak256("gnoland-7")
+                    && keccak256(pkt.payloads[0].value) == keccak256(admin.epochNotice(2));
+            }
+        }
+        assertTrue(sent, "the notice over the attested client");
+        admin.resendEpochNotice(2);
     }
 }

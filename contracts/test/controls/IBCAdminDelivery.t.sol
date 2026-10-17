@@ -267,11 +267,16 @@ contract IBCAdminDeliveryTest is ControlsFixture {
         vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotRouter.selector, address(this)));
         admin.onRecvPacket(m);
         IIBCAppCallbacks.OnAcknowledgementPacketCallback memory a;
-        vm.expectRevert(IIBCAdmin.NotSupported.selector);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotRouter.selector, address(this)));
         admin.onAcknowledgementPacket(a);
         IIBCAppCallbacks.OnTimeoutPacketCallback memory t;
-        vm.expectRevert(IIBCAdmin.NotSupported.selector);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotRouter.selector, address(this)));
         admin.onTimeoutPacket(t);
+        // from the router, an ack or timeout of anything but an epoch notice is ignored, never reverted
+        vm.startPrank(address(router));
+        admin.onAcknowledgementPacket(a);
+        admin.onTimeoutPacket(t);
+        vm.stopPrank();
     }
 
     /// @notice Governance is not quarantined: the route's quarantine stops token receives only.

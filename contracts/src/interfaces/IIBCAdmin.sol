@@ -86,6 +86,8 @@ interface IIBCAdmin {
     error SetupIncomplete(uint8 check);
     /// @notice Governance waits for `finishSetup`: nothing is recorded, executed or recovered before it.
     error SetupPending();
+    /// @notice No epoch notice is owed: none since the launch, or gno.land acknowledged it.
+    error NoNoticeOwed();
     error RecoveryDisabled();
     error RecoveryNotEligible();
     error RecoveryState();
@@ -117,4 +119,8 @@ interface IIBCAdmin {
     event RecoveryCancelled(bytes32 indexed proposal);
     event RecoveryExecuted(bytes32 indexed proposal, string newClientId);
     event SetupDone();
+    /// @notice The epoch notice sent over the new client (§7.12); `sequence` zero: the router refused it, resend.
+    event EpochNoticeSent(uint32 indexed epoch, string clientId, uint64 sequence);
+    /// @notice An acknowledgement (`done`: gno.land switched) or, `done` false, an error ack or a timeout: resend.
+    event EpochNoticeAcknowledged(uint32 indexed epoch, uint64 sequence, bool done);
 }

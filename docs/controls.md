@@ -94,6 +94,26 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 - Every refusal is an error acknowledgement (the router's universal error ack; the custom error is only in the
   router's `IBCAppRecvPacketCallbackError` event): wrong port/version/encoding/client, undecodable envelope, other
   epoch (`StaleEpoch`), beyond the window (`BeyondWindow`), a decision starved of gas (`ExecutionStarved`).
+- **Epoch notice (ADR §7.12, the two-phase epoch switch).** Every executed kind 10 or emergency recovery raises the
+  epoch by one and sends that epoch's notice from IBCAdmin's port `ibcgov` over the epoch's NEW client to gno.land's
+  `gov` port: payload `sourcePort "ibcgov"`, `destPort "gov"`, `version "ibcgov-1"`, `encoding
+  "application/x-ibcgov"`, value `version u8 (1) ‖ epoch u32 BE ‖ clientId`, the client id as raw trailing bytes
+  (no length) and equal to the packet's source client. Its timeout is a fixed 23 hours.
+  - gno.land answers in IBCAdmin's ack layout, `epoch u32 ‖ seq u64 (0) ‖ status u8 ‖ redispatch u8 (0)`: status 1
+    (switched) or 3 (already switched) for that epoch ends it.
+  - An error ack, a timeout, or a send the router refused leaves it owed: anyone calls `resendEpochNotice(epoch)`,
+    which sends the same bytes again.
+  - Each epoch keeps its own notice, so after consecutive replacements (A→B→C: epoch 2 over B, epoch 3 over C) each
+    stays re-sendable on its own, and gno.land may skip ahead.
+  - The ack and timeout callbacks handle notices and ignore anything else; they never revert.
+  - Example (`epochNotice` in the vectors file): epoch 2 over `gnoland-2` is `0x0100000002676e6f6c616e642d32`; the
+    switched ack is `0x0000000200000000000000000100`, the duplicate ack `0x0000000200000000000000000300`.
+- **Route identity.** Every replacement path (kind 6 add or migrate, kind 10, the emergency recovery) requires the
+  verifier to follow IBCAdmin's gno.land chain id, which `finishSetup` checked against the launch client, and the
+  counterparty to use gno.land's exact store prefix. The route's identity is therefore preserved; a client of
+  another gno chain or store is refused (`test_routeIdentity_anotherGnoChain_refusedOnEveryPath`).
+- **Vacancies.** Kind 3 never sets a seat to no key: a vacancy is spent at recording, so it can never land faster than
+  a replacement (ADR §7.4).
 - Byte-exact vectors for kinds 1–13 and every ack: `contracts/test/fixtures/gov-vectors.json`, written and checked
   by `contracts/test/controls/GovVectors.t.sol` (`WRITE_GOV_VECTORS=true` rewrites it).
 

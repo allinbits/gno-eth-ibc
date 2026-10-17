@@ -125,6 +125,18 @@ library IBCAdminStorage {
         string gnoChainId;
         /// Client ids a kind 6 op 1 added (custom, verifier pinned): the only targets of a kind 10.
         mapping(bytes32 clientHash => bool) enrolled;
+        /// Each epoch's notice (§7.12), kept per epoch so that every one stays re-sendable after consecutive
+        /// replacements: none at launch (epoch 1).
+        mapping(uint32 epoch => Notice) notices;
+    }
+
+    /// @notice An epoch's notice: owed since its epoch opened by kind 10 or the emergency recovery, the client it
+    /// travels over (the epoch's), whether gno.land acknowledged it, and its last send's sequence (zero: none).
+    struct Notice {
+        bool owed;
+        bool acked;
+        uint64 seq;
+        string client;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("gno.storage.IBCAdmin")) - 1)) & ~bytes32(uint256(0xff))

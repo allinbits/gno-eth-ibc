@@ -822,4 +822,53 @@ contract IBCAdminKindsTest is ControlsFixture {
         ctl.unpauseRoute(clientId, uint64(vm.getBlockNumber()));
         assertFalse(ctl.routePaused(clientId));
     }
+
+    // ======================================================================== route identity and vacancies ==
+
+    /// @notice ADR §7.12 "Route identity is preserved": every replacement path requires the route's own gno.land chain
+    /// id (IBCAdmin's, which `finishSetup` checked against the launch client) and gno.land's exact store prefix. A
+    /// genuine client of another gno chain is refused: kind 6 add, kind 6 migrate, a kind 10 to an enrolled client
+    /// whose chain is no longer the route's, and an emergency recovery proposal.
+    function test_routeIdentity_anotherGnoChain_refusedOnEveryPath() public {
+        MockLightClient other = new MockLightClient();
+        other.setChainId("gno-other");
+        uint64 add = _decidePending(
+            S.KIND_CLIENT, P.client(1, "gnoland-5", "ethereum-5", _prefix(), address(other), address(other).codehash)
+        );
+        uint64 migrate = _decidePending(
+            S.KIND_CLIENT, P.client(2, clientId, CP, _prefix(), address(other), address(other).codehash)
+        );
+        // a client of this chain, enrolled, whose chain id then differs (a verifier answering another chain)
+        MockLightClient later = new MockLightClient();
+        uint64 enroll = _decidePending(
+            S.KIND_CLIENT, P.client(1, "gnoland-6", "ethereum-6", _prefix(), address(later), address(later).codehash)
+        );
+        uint64 route = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-6"));
+        _skip(7 days);
+        admin.execute(add);
+        admin.execute(migrate);
+        admin.execute(enroll);
+        assertEq(_state(add), S.SPENT, "kind 6 add");
+        assertEq(_state(migrate), S.SPENT, "kind 6 migrate");
+        assertEq(_state(enroll), S.EXECUTED);
+        later.setChainId("gno-other");
+        admin.execute(route);
+        assertEq(_state(route), S.SPENT, "kind 10");
+        assertEq(admin.epoch(), 1);
+        // a store prefix other than gno.land's is refused at recording
+        bytes[] memory bad = _prefix();
+        bad[1] = "/pv/vm:gno.land/r/other/ibc/core:";
+        (, uint8 status) = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-7", "ethereum-7", bad, address(later), address(later).codehash)
+        );
+        assertEq(status, S.STATUS_SPENT, "another store prefix");
+    }
+
+    /// @notice ADR §7.4: a vacancy (a seat set to no key) is never faster than a replacement. IBCAdmin's kind 3
+    /// refuses it outright (spent at recording), so no vacancy lands at all.
+    function test_kind3_vacancy_spentAtRecording() public {
+        (, uint8 status) = _decide(S.KIND_SEATS, P.seat1(1, address(0)));
+        assertEq(status, S.STATUS_SPENT);
+        assertEq(admin.keys()[1], G[1]);
+    }
 }

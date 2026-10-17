@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import { Vm } from "forge-std/Vm.sol";
+import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
+import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IGuardians } from "../../src/interfaces/IGuardians.sol";
+import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
+import { MockLightClient } from "../utils/MockLightClient.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
@@ -214,7 +220,71 @@ contract GovVectorsTest is ControlsFixture {
                 i + 1 == vectors.length ? "}\n" : "},\n"
             );
         }
-        j = string.concat(j, "  ]\n}\n");
+        j = string.concat(j, "  ],\n", _noticeJson(), "}\n");
+    }
+
+    // ----------------------------------------------------------------------------------------- epoch notice --
+
+    /// @notice The epoch notice IBCAdmin sends when a kind 10 (or the emergency recovery) opens epoch 2 over client
+    /// `gnoland-2`, and gno.land's two acknowledgements that end it (status 1 switched, 3 already switched).
+    function _notice() internal pure returns (bytes memory) {
+        return abi.encodePacked(uint8(1), uint32(2), "gnoland-2");
+    }
+
+    function _noticeAck(uint8 status) internal pure returns (bytes memory) {
+        return abi.encodePacked(uint32(2), uint64(0), status, uint8(0));
+    }
+
+    function _noticeJson() internal pure returns (string memory) {
+        return string.concat(
+            "  \"epochNotice\": {\"description\": \"Sent by IBCAdmin from port ibcgov over the NEW client (the packet's ",
+            "source client, here gnoland-2) to gno.land's gov port when a kind 10 or the emergency recovery opens the next ",
+            "epoch; timeout 23 hours; re-sent with the same bytes by resendEpochNotice(epoch) until acknowledged with ",
+            "status 1 (switched) or 3 (already switched). notice = version u8 (1) | epoch u32 BE | clientId (raw ",
+            "trailing bytes, no length); ack = epoch u32 BE | seq u64 (0) | status u8 | redispatch u8 (0); any other ",
+            "answer (eureka's universal error ack) or a timeout leaves it owed.\", ",
+            "\"payload\": {\"sourcePort\": \"ibcgov\", \"destPort\": \"gov\", \"version\": \"ibcgov-1\", ",
+            "\"encoding\": \"application/x-ibcgov\"}, \"epoch\": 2, \"clientId\": \"gnoland-2\", ",
+            "\"timeoutSeconds\": 82800, \"notice\": \"",
+            vm.toString(_notice()),
+            "\", \"ackSwitched\": \"",
+            vm.toString(_noticeAck(1)),
+            "\", \"ackDuplicate\": \"",
+            vm.toString(_noticeAck(3)),
+            "\"}\n"
+        );
+    }
+
+    /// @notice The vector is what IBCAdmin sends: a kind 10 to `gnoland-2` executed through the real router, its
+    /// notice's bytes and payload checked against the file, and both acks end it.
+    function test_epochNoticeVector() public {
+        MockLightClient c = new MockLightClient();
+        _recvGov(
+            _env(1, S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(c), address(c).codehash))
+        );
+        _recvGov(_env(2, S.KIND_ROUTE, P.route(clientId, "gnoland-2")));
+        _skip(7 days);
+        admin.execute(1);
+        vm.recordLogs();
+        admin.execute(2);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        IICS26RouterMsgs.Packet memory pkt;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
+                pkt = abi.decode(logs[i].data, (IICS26RouterMsgs.Packet));
+            }
+        }
+        assertEq(pkt.payloads[0].value, _notice());
+        assertEq(pkt.timeoutTimestamp, _now() + 82_800);
+        if (!vm.envOr("WRITE_GOV_VECTORS", false)) {
+            string memory file = vm.readFile(FILE);
+            assertEq(vm.parseJsonBytes(file, ".epochNotice.notice"), _notice());
+            assertEq(vm.parseJsonBytes(file, ".epochNotice.ackSwitched"), _noticeAck(1));
+            assertEq(vm.parseJsonBytes(file, ".epochNotice.ackDuplicate"), _noticeAck(3));
+        }
+        router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, _noticeAck(1), "", IICS02ClientMsgs.Height(0, 1)));
+        vm.expectRevert(IIBCAdmin.NoNoticeOwed.selector);
+        admin.resendEpochNotice(2);
     }
 
     function _escape(string memory s) internal pure returns (string memory) {
