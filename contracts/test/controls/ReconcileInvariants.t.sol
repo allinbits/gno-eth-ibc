@@ -508,6 +508,7 @@ contract ReconcileHandler is Test {
             _govPacket(abi.encodePacked(uint8(1), ep, last + 11, S.KIND_UNPAUSE, params));
         hookToken.setHook(ics20.getEscrow(_live()), address(busyProbe), abi.encodeCall(BusyProbe.probe, (gov)));
         amount = bound(amount, 1, 10);
+        _limits(address(hookToken));
         vm.recordLogs();
         vm.prank(alice);
         try ics20.sendTransfer(
@@ -905,6 +906,13 @@ contract ReconcileHandler is Test {
 
     /// @notice The route open again: a reopening under way continued, a closed route reconciled and reopened.
     function _ensureOpen() internal returns (bool) {
+        // an emergency recovery left open (its execution failed) blocks the route: the guardians cancel it
+        (, uint64 openedAt,,) = admin.recovery();
+        for (uint256 g = 0; openedAt != 0 && g < 4; g++) {
+            vm.prank(G[g]);
+            try admin.cancelRecovery() { } catch { }
+            (, openedAt,,) = admin.recovery();
+        }
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
             try ctl.continueReopen(_live(), 16) {
                 ok["continueReopen"]++;
@@ -1064,7 +1072,10 @@ contract ReconcileHandler is Test {
             _ensureOpen();
             this.senderReentry(5);
         }
-        if (ok["receiveVoucher"] == 0) this.receiveVoucher(10, true);
+        if (ok["receiveVoucher"] == 0) {
+            _ensureOpen();
+            this.receiveVoucher(10, true);
+        }
         if (ok["transportRound"] == 0) transportRound(0xA5A5A5);
         if (ok["lateLoss"] == 0) lateLossScenario();
         if (ok["replace"] == 0 && clients.length < 6 && _replace(true)) ok["replace"]++;
