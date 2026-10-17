@@ -100,7 +100,9 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   "application/x-ibcgov"`, value `version u8 (1) ‖ epoch u32 BE ‖ clientId`, the client id as raw trailing bytes
   (no length) and equal to the packet's source client. Its timeout is a fixed 23 hours.
   - gno.land answers in IBCAdmin's ack layout, `epoch u32 ‖ seq u64 (0) ‖ status u8 ‖ redispatch u8 (0)`: status 1
-    (switched) or 3 (already switched) for that epoch ends it.
+    (switched) or 3 (already switched) for that epoch, with sequence 0 and redispatch 0, ends it. Any other value of
+    any field leaves it owed. The campaign's `noticeStep` re-sends notices of any epoch and answers them (switched,
+    duplicate, error ack, timeout), interleaved with replacements and recoveries.
   - An error ack, a timeout, or a send the router refused leaves it owed: anyone calls `resendEpochNotice(epoch)`,
     which sends the same bytes again.
   - Each epoch keeps its own notice, so after consecutive replacements (A→B→C: epoch 2 over B, epoch 3 over C) each
@@ -226,20 +228,45 @@ bounds (constant work whatever the number of incidents).
     ends refunded its packet's full amount, or the remainder stays reserved.
 4c. Kind 12's actions agree with the proven outcomes (a refund only for a packet not delivered, a delivered
     settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
-5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12). A refund a
-   forged success ack hid is reserved from the moment `proveOutcome` proves it owed (refundable or a collision),
-   not from its settlement. Its backing is therefore held however the settlements are split across decisions. The
-   liability outlives the proof (`held`). If the verifier that proved it stops vouching for it, anyone may call
-   `voidOutcome` so that the active verifier can prove it again; the reservation stays. Only its settlement, or a
-   new proof through the active verifier that the packet was delivered, releases it. `voidAndReprove` drives three
-   such refunds against deficient backing: proven, verifier migrated, two voided, one re-proven and settled; it must
-   not pay. The only
+5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12).
+
+   **Every success that may hide a refund is held** (`held`, reserved at its whole remainder):
+   - every unsettled success a retired client processed in its suspected compromise interval, reserved by the
+     incident's preparation (`prepareIncident`: permissionless, in bounded batches, over the client's processed
+     list from `suspectStart`);
+   - a success a retired client processes later, held at once by the ack hook;
+   - a success proven owed (refundable or a collision), held by `proveOutcome`.
+
+   **Before any kind 12 payment, every unsettled suspect success of the route is reserved.** Kind 12 pays no refund
+   while any incident of the route is unprepared (the refund stays parked). This holds whatever the order of
+   proofs and decisions. Outside kind 12 a closed route pays nothing: no claim, and acks do not pay.
+
+   **A hold is released only by the kind 12 that settles the record**, with an outcome still valid at execution.
+   No proof releases it, not even one of delivery, which may later go void. `voidOutcome` clears an outcome its
+   verifier no longer vouches for, so that it can be proven again, and keeps the hold. A batch that settles a
+   delivered record and pays a sibling still works: its first pass settles every item (releasing the delivered
+   one), its second pays.
+
+   Successes processed before the suspect interval are trusted (the replacement confirms the history up to it)
+   and are not held; one proven owed is held from its proof.
+
+   The campaign drives:
+   - `voidAndReprove`: three hidden refunds proven, the verifier migrated, two voided, one re-proven and settled;
+     it must not pay;
+   - `deliveredVoidSibling`: a delivered success and a hidden refund, either proven first, the verifier replaced,
+     the hidden refund settled before the delivered one is proven again; it must not pay;
+   - `prepareStep` and `proveAndPay`: preparation, proofs and payments interleaved arbitrarily.
+
+   The only
    permitted shortfall is the one reconciliation recognizes: the refunds kind 12 owes again for packets a forged
    success ack released, whose backing the compromise consumed. That allowance belongs to those very refunds and
    only while they are unpaid. Every other record's reservation is backed in full at all times, so a payment of one
    refund never takes another's backing, and no receive or payment ever increases the shortfall.
-   The invariant campaign checks this from its own ghost. It marks the eligible refunds when it proves them owed, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
-   every step, never raised but by kind 12). It asserts that the escrow covers every reservation but the eligible
+   The invariant campaign checks this from its own ghost. It holds a success when the ghost prepared its incident,
+   processed it while retired or proved it owed, and releases it only at settlement. It asserts that no kind 12
+   refund is paid before every incident of the route is prepared. It marks a held success eligible for the
+   shortfall allowance when it becomes held, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
+   every step, never raised but by a new hold). It asserts that the escrow covers every reservation but the eligible
    refunds' unpaid part. It also checks every payment's own postcondition: a record paid since the previous step
    left every other record's reservation backed, other refunds owed again included. Only the paid record may stay
    short. `twinEligibleRefunds` drives that: two such refunds unpaid against 150 of backing, one retried.

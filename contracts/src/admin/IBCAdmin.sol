@@ -233,7 +233,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         uint32 ep = _noticeEpoch(m.sourceClient, m.payload);
         if (ep == 0) return;
         bytes calldata a = m.acknowledgement;
-        bool done = a.length == 14 && uint32(bytes4(a[0:4])) == ep && (a[12] == 0x01 || a[12] == 0x03);
+        // every field checked: this epoch, sequence 0, status 1 or 3, redispatch 0
+        bool done = a.length == 14 && uint32(bytes4(a[0:4])) == ep && uint64(bytes8(a[4:12])) == 0 && a[13] == 0
+            && (a[12] == 0x01 || a[12] == 0x03);
         if (done) S.layout().notices[ep].acked = true;
         emit EpochNoticeAcknowledged(ep, m.sequence, done);
     }

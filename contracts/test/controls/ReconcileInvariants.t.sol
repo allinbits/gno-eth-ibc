@@ -89,6 +89,7 @@ contract ReconcileHandler is Test {
     address public twinToken; // only `twinEligibleRefunds` sends it
     address public twinInitialToken; // only `twinHiddenInitial` sends it
     address public voidToken; // only `voidAndReprove` sends it
+    address public deliveredToken; // only `deliveredVoidSibling` sends it
     // each record's refund paid as of the last step's start: a record paid since must have left every other
     // record's reservation backed (the payment's own postcondition)
     mapping(uint256 => uint256) public refundedAt;
@@ -101,6 +102,12 @@ contract ReconcileHandler is Test {
     // the ghost's own record of a proof that a packet's refund is owed (it was not delivered, and the handler proved
     // that through the active verifier): from then on its reservation is held, until settled (ADR §7.12)
     mapping(uint256 => bool) public provenOwed;
+    // the ghost's record of a proof that a packet was delivered (it releases a held success)
+    mapping(uint256 => bool) public provenDelivered;
+    // a success processed on a client already retired (held at once), and the retired clients whose suspect
+    // successes the handler's preparation reserved
+    mapping(uint256 => bool) public relayedRetired;
+    mapping(bytes32 => bool) public preparedGhost;
     bool internal partialDone; // after its scenario, ordinary sends may use the partial-backing token
     uint256 internal contSeed;
     HookToken internal hookToken;
@@ -173,7 +180,7 @@ contract ReconcileHandler is Test {
         (router, ctl, ics20, admin, alice, bob, G) = (router_, ctl_, ics20_, admin_, alice_, bob_, guardians);
         clients.push(clientId);
         tokens.push(usdc);
-        for (uint256 i = 0; i <= LOSS_TOKENS + 3; i++) {
+        for (uint256 i = 0; i <= LOSS_TOKENS + 4; i++) {
             ERC20Mock t = new ERC20Mock();
             t.mint(alice, 1e30);
             tokens.push(address(t));
@@ -182,6 +189,7 @@ contract ReconcileHandler is Test {
         twinToken = tokens[LOSS_TOKENS + 2];
         twinInitialToken = tokens[LOSS_TOKENS + 3];
         voidToken = tokens[LOSS_TOKENS + 4];
+        deliveredToken = tokens[LOSS_TOKENS + 5];
         hookToken = new HookToken();
         hookToken.mint(alice, 1e30);
         tokens.push(address(hookToken));
@@ -229,6 +237,80 @@ contract ReconcileHandler is Test {
     function _relayed(uint256 i) internal {
         ghost[i].relayed = true;
         relayBlock[i] = vm.getBlockNumber();
+        if (retiredGhost[keccak256(bytes(packets[i].sourceClient))]) {
+            relayedRetired[i] = true;
+            _eligibleIfHeld(i);
+        }
+    }
+
+    /// @notice Whether packet `i`'s success is held as a potential refund, from the ghost alone: unsettled, relayed
+    /// with a success (a proof of delivery releases nothing; only the settlement), and either proven owed, processed on
+    /// a client already retired, or in the suspect interval of a client whose incident the handler prepared.
+    /// @notice Whether every retired client's incident is prepared (the ghost's): kind 12 may pay only then.
+    function allPrepared() public view returns (bool) {
+        for (uint256 k = 0; k + 1 < clients.length; k++) {
+            if (!preparedGhost[keccak256(bytes(clients[k]))]) return false;
+        }
+        return true;
+    }
+
+    function heldGhost(uint256 i) public view returns (bool) {
+        Ghost memory gh = ghost[i];
+        bool success = gh.relayed && (gh.forgedSuccess || (gh.delivered && !gh.forgedRefund));
+        if (!success) return false;
+        if (settledCount[keccak256(abi.encode(packets[i].sourceClient, packets[i].sequence))] != 0) return false;
+        bytes32 ch = keccak256(bytes(packets[i].sourceClient));
+        return provenOwed[i] || relayedRetired[i]
+            || (preparedGhost[ch] && retiredGhost[ch] && relayBlock[i] >= suspectFromOf[ch]);
+    }
+
+    /// @notice A held success is a recognized compromise liability: its shortfall is permitted (lowered at every step).
+    function _eligibleIfHeld(uint256 i) internal {
+        if (!eligible[i] && heldGhost(i)) {
+            eligible[i] = true;
+            permittedShortfall[ghost[i].token] += ghost[i].amount;
+        }
+    }
+
+    /// @notice The incident of retired client `c` prepared, in batches of `n` (all of it when `n` is large).
+    function _prepare(string memory c, uint256 n) internal returns (bool done) {
+        try ctl.prepareIncident(c, n) returns (uint256 left) {
+            done = left == 0;
+        } catch {
+            return false;
+        }
+        bytes32 ch = keccak256(bytes(c));
+        if (done && !preparedGhost[ch]) {
+            preparedGhost[ch] = true;
+            for (uint256 i = 0; i < packets.length; i++) {
+                if (keccak256(bytes(packets[i].sourceClient)) == ch) _eligibleIfHeld(i);
+            }
+            ok["prepared"]++;
+        }
+    }
+
+    /// @notice A preparation step of a random retired client (possibly partial).
+    function prepareStep(uint256 seed) external {
+        calls++;
+        _ratchet();
+        if (clients.length < 2) return;
+        _prepare(clients[seed % (clients.length - 1)], 1 + (seed >> 8) % 4);
+        _checkpoint();
+    }
+
+    /// @notice Proves one retired record and settles it at once, alone, whatever else is prepared or proven: arbitrary
+    /// interleavings of proofs and payments.
+    function proveAndPay(uint256 i, uint256 how) external {
+        calls++;
+        _ratchet();
+        if (packets.length == 0) return;
+        i = i % packets.length;
+        if (!ctl.isRetired(packets[i].sourceClient)) return;
+        T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
+        if (rec.settlement != 0 || !_prove(i, how % 3)) return;
+        T.SettleItem[] memory items = new T.SettleItem[](1);
+        items[0] = _action(i);
+        if (_settleBatch(packets[i].sourceClient, items, 1)) ok["proveAndPay"]++;
     }
 
     /// @notice The ghost's incident boundary: the live client retired by a replacement whose suspect interval starts
@@ -237,6 +319,12 @@ contract ReconcileHandler is Test {
         bytes32 old = keccak256(bytes(clients[clients.length - 1]));
         retiredGhost[old] = true;
         suspectFromOf[old] = suspectFrom;
+        // nothing processed in its suspect interval: its incident needs no preparation
+        bool any;
+        for (uint256 i = 0; i < packets.length && !any; i++) {
+            any = keccak256(bytes(packets[i].sourceClient)) == old && ghost[i].relayed && relayBlock[i] >= suspectFrom;
+        }
+        if (!any) preparedGhost[old] = true;
         clients.push(next);
     }
 
@@ -548,7 +636,7 @@ contract ReconcileHandler is Test {
         token = tokens[seed % 2 == 0 ? 0 : bound(seed, 0, tokens.length - 1)];
         if (
             (token == partialToken && !partialDone) || token == twinToken || token == twinInitialToken
-                || token == voidToken
+                || token == voidToken || token == deliveredToken
         ) {
             token = tokens[0];
         }
@@ -942,14 +1030,11 @@ contract ReconcileHandler is Test {
         }
         try ctl.proveOutcome(pkt, proof) returns (T.Proven pr) {
             done = true;
-            // a refund a forged success ack hid, proven owed: its backing is protected from now on
-            if (!ghost[i].delivered) {
-                provenOwed[i] = true;
-                if (ghost[i].forgedSuccess && !eligible[i]) {
-                    eligible[i] = true;
-                    permittedShortfall[ghost[i].token] += ghost[i].amount;
-                }
-            }
+            // a refund a forged success ack hid, proven owed: its backing is protected from now on; a delivered packet
+            // proven so is released
+            if (!ghost[i].delivered) provenOwed[i] = true;
+            else provenDelivered[i] = true;
+            _eligibleIfHeld(i);
             if (pr == T.Proven.Collision) ok["proveCollision"]++;
             else if (proof.receipt == bytes32(0)) ok["proveNonReceipt"]++;
             else ok["prove"]++;
@@ -980,6 +1065,10 @@ contract ReconcileHandler is Test {
     /// clients and the forged receives on them; with `all` false, only what kind 13 waits for.
     function _reconcile(uint256 how, bool all) internal returns (bool done) {
         done = true;
+        // every incident prepared first: no refund is paid before its suspect successes are reserved
+        for (uint256 k = 0; k + 1 < clients.length; k++) {
+            if (!_prepare(clients[k], 1000)) done = false;
+        }
         // the live client must be healthy to prove through
         _liveClient().setStatus(false, false);
         for (uint256 k = 0; k + 1 < clients.length; k++) {
@@ -1976,6 +2065,123 @@ contract ReconcileHandler is Test {
         }
     }
 
+    // ------------------------------------------------------------------------------------- round 20 actions --
+
+    /// @notice A delivered success and a hidden refund, both in a suspect interval (prepared: 200 held against 150);
+    /// A proven delivered, B proven owed (in either order); the verifier then migrated (both proofs void). Checked
+    /// right after the delivered proof (it releases nothing), and B settled before A is proven again must not pay.
+    function deliveredVoidSibling(bool bFirst) public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        address p = deliveredToken;
+        _limits(p);
+        if (!_send(alice, p, 100, true) || !_send(alice, p, 100, false)) return;
+        uint256 a = packets.length - 2;
+        this.relay(a, false, false); // A: delivered, its honest success ack
+        this.relay(a + 1, true, false); // B: a forged success ack hides its refund
+        if (!ghost[a + 1].forgedSuccess) return;
+        address escrow = ics20.getEscrow(_live());
+        uint256 bal = IERC20(p).balanceOf(escrow);
+        uint256 reserved = ctl.reserved(_live(), p);
+        if (bal < reserved + 150) return;
+        if (bal - reserved - 150 != 0 && !_receiveToken(p, bal - reserved - 150, true)) return;
+        string memory c = packets[a].sourceClient;
+        if (!_replace(true) || !_prepare(c, 1000)) {
+            _ensureOpen();
+            return;
+        }
+        if (bFirst && !_prove(a + 1, 0)) return;
+        if (!_prove(a, 0)) return; // A proven delivered: still held
+        _checkpoint();
+        if (!bFirst && !_prove(a + 1, 0)) return;
+        MockLightClient fresh = new MockLightClient();
+        string memory live = _live();
+        if (!_executeAll(
+                _one(
+                    _decide(
+                        S.KIND_CLIENT,
+                        P.client(
+                            2,
+                            live,
+                            router.getCounterparty(live).clientId,
+                            _prefix(),
+                            address(fresh),
+                            address(fresh).codehash
+                        )
+                    )
+                )
+            )) {
+            _ensureOpen();
+            return;
+        }
+        ctl.voidOutcome(c, packets[a].sequence);
+        if (!_prove(a + 1, 0)) return;
+        T.SettleItem[] memory items = new T.SettleItem[](1);
+        items[0] = _action(a + 1);
+        if (_settleBatch(c, items, 1) && ctl.sendRecord(c, packets[a + 1].sequence).refunded == 0) {
+            ok[bFirst ? "deliveredVoidHeldReversed" : "deliveredVoidHeld"]++;
+        }
+        _ensureOpen();
+    }
+
+    /// @notice The epoch notices, interleaved with the replacements and recoveries that send them: an owed notice
+    /// (of any epoch) re-sent, then answered by gno.land's switched ack, an error ack, or a timeout. Only the switched
+    /// ack ends it; the others leave it re-sendable. A notice over a client since retired (frozen) cannot be answered.
+    function noticeStep(uint256 seed) public {
+        calls++;
+        _ratchet();
+        uint32 top = admin.epoch();
+        if (top < 2) return;
+        uint32 ep = uint32(2 + (seed & 0xffff) % (top - 1));
+        bytes memory notice = admin.epochNotice(ep);
+        if (notice.length == 0) return;
+        vm.recordLogs();
+        try admin.resendEpochNotice(ep) { }
+        catch {
+            return; // answered already
+        }
+        IICS26RouterMsgs.Packet memory pkt;
+        bool sent;
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 k = 0; k < logs.length; k++) {
+            if (logs[k].emitter == address(router) && logs[k].topics[0] == IICS26Router.SendPacket.selector) {
+                pkt = abi.decode(logs[k].data, (IICS26RouterMsgs.Packet));
+                sent = true;
+            }
+        }
+        if (!sent) return;
+        assertEq(pkt.payloads[0].value, notice, "the same bytes");
+        ok["noticeResent"]++;
+        uint256 how = (seed >> 16) % 3;
+        if (how == 2) {
+            MockLightClient c = MockLightClient(address(router.getClient(pkt.sourceClient)));
+            try c.setTimestamp(pkt.timeoutTimestamp) {
+                try router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(pkt, "", IICS02ClientMsgs.Height(0, 1))) {
+                    ok["noticeTimedOut"]++;
+                } catch { }
+                c.setTimestamp(0);
+            } catch { }
+        } else {
+            bytes memory ack = how == 0
+                ? abi.encodePacked(ep, uint64(0), uint8(1 + 2 * ((seed >> 24) % 2)), uint8(0))  // switched or duplicate
+                : ICS24Host.UNIVERSAL_ERROR_ACK;
+            try router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, ack, "", IICS02ClientMsgs.Height(0, 1))) {
+                if (how == 0) ok["noticeAcked"]++;
+            } catch {
+                return;
+            }
+        }
+        // only the switched (or duplicate) ack ends it
+        bool ended;
+        try admin.resendEpochNotice(ep) { }
+        catch {
+            ended = true;
+        }
+        assertEq(ended, how == 0, "only gno.land's switch ends a notice");
+        _checkpoint();
+    }
+
     // ------------------------------------------------------------------------------------- round 19 actions --
 
     /// @notice Three refunds a forged success ack hid, proven owed (300 reserved) against 150; the verifier then
@@ -2265,6 +2471,26 @@ contract ReconcileHandler is Test {
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["deliveredVoidHeld"] == 0) deliveredVoidSibling(false);
+        if (ok["deliveredVoidHeldReversed"] == 0) deliveredVoidSibling(true);
+        if (ok["noticeTimedOut"] == 0 && clients.length < 40 && _ensureOpen() && _replace(true)) {
+            noticeStep((uint256(2) << 16) | (admin.epoch() - 2)); // the latest epoch's notice, timed out
+        }
+        if (ok["noticeAcked"] == 0 && clients.length < 40 && _ensureOpen() && _replace(true)) {
+            noticeStep(admin.epoch() - 2); // the latest epoch's notice, switched
+        }
+        if ((ok["prepared"] == 0 || ok["proveAndPay"] == 0) && _ensureOpen() && clients.length < 40) {
+            if (_send(alice, tokens[0], 5, false)) {
+                uint256 i = packets.length - 1;
+                this.relay(i, true, false); // a forged success ack: suspect once the client is retired
+                string memory c = packets[i].sourceClient;
+                if (_replace(true)) {
+                    this.proveAndPay(i, 0); // proven and settled before the preparation: parked
+                    _prepare(c, 1000);
+                }
+            }
+            _ensureOpen();
+        }
         if (ok["voidReproveHeld"] == 0) voidAndReprove();
         if (ok["tightenDelivery"] == 0) tightenAtRecording(0, false);
         if (ok["tightenDrain"] == 0) tightenAtRecording(1, true);
@@ -2449,8 +2675,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
         (,,,,,, uint256 amount) = h.ghost(i);
         if (rec.payment == T.Payment.Queued || rec.payment == T.Payment.Parked) return amount - rec.refunded;
         bool settled = h.settledCount(keccak256(abi.encode(h.packet(i).sourceClient, h.packet(i).sequence))) != 0;
-        // a refund a forged success ack hid, held from the moment the ghost proved it owed
-        if (!settled && rec.outcome == T.Outcome.Success && h.provenOwed(i)) return amount - rec.refunded;
+        // a success held as a potential refund (the ghost's: prepared suspect interval, processed while retired, or
+        // proven owed), until settled or proven delivered
+        if (!settled && rec.outcome == T.Outcome.Success && h.heldGhost(i)) return amount - rec.refunded;
         return rec.outcome == T.Outcome.Pending && !settled ? amount : 0;
     }
 
@@ -2676,7 +2903,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
         for (uint256 i = 0; i < n; i++) {
             IICS26RouterMsgs.Packet memory pkt = h.packet(i);
             T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
-            if (_burnedOf(i) || rec.refunded <= h.refundedAt(i)) continue;
+            if (rec.refunded <= h.refundedAt(i)) continue;
+            // invariant 5: no kind 12 refund before every unsettled suspect success of the route is reserved
+            if (rec.settlement == 1) assertTrue(h.allPrepared(), "a kind 12 refund before the preparation");
+            if (_burnedOf(i)) continue;
             if (_tokenIndex(rec.token, tn) == tn) continue;
             uint256 own = _reserveOf(rec, i);
             assertGe(
@@ -2785,7 +3015,14 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[68] memory names = [
+        string[75] memory names = [
+            "deliveredVoidHeld",
+            "deliveredVoidHeldReversed",
+            "noticeResent",
+            "noticeAcked",
+            "noticeTimedOut",
+            "prepared",
+            "proveAndPay",
             "voidReproveHeld",
             "twinInitialHeldSeparate",
             "tightenDelivery",
@@ -2860,7 +3097,14 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[51] memory required = [
+        string[58] memory required = [
+            "deliveredVoidHeld",
+            "deliveredVoidHeldReversed",
+            "noticeResent",
+            "noticeAcked",
+            "noticeTimedOut",
+            "prepared",
+            "proveAndPay",
             "voidReproveHeld",
             "twinInitialHeldSeparate",
             "tightenDelivery",

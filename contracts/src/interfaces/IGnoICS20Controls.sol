@@ -100,8 +100,8 @@ interface IGnoICS20ControlsTypes {
         /// client that verified it: void once that client is no longer the route's active one (frozen, expired, or
         /// replaced), when kind 12 refuses it and a new proof may replace it.
         Proven proven;
-        /// A refund a forged success ack hid, once proven owed: held (reserved) until settled, or until a new proof
-        /// through the active verifier finds the packet delivered; a void of the proof keeps it.
+        /// A success that may hide a refund (in a suspect interval, prepared; processed while retired; or proven
+        /// owed): held (reserved) until a kind 12 settles it. No proof releases it, whatever it proves.
         bool held;
         address provenBy;
         /// The route's verifier generation when it was proven: any re-pointing of the route's client since voids it.
@@ -197,6 +197,7 @@ interface IGnoICS20ControlsTypes {
     /// @notice A loss booked after the route reopened closed it again, until a kind 13 accepts it.
     event GnoRouteClosedForLoss(string routeKey);
     event GnoOutcomeProven(string clientId, uint64 indexed sequence, Proven proven);
+    event GnoIncidentPrepared(string clientId);
     /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
     /// is paid; `ok` false when the sender reverted (the refund stands).
     event GnoSenderNotified(string clientId, uint64 indexed sequence, bool ok);
@@ -279,9 +280,15 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// sha256(sourceClient) | packet commitment)) and compared with the proven one. A non-receipt counts only once
     /// the proven time reaches the packet's timeout (it can then never be received). Proven once, before kind 12.
     /// @notice Clears an outcome its verifier no longer vouches for (the route's active client or its generation
-    /// changed since the proof), so that the active verifier can prove it again. A hidden refund's reservation stays:
-    /// only its settlement, or a new trusted proof that the packet was delivered, releases it. Permissionless.
+    /// changed since the proof), so that the active verifier can prove it again. A held success's reservation stays:
+    /// only its settlement releases it. Permissionless.
     function voidOutcome(string calldata clientId, uint64 sequence) external;
+
+    /// @notice Reserves, in batches of at most `n` records, every unsettled success a retired client processed in
+    /// its suspected compromise interval: each is a potential refund (a forged success ack may hide one), held until
+    /// a kind 12 settles it. Kind 12 pays no refund of the route until every incident is prepared. Permissionless;
+    /// returns the records left (zero once prepared).
+    function prepareIncident(string calldata clientId, uint256 n) external returns (uint256 left);
 
     /// @notice When the route's quarantine ends (receives wait until then): the deadline of the transitions already
     /// seen and, with the duration in force, of its current client's latest transition.

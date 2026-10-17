@@ -943,6 +943,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(f, from);
         assertEq(open, 3);
         assertEq(ctl.openRecords(clientId), 0, "nothing outstanding: the old gate alone would reopen");
+        // the suspect successes reserved before any refund is paid (round 20)
+        assertEq(ctl.prepareIncident(clientId, 16), 0);
 
         _proveDelivered(before);
         _proveRefundable(forgedOk);
@@ -2530,9 +2532,9 @@ contract ReviewRegressionsTest is ControlsFixture {
     }
 
     /// @notice r19 #1: an outcome its verifier no longer vouches for is voided by anyone so it can be proven again;
-    /// the hidden refund's liability and reservation stay. Only a trusted proof that the packet was delivered (or its
-    /// settlement) releases it.
-    function test_r19_1_void_keepsTheReservation_deliveredProofReleases() public {
+    /// the hidden refund's liability and reservation stay. Since round 20 no proof releases it, not even one of
+    /// delivery: only the kind 12 that settles it.
+    function test_r19_1_void_keepsTheReservation_onlySettlementReleases() public {
         IICS26RouterMsgs.Packet[] memory p = _hiddenRefunds(1, 100, 100);
         assertEq(ctl.reserved(clientId, address(usdc)), 100);
         vm.expectRevert(T.GnoBadProof.selector);
@@ -2543,8 +2545,10 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.voidOutcome(clientId, p[0].sequence);
         assertEq(uint8(ctl.sendRecord(clientId, p[0].sequence).proven), uint8(T.Proven.None));
         assertEq(ctl.reserved(clientId, address(usdc)), 100, "a void keeps the liability");
-        _proveDelivered(p[0]); // a trusted proof reclassifies it as delivered
-        assertEq(ctl.reserved(clientId, address(usdc)), 0, "released by the delivered proof");
+        _proveDelivered(p[0]); // a proof of delivery releases nothing by itself
+        assertEq(ctl.reserved(clientId, address(usdc)), 100, "kept until settled");
+        _settle(_item(p[0].sequence, 3, 0)); // settled as delivered
+        assertEq(ctl.reserved(clientId, address(usdc)), 0, "released by the settlement");
     }
 
     /// @notice r19 #1, Codex's sequence: two hidden refunds of 100 proven (200 reserved) against 150; the verifier
@@ -2611,5 +2615,134 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.voidOutcome(clientId, a.sequence);
         _settle(_item(a.sequence, 1, 100));
         assertEq(ctl.sendRecord(clientId, a.sequence).refunded, 100);
+    }
+
+    // ============================================================================================= round 20 ==
+
+    /// @notice r20 #1: two hidden refunds of 100 against 150, both acks inside the suspect interval of a kind 10
+    /// replacement; proven and paid one at a time. Their reservations do not wait for the proofs: the incident's
+    /// preparation holds every unsettled suspect success, and kind 12 pays nothing before it. Then neither payment
+    /// can take the other's backing, whatever the proof order.
+    function _staggered(uint256 n, uint256 each, uint256 left) internal returns (IICS26RouterMsgs.Packet[] memory p) {
+        _setLimits(address(usdc), 1e9, 1e9, 1e9);
+        p = new IICS26RouterMsgs.Packet[](n);
+        uint64 from = uint64(block.number);
+        for (uint256 i = 0; i < n; i++) {
+            p[i] = _send(alice, address(usdc), each, clientId);
+            _ack(p[i], bytes("{\"result\":\"AQ==\"}")); // forged success acks
+        }
+        _transferIn(
+            clientId, string.concat("transfer/", CP, "/", Strings.toHexString(address(usdc))), n * each - left, bob
+        );
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        uint64 replace = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-2", from));
+        _skip(7 days);
+        admin.execute(add);
+        admin.execute(replace);
+        assertEq(admin.decision(1, replace).state, S.EXECUTED);
+    }
+
+    function test_r20_1_staggeredProofs_noPaymentBeforePreparation_noneTakesTheOthersBacking() public {
+        IICS26RouterMsgs.Packet[] memory p = _staggered(2, 100, 150);
+        address escrow = ics20.getEscrow(clientId);
+        // proven and settled before the preparation: parked, nothing leaves the escrow
+        _proveRefundable(p[0]);
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, _item(p[0].sequence, 1, 100));
+        assertEq(usdc.balanceOf(escrow), 150, "no refund before the preparation");
+        // prepared (anyone, in batches): both suspect successes reserved
+        assertEq(ctl.prepareIncident(clientId, 1), 1);
+        assertEq(ctl.prepareIncident(clientId, 1), 0);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
+        // B proven later: still no payment can take A's or B's backing
+        _proveRefundable(p[1]);
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, _item(p[1].sequence, 1, 100));
+        assertEq(usdc.balanceOf(escrow), 150);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
+    }
+
+    /// @notice r20 #1, nine staggered hidden refunds of 10 against 80, crossing the eight-item batch: prepared, then
+    /// proven and settled one at a time, none pays.
+    function test_r20_1_staggeredProofs_nineAcrossTheBatchBoundary() public {
+        IICS26RouterMsgs.Packet[] memory p = _staggered(9, 10, 80);
+        while (ctl.prepareIncident(clientId, 4) != 0) { }
+        assertEq(ctl.reserved(clientId, address(usdc)), 90);
+        T.SettleItem[] memory items = new T.SettleItem[](8);
+        for (uint256 i = 0; i < 8; i++) {
+            _proveRefundable(p[i]);
+            items[i] = T.SettleItem(p[i].sequence, 1, 10);
+        }
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, items);
+        _proveRefundable(p[8]);
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, _item(p[8].sequence, 1, 10));
+        for (uint256 i = 0; i < 9; i++) {
+            assertEq(ctl.sendRecord(clientId, p[i].sequence).refunded, 0);
+        }
+        assertEq(usdc.balanceOf(ics20.getEscrow(clientId)), 80);
+    }
+
+    /// @notice r20: a prepared suspect success proven delivered stays held; the kind 12 that settles it releases it.
+    function test_r20_1_deliveredProof_releasesOnlyAtSettlement() public {
+        IICS26RouterMsgs.Packet[] memory p = _staggered(1, 100, 50);
+        ctl.prepareIncident(clientId, 8);
+        assertEq(ctl.reserved(clientId, address(usdc)), 100);
+        _proveDelivered(p[0]);
+        assertEq(ctl.reserved(clientId, address(usdc)), 100, "a proof releases nothing");
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, _item(p[0].sequence, 3, 0));
+        assertEq(ctl.reserved(clientId, address(usdc)), 0, "released by the settlement");
+    }
+
+    /// @notice r20 (the gno side's round 39 class): A's success proven delivered, B's hidden refund proven owed, both
+    /// held (200) against 150; the verifier then replaced (A's proof void). B settled before A is proven again must
+    /// not take A's backing: A stays held, B parks. In both proof orders.
+    function _deliveredVoidThenSibling(bool bFirst) internal {
+        IICS26RouterMsgs.Packet[] memory p = _staggered(2, 100, 150);
+        ctl.prepareIncident(clientId, 8);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
+        if (bFirst) _proveRefundable(p[1]);
+        _proveDelivered(p[0]);
+        if (!bFirst) _proveRefundable(p[1]);
+        // the verifier replaced: A's proof (and B's) void
+        MockLightClient next = new MockLightClient();
+        vm.prank(address(admin));
+        router.migrateClient("gnoland-2", IICS02ClientMsgs.CounterpartyInfo("ethereum-2", _prefix()), address(next));
+        ctl.voidOutcome(clientId, p[0].sequence);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200, "A held through the void");
+        _proveRefundable(p[1]);
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, _item(p[1].sequence, 1, 100));
+        assertEq(ctl.sendRecord(clientId, p[1].sequence).refunded, 0, "B never takes A's backing");
+        assertEq(usdc.balanceOf(ics20.getEscrow(clientId)), 150);
+    }
+
+    function test_r20_1_deliveredThenVoid_siblingCannotDrain() public {
+        _deliveredVoidThenSibling(false);
+    }
+
+    function test_r20_1_deliveredThenVoid_siblingCannotDrain_reversed() public {
+        _deliveredVoidThenSibling(true);
+    }
+
+    /// @notice r20: the honest batch: A proven delivered, B proven owed, 100 left for B. One kind 12 settles A as
+    /// delivered (releasing it in the first pass) and pays B in the second.
+    function test_r20_1_batchReleasesADeliveredRecord_andPaysTheSibling() public {
+        IICS26RouterMsgs.Packet[] memory p = _staggered(2, 100, 100);
+        ctl.prepareIncident(clientId, 8);
+        _proveDelivered(p[0]);
+        _proveRefundable(p[1]);
+        T.SettleItem[] memory items = new T.SettleItem[](2);
+        items[0] = T.SettleItem(p[1].sequence, 1, 100); // the payment first in the list: the passes order it
+        items[1] = T.SettleItem(p[0].sequence, 3, 0);
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, items);
+        assertEq(ctl.sendRecord(clientId, p[1].sequence).refunded, 100, "B paid");
+        assertEq(ctl.reserved(clientId, address(usdc)), 0);
     }
 }

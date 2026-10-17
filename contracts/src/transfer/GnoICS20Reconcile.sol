@@ -247,6 +247,33 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         emit GnoSettled(clientId, it.sequence, action, it.amount);
     }
 
+    /// @notice See IGnoICS20Controls.
+    function prepareIncident(string calldata clientId, uint256 n) external delegated nonReentrant returns (uint256) {
+        GnoTransferStorage.Layout storage g = _g();
+        bytes32 clientHash = keccak256(bytes(clientId));
+        GnoTransferStorage.ClientRecon storage c = g.clients[clientHash];
+        uint256 end = c.processed.length;
+        uint256 i = c.prepCursor;
+        if (c.incident == 0 || c.prepared) return 0;
+        bytes32 route = c.route;
+        for (uint256 stop = i + n < end ? i + n : end; i < stop; i++) {
+            SendRecord storage rec = g.records[clientHash][c.processedSeq[i]];
+            // every unsettled success of the suspect interval: a potential refund, held until settled
+            if (rec.settlement == 0 && rec.outcome == Outcome.Success && !rec.held) {
+                uint256 before = GnoTransferStorage.reservation(rec);
+                rec.held = true;
+                GnoTransferStorage.syncReserve(route, rec, before);
+            }
+        }
+        c.prepCursor = uint64(i);
+        if (i == end) {
+            c.prepared = true;
+            --g.routes[route].unprepared;
+            emit GnoIncidentPrepared(clientId);
+        }
+        return end - i;
+    }
+
     /// @notice Kind 12's second pass: pays a refund action 1 owed, against the batch's complete reservations; one
     /// that cannot be paid now stays parked (owed, reserved) for `claimParked`.
     function _payOwed(
@@ -260,6 +287,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     {
         SendRecord storage rec = g.records[clientHash][sequence];
         if (rec.payment != Payment.Parked) return; // settled with nothing left to pay
+        // no refund leaves the route's escrow until every incident's suspect successes are reserved
+        if (g.routes[route].unprepared != 0) {
+            emit GnoRefundParked(clientId, sequence, rec.token, rec.amount - rec.refunded);
+            return;
+        }
         uint256 left = rec.amount - rec.refunded;
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, 0)) {

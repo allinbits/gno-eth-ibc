@@ -133,9 +133,9 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         rec.proven = proven;
         rec.provenBy = address(lc);
-        // the liability a proof establishes outlives the proof: a hidden refund proven owed stays held until settled,
-        // or until a trusted proof finds the packet delivered
-        if (rec.outcome == Outcome.Success) rec.held = proven != Proven.Delivered;
+        // the liability a proof establishes outlives the proof: a hidden refund proven owed stays held until settled.
+        // A proof of delivery releases nothing by itself (it may go void): only the settlement that applies it does
+        if (rec.outcome == Outcome.Success && proven != Proven.Delivered) rec.held = true;
         if (proven == Proven.Delivered) {
             g.provenAck[keccak256(bytes(packet.sourceClient))][packet.sequence] = keccak256(proof.ack);
         }

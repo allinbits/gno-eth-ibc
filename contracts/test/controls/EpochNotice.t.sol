@@ -196,4 +196,21 @@ contract EpochNoticeTest is ControlsFixture {
         vm.expectRevert(IIBCAdmin.NoNoticeOwed.selector);
         admin.resendEpochNotice(2);
     }
+
+    /// @notice An ack in the right epoch and status but a non-zero sequence or redispatch field ends nothing: the
+    /// notice stays owed.
+    function test_epochNotice_malformedAckFields_endNothing() public {
+        IICS26RouterMsgs.Packet memory pkt = _replace("gnoland-2", "ethereum-2");
+        _ackNotice(pkt, abi.encodePacked(uint32(2), uint64(1), uint8(1), uint8(0))); // seq 1
+        vm.recordLogs();
+        admin.resendEpochNotice(2);
+        IICS26RouterMsgs.Packet memory again = _sentNotice();
+        _ackNotice(again, abi.encodePacked(uint32(2), uint64(0), uint8(1), uint8(1))); // redispatch 1
+        vm.recordLogs();
+        admin.resendEpochNotice(2);
+        IICS26RouterMsgs.Packet memory third = _sentNotice();
+        _ackNotice(third, abi.encodePacked(uint32(2), uint64(0), uint8(3), uint8(0)));
+        vm.expectRevert(IIBCAdmin.NoNoticeOwed.selector);
+        admin.resendEpochNotice(2);
+    }
 }

@@ -59,6 +59,9 @@ library GnoTransferStorage {
         /// Unresolved replacement incidents whose client still has an open or unsettled suspect record: kind 13
         /// waits for zero (kept by every change of those counts, so no transition walks the incidents).
         uint64 pendingIncidents;
+        /// Replacement incidents whose suspect successes are not all reserved yet (`prepareIncident`): kind 12 pays
+        /// no refund from the route's escrow while any remains.
+        uint64 unprepared;
     }
 
     /// @notice Incident kinds and statuses.
@@ -78,6 +81,11 @@ library GnoTransferStorage {
         uint64 suspectStart;
         uint64 suspectOpen;
         bytes32 route;
+        /// The sequence of each processed record (the same order as `processed`), for the incident's preparation.
+        uint64[] processedSeq;
+        /// The incident's preparation: the next processed index to reserve, and whether it reached the end.
+        uint64 prepCursor;
+        bool prepared;
     }
 
     /// @notice A refund queued under the refund meter or the refunds hold: its send record.
