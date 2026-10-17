@@ -5,6 +5,7 @@ import { BeaconProxy } from "@openzeppelin-contracts/proxy/beacon/BeaconProxy.so
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
 
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
+import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
 import { GnoICS20Reconcile } from "../../src/transfer/GnoICS20Reconcile.sol";
 import { GnoICS20Evidence } from "../../src/transfer/GnoICS20Evidence.sol";
@@ -37,7 +38,7 @@ contract CodePinningTest is ControlsFixture {
 
     /// @notice The deployment matches a build of its sources, delegates included.
     function test_r10_1_deploymentMatchesTheBuild() public view {
-        assertTrue(verifier.verifyGraph(d.ics20Implementation, address(admin)));
+        assertTrue(verifier.verifyLive(address(admin)));
     }
 
     /// @notice A module whose code is swapped (the same address, other code) is refused on every delegated call.
@@ -82,5 +83,67 @@ contract CodePinningTest is ControlsFixture {
         beacon.upgradeTo(address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence()))))));
         assertEq(proxied.codehash, recorded, "the proxy's hash never changes");
         assertFalse(verifier.matchesBuild(proxied, "GnoICS20Controls.sol", "GnoICS20Controls"), "the build check");
+    }
+
+    // ================================================================================================ round 11 ==
+
+    /// @notice r11 #3: the verification reads the live implementation slot, not the deployment file: an
+    /// implementation installed behind the file's back is caught.
+    function test_r11_3_liveImplementationSlot_checked() public {
+        assertEq(verifier.implementationOf(address(ics20)), d.ics20Implementation);
+        assertTrue(verifier.verifyLive(address(admin)));
+        // the proxy now runs other code (the deployment file still names the old implementation)
+        address other = address(new MockLightClient());
+        vm.store(
+            address(ics20),
+            bytes32(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc),
+            bytes32(uint256(uint160(other)))
+        );
+        assertFalse(verifier.verifyLive(address(admin)));
+        assertTrue(verifier.verifyTransfer(d.ics20Implementation), "the file's implementation is still a build");
+    }
+
+    /// @notice r11 #3, end to end: a pending kind 9 hands over to an executor behind a beacon proxy. On chain it
+    /// would pass (its bindings answer through the proxy, its hash is the one governance pinned); the verification of
+    /// the pending decision refuses it before it matures. A genuine executor passes; a wrong expected hash or another
+    /// candidate fails.
+    function test_r11_3_pendingProxyBackedExecutor_refused() public {
+        IBCAdminExec genuine = new IBCAdminExec(address(router), d.accessManager, address(ics20));
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(genuine), address(this));
+        address proxied = address(new BeaconProxy(address(beacon), ""));
+        uint64 seq = admin.lastSeq() + 1;
+        bytes memory env = _env(seq, S.KIND_HANDOVER, P.handover(proxied, proxied.codehash, ""));
+        _recvGov(env);
+        assertEq(admin.decision(admin.epoch(), seq).state, S.PENDING);
+        assertFalse(verifier.verifyPending(address(admin), seq, keccak256(env), proxied), "the proxy-backed executor");
+        // the genuine executor, pending as well, passes; the checks are of the named decision and candidate
+        bytes memory env2 = _env(seq + 1, S.KIND_HANDOVER, P.handover(address(genuine), address(genuine).codehash, ""));
+        _recvGov(env2);
+        assertTrue(verifier.verifyPending(address(admin), seq + 1, keccak256(env2), address(genuine)));
+        assertFalse(verifier.verifyPending(address(admin), seq + 1, keccak256(env), address(genuine)), "other hash");
+        assertFalse(verifier.verifyPending(address(admin), seq + 1, keccak256(env2), proxied), "other candidate");
+        // on chain, the proxy-backed hand-over would execute: only the verification catches it
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(admin.decision(admin.epoch(), seq).state, S.EXECUTED, "governance pinned it");
+        assertFalse(verifier.verifyLive(address(admin)), "and the live check refuses it after");
+    }
+
+    /// @notice r11 #3: a pending kind 7 of the transfer app is checked through its whole graph: a candidate whose
+    /// controls module is a beacon proxy fails, a genuine one passes.
+    function test_r11_3_pendingKind7_checksTheCandidatesGraph() public {
+        GnoICS20Controls genuineControls =
+            new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence()))));
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(genuineControls), address(this));
+        address proxiedControls = address(new BeaconProxy(address(beacon), ""));
+        address bad = address(new GnoICS20Transfer(proxiedControls));
+        address good = address(new GnoICS20Transfer(address(genuineControls)));
+        uint64 seq = admin.lastSeq() + 1;
+        bytes memory e1 = _env(seq, S.KIND_UPGRADE, P.upgrade(address(ics20), bad, bad.codehash, ""));
+        bytes memory e2 = _env(seq + 1, S.KIND_UPGRADE, P.upgrade(address(ics20), good, good.codehash, ""));
+        _recvGov(e1);
+        _recvGov(e2);
+        assertFalse(verifier.verifyPending(address(admin), seq, keccak256(e1), bad));
+        assertTrue(verifier.verifyPending(address(admin), seq + 1, keccak256(e2), good));
     }
 }

@@ -288,10 +288,23 @@ IBCAdmin checks the recovery module before running it (`ForeignExec`).
 A hash says nothing of the source, and a proxy's hash never changes when its target does. So **every pinned hash
 must equal a reproducible build of the named source, and no module may hold a mutable implementation pointer** (a
 beacon or an ERC-1967 proxy as a module would keep its hash while its owner changed what it runs; on chain it
-passes, as governance pinned it). `scripts/verify-codehashes.sh` (`script/VerifyCodehashes.s.sol`) checks a
-deployment against a clean build: every contract of the transfer app's and IBCAdmin's graphs must equal its source's
-built runtime code, the compiler's immutables aside, and each delegate address is the one its holder records. The
-watch tool (T5) runs it for every deployment and every hash a decision pins, before the decision matures.
+passes, as governance pinned it). `scripts/verify-codehashes.sh` (`script/VerifyCodehashes.s.sol`,
+`script/CodeVerifier.sol`) checks against a clean build, the compiler's immutables aside, with each delegate address
+the one its holder records:
+
+- **What runs now** (`verifyLive`), read from the chain and never from the deployment file, which goes stale after
+  any kind 7 or 9: the transfer proxy's and the router proxy's live ERC-1967 implementation slots, the escrow and
+  voucher beacons' implementations, IBCAdmin, and the executor IBCAdmin has installed, each delegate graph complete.
+- **Every pending kind 7 or kind 9, before it matures** (`verifyPending`, given `PENDING_SEQS`, `PENDING_HASHES`,
+  `PENDING_CANDIDATES`): the recorded decision must have the hash of the envelope gno.land sent, name the expected
+  implementation or executor, and pin that candidate's live code hash. The candidate's whole graph must then be a
+  build of its source: the transfer app's four contracts, the router, the escrow or voucher implementation, or the
+  executor and its modules.
+
+The watch tool (T5) runs both: after every deployment and every executed decision, and for each recorded kind 7 or 9
+as soon as it is recorded, within its seven-day delay. A failure is the signal to cancel the decision (kind 2). On
+chain, a hand-over to an executor behind a proxy would pass, since its bindings answer through the proxy and its hash
+is the one governance pinned; only this step refuses it (`test_r11_3_pendingProxyBackedExecutor_refused`).
 
 ## Deployment
 

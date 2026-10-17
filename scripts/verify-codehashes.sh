@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Verifies a deployment against a clean, reproducible build of this repository (ADR §6.12, T5): every deployed
-# contract of the transfer app's and IBCAdmin's delegate graphs must equal the built runtime code of its source, the
-# compiler's immutables aside, and every delegate address must be the one its holder records.
+# Verifies what runs on chain against a clean, reproducible build of this repository (ADR §6.12, T5): the transfer
+# and router proxies' live implementations, the escrow and voucher beacons' implementations, IBCAdmin and its
+# installed executor, each delegate graph complete, must equal the built runtime code of their sources (the
+# compiler's immutables aside). Run it again for every pending kind 7 or kind 9 before it matures, naming the
+# decision, the hash of the envelope gno.land sent, and the candidate it installs:
 #
 #   ETH_RPC_URL=...  DEPLOYMENTS_FILE=deployments/<chain>.json  scripts/verify-codehashes.sh
+#   ETH_RPC_URL=...  DEPLOYMENTS_FILE=...  PENDING_SEQS=12,13  PENDING_HASHES=0x..,0x..  \
+#       PENDING_CANDIDATES=0x..,0x..  scripts/verify-codehashes.sh
 #
 # Runs Foundry in Docker (the pinned image), from a clean build.
 set -euo pipefail
@@ -11,5 +15,5 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FOUNDRY_IMAGE="${FOUNDRY_IMAGE:-ghcr.io/foundry-rs/foundry:v1.7.1}"
 : "${ETH_RPC_URL:?ETH_RPC_URL}" "${DEPLOYMENTS_FILE:?DEPLOYMENTS_FILE (relative to contracts/)}"
 docker run --rm --network host -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
-	-e DEPLOYMENTS_FILE --entrypoint sh "$FOUNDRY_IMAGE" -c \
+	-e DEPLOYMENTS_FILE -e PENDING_SEQS -e PENDING_HASHES -e PENDING_CANDIDATES --entrypoint sh "$FOUNDRY_IMAGE" -c \
 	"forge build --force >/dev/null && forge script script/VerifyCodehashes.s.sol --rpc-url '$ETH_RPC_URL'"
