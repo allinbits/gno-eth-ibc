@@ -425,6 +425,8 @@ contract ReconcileHandler is Test {
     function notify(uint256 i) external {
         calls++;
         uint256 n = packets.length;
+        if (n == 0) return;
+        i %= n; // no overflow in the walk below
         for (uint256 k = 0; k < n; k++) {
             uint256 j = (i + k) % n;
             if (ghost[j].sender != address(adapter)) continue;
@@ -774,7 +776,7 @@ contract ReconcileHandler is Test {
                 if (rec.settlement != 0) continue;
                 bool needed = rec.open || (rec.processedBlock != 0 && rec.processedIndex >= start);
                 if (!all && !needed) continue;
-                if (!_prove(i, how + i)) {
+                if (!_prove(i, how % 3 + i)) {
                     done = false;
                     continue;
                 }
@@ -1136,6 +1138,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
 
     /// forge-config: default.invariant.runs = 24
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_ghostModel() public view {
         _checkAll();
     }
