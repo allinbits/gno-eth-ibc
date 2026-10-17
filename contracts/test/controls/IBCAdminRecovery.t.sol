@@ -12,6 +12,7 @@ import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
+import { StatusMock } from "../utils/ControlsMocks.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
 /// @notice The emergency route replacement is off unless the deployment enables it (ADR §7.12).
@@ -347,6 +348,42 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertFalse(ctl.routeClosed(clientId));
         (, resolved,) = ctl.incidents(clientId);
         assertEq(resolved, 2);
+    }
+
+    /// @notice Round 9 #1: the attested client's status views must answer exactly at approval and at execution: a
+    /// missing, reverting, short or out-of-range view makes it unusable (fail closed).
+    function test_r9_1_recovery_statusViewsFailClosed() public {
+        bytes4[3] memory sels =
+            [bytes4(keccak256("isFrozen()")), bytes4(keccak256("isExpired()")), bytes4(keccak256("lastTransition()"))];
+        lc.setStatus(true, false);
+        StatusMock c = new StatusMock();
+        IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-7");
+        p.lightClient = address(c);
+        p.codeHash = address(c).codehash;
+        for (uint256 i = 0; i < 3; i++) {
+            for (uint8 m = 1; m <= 4; m++) {
+                c.setMode(sels[i], m);
+                vm.prank(G[0]);
+                vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+                admin.approveRecovery(p);
+            }
+            c.setMode(sels[i], 0);
+        }
+        _approve(0, p);
+        _approve(1, p);
+        _approve(2, p);
+        assertEq(_openedAt(), _now());
+        _skip(DELAY);
+        for (uint256 i = 0; i < 3; i++) {
+            for (uint8 m = 1; m <= 4; m++) {
+                c.setMode(sels[i], m);
+                vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+                admin.executeRecovery();
+            }
+            c.setMode(sels[i], 0);
+        }
+        admin.executeRecovery();
+        assertEq(admin.govClient(), "gnoland-7");
     }
 
     function test_executeRefusesAClientWithAnotherCode() public {

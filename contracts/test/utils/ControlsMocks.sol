@@ -14,6 +14,7 @@ import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
 
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
+import { IGnoLightClientMsgs } from "../../src/msgs/IGnoLightClientMsgs.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { IGnoICS20Controls } from "../../src/interfaces/IGnoICS20Controls.sol";
@@ -264,5 +265,36 @@ contract CostlyBalanceToken is ERC20 {
             x = keccak256(abi.encode(x, i));
         }
         return super.balanceOf(a) + (uint256(x) == 0 ? 1 : 0);
+    }
+}
+
+/// @notice A gno.land light client whose status views (isFrozen, isExpired, lastTransition) misbehave on demand:
+/// mode 1 missing (an empty revert), 2 reverting, 3 a short return, 4 an out-of-range value; 0 answers healthy.
+contract StatusMock {
+    mapping(bytes4 => uint8) public mode;
+
+    function setMode(bytes4 selector, uint8 m) external {
+        mode[selector] = m;
+    }
+
+    function getClientState() external pure returns (bytes memory) {
+        IGnoLightClientMsgs.ClientState memory cs;
+        cs.chainId = "gno-test";
+        return abi.encode(cs);
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        bytes4 s = msg.sig;
+        uint8 m = mode[s];
+        if (m == 1) revert();
+        if (m == 2) revert("broken");
+        if (s == bytes4(keccak256("lastTransition()"))) {
+            if (m == 3) return hex"00";
+            if (m == 4) return abi.encode(uint256(1) << 70, uint256(0));
+            return abi.encode(uint64(0), uint64(0));
+        }
+        if (m == 3) return hex"0000";
+        if (m == 4) return abi.encode(uint256(2));
+        return abi.encode(false);
     }
 }

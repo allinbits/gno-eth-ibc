@@ -83,7 +83,7 @@ contract IBCAdminExec is IIBCAdmin {
         frozenClient = address(new FrozenLightClient());
         setupCheck = address(new IBCAdminSetupCheck());
         checks = address(new IBCAdminChecks());
-        recoveryModule = address(new IBCAdminRecovery(router_, ics20_, frozenClient));
+        recoveryModule = address(new IBCAdminRecovery(router_, ics20_, frozenClient, checks));
         _self = address(this);
     }
 

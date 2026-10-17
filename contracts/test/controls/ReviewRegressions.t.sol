@@ -40,7 +40,8 @@ import {
     HookToken,
     OlderFork,
     GasBurnToken,
-    CostlyBalanceToken
+    CostlyBalanceToken,
+    StatusMock
 } from "../utils/ControlsMocks.sol";
 import { ICS26Router } from "@eureka/ICS26Router.sol";
 import { ICS20Transfer } from "@eureka/ICS20Transfer.sol";
@@ -558,11 +559,11 @@ contract ReviewRegressionsTest is ControlsFixture {
 
     function test_r18_envelope1024Recorded_1025Spent() public {
         // canonical parameters are a multiple of 32 bytes: the largest envelope within 1024 is 14 + 992 = 1006
-        bytes memory params = P.settings(string(_repeat("a", 32 * 28)), 1 days);
-        bytes memory at = _env(1, S.KIND_SETTINGS, params);
+        bytes memory params = P.settle1(string(_repeat("a", 32 * 24)), 1, 1, 1);
+        bytes memory at = _env(1, S.KIND_SETTLE, params);
         assertEq(at.length, 1006);
         assertEq(_status(_recvGov(at)), S.STATUS_RECORDED);
-        bytes memory over = _env(2, S.KIND_SETTINGS, P.settings(string(_repeat("a", 32 * 29)), 1 days));
+        bytes memory over = _env(2, S.KIND_SETTLE, P.settle1(string(_repeat("a", 32 * 25)), 1, 1, 1));
         assertEq(over.length, 1038);
         assertEq(_status(_recvGov(over)), S.STATUS_SPENT);
         assertEq(admin.PORT(), "ibcgov");
@@ -2132,6 +2133,74 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.reopenRoute("gnoland-9");
         assertEq(ctl.claimParked(clientId, b.sequence, 300_000), 100);
         assertEq(c.balanceOf(alice), 300);
+    }
+
+    // ====================================================================================== round 9 ==
+
+    function _statusSelectors() internal pure returns (bytes4[3] memory) {
+        return
+            [bytes4(keccak256("isFrozen()")), bytes4(keccak256("isExpired()")), bytes4(keccak256("lastTransition()"))];
+    }
+
+    /// @notice Round 9 #1: kind 6 installs no verifier whose status views (frozen, expired, last transition) are
+    /// missing, revert, return short, or return an out-of-range value: every case is unusable (fail closed).
+    function test_r9_1_kind6_statusViewsFailClosed() public {
+        bytes4[3] memory sels = _statusSelectors();
+        uint64[] memory seqs = new uint64[](12);
+        uint256 n;
+        for (uint256 i = 0; i < 3; i++) {
+            for (uint8 m = 1; m <= 4; m++) {
+                StatusMock c = new StatusMock();
+                c.setMode(sels[i], m);
+                seqs[n++] = _decide(
+                    S.KIND_CLIENT,
+                    P.client(
+                        1,
+                        string.concat("gnoland-", vm.toString(70 + n)),
+                        "ethereum-7",
+                        _prefix(),
+                        address(c),
+                        address(c).codehash
+                    )
+                );
+            }
+        }
+        StatusMock healthy = new StatusMock();
+        uint64 good = _decide(
+            S.KIND_CLIENT,
+            P.client(1, "gnoland-99", "ethereum-7", _prefix(), address(healthy), address(healthy).codehash)
+        );
+        _skip(7 days);
+        for (uint256 i = 0; i < n; i++) {
+            admin.execute(seqs[i]);
+            assertEq(_state(seqs[i]), S.SPENT, vm.toString(i));
+        }
+        admin.execute(good);
+        assertEq(_state(good), S.EXECUTED, "a client answering exactly is installed");
+    }
+
+    /// @notice Round 9 #1: kind 10 to a client whose status views stopped answering exactly since kind 6 enrolled
+    /// it is spent, the old route untouched (recovery disabled).
+    function test_r9_1_kind10_statusViewsFailClosed() public {
+        bytes4[3] memory sels = _statusSelectors();
+        uint256 n;
+        for (uint256 i = 0; i < 3; i++) {
+            for (uint8 m = 1; m <= 4; m++) {
+                StatusMock c = new StatusMock();
+                string memory id = string.concat("gnoland-", vm.toString(80 + n++));
+                uint64 add =
+                    _decide(S.KIND_CLIENT, P.client(1, id, "ethereum-8", _prefix(), address(c), address(c).codehash));
+                uint64 replace = _decide(S.KIND_ROUTE, P.route(clientId, id, 0));
+                _skip(7 days);
+                admin.execute(add);
+                assertEq(_state(add), S.EXECUTED);
+                c.setMode(sels[i], m);
+                admin.execute(replace);
+                assertEq(_state(replace), S.SPENT, vm.toString(n));
+                assertEq(admin.govClient(), clientId);
+                assertFalse(ctl.isRetired(clientId));
+            }
+        }
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

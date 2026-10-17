@@ -10,6 +10,7 @@ import { IGnoLightClientStatus } from "../interfaces/IGnoLightClientStatus.sol";
 import { IGnoLightClientMsgs } from "../msgs/IGnoLightClientMsgs.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
+import { IBCAdminChecks } from "./IBCAdminChecks.sol";
 
 /// @title The emergency route replacement of ADR §7.12 (optional, off unless IBCAdmin enables it)
 /// @notice Deployed by IBCAdminExec (so pinned with it) and delegatecalled by IBCAdmin, as IBCAdmin: a guardian
@@ -20,10 +21,12 @@ contract IBCAdminRecovery is IIBCAdmin {
     address public immutable router;
     address public immutable ics20;
     address public immutable frozenClient;
+    /// @notice The executor's stateless checks (a usable client, fail closed).
+    address public immutable checks;
     address private immutable _self;
 
-    constructor(address router_, address ics20_, address frozenClient_) {
-        (router, ics20, frozenClient) = (router_, ics20_, frozenClient_);
+    constructor(address router_, address ics20_, address frozenClient_, address checks_) {
+        (router, ics20, frozenClient, checks) = (router_, ics20_, frozenClient_, checks_);
         _self = address(this);
     }
 
@@ -71,18 +74,16 @@ contract IBCAdminRecovery is IIBCAdmin {
         address lc = rp.lightClient;
         if (!_isCode(lc) || lc.codehash != rp.codeHash) return false;
         if (!S.canonicalCounterparty(rp.counterpartyClientId, rp.merklePrefix)) return false;
-        (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSignature("getClientState()"));
-        if (!ok) return false;
-        IGnoLightClientMsgs.ClientState memory cs =
-            abi.decode(abi.decode(ret, (bytes)), (IGnoLightClientMsgs.ClientState));
-        if (keccak256(bytes(cs.chainId)) != keccak256(bytes(l.gnoChainId)) || cs.isFrozen) return false;
-        return !_ask(lc, IGnoLightClientStatus.isFrozen.selector) && !_ask(lc, IGnoLightClientStatus.isExpired.selector);
+        // its chain id and every status view answering exactly, not frozen, not expired (fail closed)
+        return IBCAdminChecks(checks).usableClient(lc, l.gnoChainId);
     }
 
     /// @notice Eligible while the epoch's client is frozen or expired, the channel has been silent for `silence`,
     /// or a hold has stood on IBCAdmin for `holdPeriod`.
     function _eligible(S.Layout storage l, RecoveryConfig calldata c) private view returns (bool) {
         address lc = address(IICS02Client(router).getClient(l.govClient));
+        // frozen or expired by an exact answer (a client that answers neither opens no recovery by its status; the
+        // silence and the hold criteria still apply)
         if (_ask(lc, IGnoLightClientStatus.isFrozen.selector) || _ask(lc, IGnoLightClientStatus.isExpired.selector)) {
             return true;
         }
@@ -94,8 +95,8 @@ contract IBCAdminRecovery is IIBCAdmin {
     }
 
     function _ask(address lc, bytes4 selector) private view returns (bool) {
-        (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSelector(selector));
-        return ok && ret.length == 32 && abi.decode(ret, (bool));
+        (bool answered, bool value) = IBCAdminChecks(checks).flag(lc, selector);
+        return answered && value;
     }
 
     /// @notice Before a proposal opens, a guardian withdraws its approval; once open, it votes to cancel, and

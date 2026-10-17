@@ -70,7 +70,9 @@ contract IBCAdminChecks {
     }
 
     /// @notice Whether `lc` may verify for gno.land: contract code (not an EIP-7702 designator), a client state of
-    /// `chainId` that is not frozen, and neither frozen nor expired by its status views.
+    /// `chainId` that is not frozen, and its status views answering exactly (fail closed: a view that is missing,
+    /// reverts or returns anything but its exact encoding makes the client unusable): not frozen, not expired, and a
+    /// last transition.
     function usableClient(address lc, string calldata chainId) external view returns (bool) {
         uint256 size;
         bytes32 head;
@@ -88,11 +90,27 @@ contract IBCAdminChecks {
         IGnoLightClientMsgs.ClientState memory cs =
             abi.decode(abi.decode(ret, (bytes)), (IGnoLightClientMsgs.ClientState));
         if (keccak256(bytes(cs.chainId)) != keccak256(bytes(chainId)) || cs.isFrozen) return false;
-        return !_ask(lc, IGnoLightClientStatus.isFrozen.selector) && !_ask(lc, IGnoLightClientStatus.isExpired.selector);
+        (bool okF, bool frozen) = flag(lc, IGnoLightClientStatus.isFrozen.selector);
+        (bool okE, bool expired) = flag(lc, IGnoLightClientStatus.isExpired.selector);
+        return okF && okE && !frozen && !expired && transitionKnown(lc);
     }
 
-    function _ask(address lc, bytes4 selector) private view returns (bool) {
+    /// @notice A boolean status view, strictly: answered only by a successful call returning exactly one word that
+    /// is 0 or 1.
+    function flag(address lc, bytes4 selector) public view returns (bool answered, bool value) {
         (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSelector(selector));
-        return ok && ret.length == 32 && abi.decode(ret, (bool));
+        if (!ok || ret.length != 32) return (false, false);
+        uint256 w = abi.decode(ret, (uint256));
+        if (w > 1) return (false, false);
+        return (true, w == 1);
+    }
+
+    /// @notice Whether `lastTransition()` answers exactly: two words, each a uint64.
+    function transitionKnown(address lc) public view returns (bool) {
+        (bool ok, bytes memory ret) =
+            lc.staticcall(abi.encodeWithSelector(IGnoLightClientStatus.lastTransition.selector));
+        if (!ok || ret.length != 64) return false;
+        (uint256 a, uint256 b) = abi.decode(ret, (uint256, uint256));
+        return a <= type(uint64).max && b <= type(uint64).max;
     }
 }

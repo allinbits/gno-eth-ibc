@@ -433,8 +433,9 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         emit GnoRouteMigrated(oldClientId, newClientId, key);
     }
 
-    /// @notice The route's current light client and its latest live transition (zero when the router or the client
-    /// cannot tell: a client without the quarantine views has no transitions to keep).
+    /// @notice The route's current light client and its latest live transition. Fail closed: a client whose
+    /// `lastTransition()` is missing, reverts or answers anything but two uint64 words refuses (GnoQuarantineUnknown),
+    /// so no quarantine is ever lost to a silent client.
     function _lastTransition(string calldata clientId) private view returns (address lc, uint64 id, uint64 time) {
         // the route's current client, whichever of its ids names it: a retired id's client is frozen
         string memory key = GnoTransferStorage.routeKey(clientId);
@@ -442,10 +443,13 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         if (bytes(current).length == 0) current = key;
         (bool ok, bytes memory ret) =
             GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
-        if (!ok || ret.length != 32) return (address(0), 0, 0);
+        require(ok && ret.length == 32, GnoQuarantineUnknown(clientId));
         lc = abi.decode(ret, (address));
         (ok, ret) = lc.staticcall(abi.encodeCall(IGnoLightClientStatus.lastTransition, ()));
-        if (ok && ret.length == 64) (id, time) = abi.decode(ret, (uint64, uint64));
+        require(ok && ret.length == 64, GnoQuarantineUnknown(clientId));
+        (uint256 a, uint256 b) = abi.decode(ret, (uint256, uint256));
+        require(a <= type(uint64).max && b <= type(uint64).max, GnoQuarantineUnknown(clientId));
+        (id, time) = (uint64(a), uint64(b));
     }
 
     // ------------------------------------------------------------------------------------------------- views --
