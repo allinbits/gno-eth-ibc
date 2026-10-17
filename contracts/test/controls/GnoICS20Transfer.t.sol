@@ -442,13 +442,13 @@ contract GnoICS20TransferTest is ControlsFixture {
         _errorAck(pb);
         assertEq(r.balanceOf(bob), 1000);
         vm.expectRevert(abi.encodeWithSelector(T.GnoRefundFailed.selector, clientId, pa.sequence));
-        ctl.claimParked(clientId, pa.sequence);
+        ctl.claimParked(clientId, pa.sequence, 0);
         r.setBlocked(alice, false);
-        assertEq(ctl.claimParked(clientId, pa.sequence), 100);
+        assertEq(ctl.claimParked(clientId, pa.sequence, 0), 100);
         assertEq(r.balanceOf(alice), 1000);
         assertEq(uint8(ctl.sendRecord(clientId, pa.sequence).payment), uint8(T.Payment.Claimed));
         vm.expectRevert(abi.encodeWithSelector(T.GnoNotParked.selector, clientId, pa.sequence));
-        ctl.claimParked(clientId, pa.sequence);
+        ctl.claimParked(clientId, pa.sequence, 0);
     }
 
     function test_refusedQueuedRefund_parked_queueMovesOn() public {
@@ -480,7 +480,7 @@ contract GnoICS20TransferTest is ControlsFixture {
         assertEq(ugnot.totalSupply(), 0);
         assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Parked));
         vm.clearMockedCalls();
-        ctl.claimParked(clientId, pkt.sequence);
+        ctl.claimParked(clientId, pkt.sequence, 0);
         assertEq(ugnot.balanceOf(alice), 5e6);
     }
 

@@ -81,7 +81,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     /// @notice See IGnoICS20Controls.
     function claimParked(
         string calldata clientId,
-        uint64 sequence
+        uint64 sequence,
+        uint256 gasBudget
     )
         external
         delegated
@@ -101,7 +102,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         got = rec.settlement == 1 ? remaining : LeakyBucket.chargeUpTo(t.refunded, t.limits.refundCap, remaining, now_);
         if (got == 0) return 0;
         require(
-            GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore, false), GnoRefundFailed(clientId, sequence)
+            GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore, gasBudget),
+            GnoRefundFailed(clientId, sequence)
         );
         emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
         if (got == remaining) {
@@ -192,7 +194,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             );
             rec.settlement = 1;
             if (left != 0) {
-                if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, true)) {
+                if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, 0)) {
                     rec.payment = Payment.Claimed;
                     emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
                     // the notification is due: anyone delivers it by retryNotification

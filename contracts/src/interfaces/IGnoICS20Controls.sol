@@ -306,7 +306,9 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
 
     /// @notice Retries a parked refund (as the refund meter allows, an installment if it allows part of it), under
     /// no refunds hold. Permissionless; reverts if the payment still fails.
-    function claimParked(string calldata clientId, uint64 sequence) external returns (uint256 paid);
+    /// `gasBudget`: the gas the balance read and each token or escrow call get (0: the automatic bound; at least it
+    /// otherwise), the caller sending enough for them and a reserve (`GnoPaymentStarved` otherwise).
+    function claimParked(string calldata clientId, uint64 sequence, uint256 gasBudget) external returns (uint256 paid);
 
     // ------------------------------------------------------------------------------------------------- views --
 

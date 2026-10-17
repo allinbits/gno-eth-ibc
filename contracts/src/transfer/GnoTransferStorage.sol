@@ -226,7 +226,7 @@ library GnoTransferStorage {
         uint256 amount,
         bytes32 route,
         uint256 own,
-        bool bounded
+        uint256 budget
     )
         internal
         returns (bool)
@@ -237,14 +237,17 @@ library GnoTransferStorage {
         // a bounded payment gives the token PAY_GAS per call: one that runs out on its own is parked, never taking
         // the transaction (or a settlement's batch) down; with less gas left than the payment needs, the caller is
         // starving it, and the whole call reverts (to be retried) instead
-        uint256 g = bounded ? PAY_GAS : gasleft();
-        if (bounded && gasleft() < PAY_NEED) revert IGnoICS20ControlsTypes.GnoPaymentStarved();
+        // `budget` zero: the automatic bound (PAY_GAS per call, BALANCE_GAS for the balance read); a caller-funded
+        // retry (`claimParked`) chooses a larger one, for the balance read and each call alike
+        uint256 g = budget == 0 ? PAY_GAS : (budget < PAY_GAS ? PAY_GAS : budget);
+        uint256 gb = budget == 0 ? BALANCE_GAS : g;
+        if (gasleft() < (gb + 2 * g) * 64 / 63 + 100_000) revert IGnoICS20ControlsTypes.GnoPaymentStarved();
         bool ok;
         bytes memory ret;
         if (!burned) {
             // the escrow keeps the route's other reservations: subtractions only, each guarded
             uint256 others = layout().tokens[route][token].reserved - own;
-            (ok, ret) = token.staticcall{ gas: BALANCE_GAS }(abi.encodeCall(IERC20.balanceOf, (escrow)));
+            (ok, ret) = token.staticcall{ gas: gb }(abi.encodeCall(IERC20.balanceOf, (escrow)));
             if (!ok || ret.length != 32) return false;
             uint256 balance = abi.decode(ret, (uint256));
             if (balance < amount || balance - amount < others) return false;

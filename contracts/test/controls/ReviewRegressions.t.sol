@@ -39,7 +39,8 @@ import {
     AllowingExec,
     HookToken,
     OlderFork,
-    GasBurnToken
+    GasBurnToken,
+    CostlyBalanceToken
 } from "../utils/ControlsMocks.sol";
 import { ICS26Router } from "@eureka/ICS26Router.sol";
 import { ICS20Transfer } from "@eureka/ICS20Transfer.sol";
@@ -170,7 +171,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         r.setBlocked(alice, false);
         vm.prank(address(admin));
         ctl.reopenRoute(clientId);
-        assertEq(ctl.claimParked(clientId, pkt.sequence), 500);
+        assertEq(ctl.claimParked(clientId, pkt.sequence, 0), 500);
         assertEq(r.balanceOf(alice), 1000);
     }
 
@@ -293,7 +294,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(r.balanceOf(bob), 200);
         assertEq(ctl.reserved(clientId, address(r)), 100);
         r.setBlocked(alice, false);
-        assertEq(ctl.claimParked(clientId, pa.sequence), 100);
+        assertEq(ctl.claimParked(clientId, pa.sequence, 0), 100);
         assertEq(r.balanceOf(alice), 100);
         assertEq(ctl.reserved(clientId, address(r)), 0);
     }
@@ -312,7 +313,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Parked));
         assertEq(usdc.balanceOf(alice), before);
         _ack(b, bytes("{\"result\":\"AQ==\"}")); // b delivered: its backing is free
-        assertEq(ctl.claimParked(clientId, a.sequence), 100);
+        assertEq(ctl.claimParked(clientId, a.sequence, 0), 100);
         assertEq(usdc.balanceOf(alice), before + 100);
     }
 
@@ -1633,7 +1634,7 @@ contract ReviewRegressionsTest is ControlsFixture {
             assertEq(ctl.limits(clientId, address(h)).refundLevel, 0);
             h.setBlocked(alice, false);
             h.setHook(alice, address(admin), exec);
-            assertEq(ctl.claimParked(clientId, pkt.sequence), 100);
+            assertEq(ctl.claimParked(clientId, pkt.sequence, 0), 100);
         }
         assertFalse(h.hookOk(), "IBCAdmin refused inside the payment");
         assertEq(bytes4(h.hookRet()), IIBCAdmin.Busy.selector);
@@ -1684,7 +1685,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         b.setBurnFor(address(0));
         vm.prank(address(admin));
         ctl.reopenRoute("gnoland-9");
-        assertEq(ctl.claimParked(clientId, pkts[0].sequence), 100);
+        assertEq(ctl.claimParked(clientId, pkts[0].sequence, 0), 100);
     }
 
     /// @notice Round 6 #5: every kind's deterministic failure at execution spends the decision (its own frame:
@@ -2103,6 +2104,34 @@ contract ReviewRegressionsTest is ControlsFixture {
         (inc, resolved,) = ctl.incidents(clientId);
         assertEq(resolved, 512);
         assertEq(inc[511].status, 3);
+    }
+
+    /// @notice Round 8 #2: a token whose balanceOf needs more than the automatic 30,000 gas: its refund parks at
+    /// the timeout and after reconciliation (automatic processing stays bounded); a caller-funded claimParked with a
+    /// larger budget pays both; too little gas sent for the budget reverts as starved.
+    function test_r8_2_costlyBalanceOf_paidByABudgetedRetry() public {
+        CostlyBalanceToken c = new CostlyBalanceToken();
+        c.mint(alice, 300);
+        vm.prank(alice);
+        c.approve(address(ics20), type(uint256).max);
+        _setLimits(address(c), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(c), 100, clientId);
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(c), 100, clientId);
+        _timeout(a); // the balance read runs out of its bound: parked
+        assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Parked));
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRefundFailed.selector, clientId, a.sequence));
+        ctl.claimParked(clientId, a.sequence, 0);
+        vm.expectRevert(T.GnoPaymentStarved.selector);
+        ctl.claimParked{ gas: 400_000 }(clientId, a.sequence, 300_000);
+        assertEq(ctl.claimParked(clientId, a.sequence, 300_000), 100);
+        _retire();
+        _proveRefundable(b);
+        _settle(_item(b.sequence, 1, 100)); // kind 12's payment is bounded too: parked
+        assertEq(uint8(ctl.sendRecord(clientId, b.sequence).payment), uint8(T.Payment.Parked));
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9");
+        assertEq(ctl.claimParked(clientId, b.sequence, 300_000), 100);
+        assertEq(c.balanceOf(alice), 300);
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

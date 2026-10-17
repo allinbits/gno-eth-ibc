@@ -248,3 +248,21 @@ contract GasBurnToken is ERC20 {
         }
     }
 }
+
+/// @notice A token whose balanceOf is expensive (about 60,000 gas of computation, warm or cold), its transfers
+/// ordinary.
+contract CostlyBalanceToken is ERC20 {
+    constructor() ERC20("Costly", "COST") { }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function balanceOf(address a) public view override returns (uint256) {
+        bytes32 x = bytes32(uint256(uint160(a)));
+        for (uint256 i = 0; i < 600; i++) {
+            x = keccak256(abi.encode(x, i));
+        }
+        return super.balanceOf(a) + (uint256(x) == 0 ? 1 : 0);
+    }
+}

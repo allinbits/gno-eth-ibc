@@ -309,7 +309,7 @@ contract ReconcileHandler is Test {
         calls++;
         if (packets.length == 0) return;
         IICS26RouterMsgs.Packet memory pkt = packets[bound(i, 0, packets.length - 1)];
-        try ctl.claimParked(pkt.sourceClient, pkt.sequence) {
+        try ctl.claimParked(pkt.sourceClient, pkt.sequence, 0) {
             ok["claimParked"]++;
         } catch { }
     }
