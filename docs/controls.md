@@ -270,6 +270,23 @@ a cancel beyond the window, commitment-only send records, and kinds 12 and 13. W
 18. **Kind 7 on the transfer proxy checks the fork's modules**: its controls and reconciliation modules must be code
     answering its controls version, and all three answer through the proxy after the upgrade.
 
+## Code pinning and the build verification
+
+Governance pins code by hash (kinds 5, 6, 7, 9), and the pins are transitive: every contract records, as
+immutables set in its constructor, the address and the code hash of each delegate it runs (the fork: its controls;
+the controls: the reconciliation module; that module: the evidence module; the executor: its checks and recovery
+modules), so an implementation's single pinned hash fixes its whole delegate graph. Each delegated call checks the
+delegate's live code hash against the recorded one (`GnoBadModule`), kind 7 checks every module of a candidate, and
+IBCAdmin checks the recovery module before running it (`ForeignExec`).
+
+A hash says nothing of the source, and a proxy's hash never changes when its target does. So **every pinned hash
+must equal a reproducible build of the named source, and no module may hold a mutable implementation pointer** (a
+beacon or an ERC-1967 proxy as a module would keep its hash while its owner changed what it runs; on chain it
+passes, as governance pinned it). `scripts/verify-codehashes.sh` (`script/VerifyCodehashes.s.sol`) checks a
+deployment against a clean build: every contract of the transfer app's and IBCAdmin's graphs must equal its source's
+built runtime code, the compiler's immutables aside, and each delegate address is the one its holder records. The
+watch tool (T5) runs it for every deployment and every hash a decision pins, before the decision matures.
+
 ## Deployment
 
 `DeployGnoIBC` deploys the fork as the ICS20 proxy's first implementation and initializes its controls

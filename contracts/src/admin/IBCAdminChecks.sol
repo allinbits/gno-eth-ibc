@@ -113,4 +113,51 @@ contract IBCAdminChecks {
         (uint256 a, uint256 b) = abi.decode(ret, (uint256, uint256));
         return a <= type(uint64).max && b <= type(uint64).max;
     }
+
+    // ------------------------------------------------------------------------------- transfer-app modules --
+
+    /// @notice A version probe of `target`, zero if it does not answer exactly one word.
+    function version(address target, string calldata probe) public view returns (uint256) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature(probe));
+        return ok && ret.length == 32 ? abi.decode(ret, (uint256)) : 0;
+    }
+
+    function _word(address target, string memory probe) private view returns (bytes32) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature(probe));
+        return ok && ret.length == 32 ? abi.decode(ret, (bytes32)) : bytes32(0);
+    }
+
+    function _module(address holder, string memory probe) private view returns (address) {
+        (bool ok, bytes memory ret) = holder.staticcall(abi.encodeWithSignature(probe));
+        return ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
+    }
+
+    function _code(address a) private view returns (bool) {
+        return a.code.length != 0;
+    }
+
+    /// @notice A fork implementation's controls version, if its delegate graph is whole: the controls, the
+    /// reconciliation and the evidence modules are code answering that version, each with the code hash its holder
+    /// recorded at construction (so the implementation's pinned hash fixes them all); zero otherwise.
+    function modulesVersion(address impl) external view returns (uint256 v) {
+        v = this.version(impl, "gnoControlsVersion()");
+        address controls = _module(impl, "CONTROLS()");
+        if (!_code(controls) || this.version(controls, "gnoControlsModuleVersion()") != v) return 0;
+        if (controls.codehash != _word(impl, "CONTROLS_HASH()")) return 0;
+        address reconcile = _module(controls, "RECONCILE()");
+        if (!_code(reconcile) || this.version(reconcile, "gnoReconcileModuleVersion()") != v) return 0;
+        if (reconcile.codehash != _word(controls, "RECONCILE_HASH()")) return 0;
+        address evidence = _module(reconcile, "EVIDENCE()");
+        if (!_code(evidence) || this.version(evidence, "gnoEvidenceModuleVersion()") != v) return 0;
+        if (evidence.codehash != _word(reconcile, "EVIDENCE_HASH()")) return 0;
+    }
+
+    /// @notice Whether the transfer proxy, its controls, reconciliation and evidence modules all answer version `v`
+    /// through the proxy (the last three by delegation).
+    function proxyAnswers(address proxy, uint256 v) external view returns (bool) {
+        return this.version(proxy, "gnoControlsVersion()") == v
+            && this.version(proxy, "gnoControlsModuleVersion()") == v
+            && this.version(proxy, "gnoReconcileModuleVersion()") == v
+            && this.version(proxy, "gnoEvidenceModuleVersion()") == v;
+    }
 }

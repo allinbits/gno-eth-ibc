@@ -101,6 +101,7 @@ contract GnoICS20Transfer is
         require(controls.code.length != 0, GnoBadModule());
         _disableInitializers();
         CONTROLS = controls;
+        CONTROLS_HASH = controls.codehash;
     }
 
     /// @inheritdoc IICS20Transfer
@@ -724,11 +725,20 @@ contract GnoICS20Transfer is
     /// @notice GnoICS20Controls, fixed with this implementation (its address is in this code, so a code hash of the
     /// implementation pins it).
     address public immutable CONTROLS;
+    /// @notice The controls module's code hash when this implementation was built: the implementation's own pinned
+    /// code hash (kind 7) thereby fixes its whole delegate graph, address and code.
+    bytes32 public immutable CONTROLS_HASH;
+
+    /// @notice The controls module, its code still the recorded one (GnoBadModule otherwise).
+    function _controls() private view returns (address controls) {
+        controls = CONTROLS;
+        require(controls.codehash == CONTROLS_HASH, GnoBadModule());
+    }
 
     /// @notice Serves IGnoICS20Controls from GnoICS20Controls, in this contract's storage and authority.
     // solhint-disable-next-line no-complex-fallback
     fallback() external {
-        address controls = CONTROLS;
+        address controls = _controls();
         // solhint-disable-next-line no-inline-assembly
         assembly {
             calldatacopy(0, 0, calldatasize())
@@ -847,7 +857,7 @@ contract GnoICS20Transfer is
     )
         private
     {
-        address controls = CONTROLS;
+        address controls = _controls();
         bytes memory call = abi.encodeWithSignature(
             "ackHook(string,uint64,uint8,address,address,uint256,bytes)",
             clientId,

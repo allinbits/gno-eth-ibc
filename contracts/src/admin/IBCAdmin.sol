@@ -478,7 +478,10 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Runs the recovery module of the pinned executor as this contract.
     function _delegateRecovery(bytes memory call) private {
-        address m = IBCAdminExec(_exec(S.layout())).recoveryModule();
+        IBCAdminExec x = IBCAdminExec(_exec(S.layout()));
+        address m = x.recoveryModule();
+        // the module the pinned executor deployed, its code still the recorded one
+        if (m.codehash != x.RECOVERY_HASH()) revert ForeignExec();
         (bool ok, bytes memory ret) = m.delegatecall(call);
         if (!ok) {
             // solhint-disable-next-line no-inline-assembly

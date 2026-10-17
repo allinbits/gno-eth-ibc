@@ -71,6 +71,10 @@ contract IBCAdminExec is IIBCAdmin {
     address public immutable setupCheck;
     /// @notice The stateless checks (canonical parameters, denoms, counterparties, usable clients).
     address public immutable checks;
+    /// @notice The code hashes of the modules this executor deployed, recorded at construction: the executor's
+    /// pinned code hash thereby fixes them too (IBCAdmin checks the recovery module's before each use).
+    bytes32 public immutable CHECKS_HASH;
+    bytes32 public immutable RECOVERY_HASH;
     /// @notice The emergency recovery's code, which IBCAdmin delegatecalls (pinned with this executor).
     address public immutable recoveryModule;
     address private immutable _self;
@@ -83,7 +87,9 @@ contract IBCAdminExec is IIBCAdmin {
         frozenClient = address(new FrozenLightClient());
         setupCheck = address(new IBCAdminSetupCheck());
         checks = address(new IBCAdminChecks());
+        CHECKS_HASH = checks.codehash;
         recoveryModule = address(new IBCAdminRecovery(router_, ics20_, frozenClient, checks));
+        RECOVERY_HASH = recoveryModule.codehash;
         _self = address(this);
     }
 
@@ -111,6 +117,7 @@ contract IBCAdminExec is IIBCAdmin {
         delegated
         returns (uint8, string memory)
     {
+        if (checks.codehash != CHECKS_HASH) revert ForeignExec();
         // the parameters exactly the canonical encoding of the kind's tuple (§5.4): anything else is spent
         if (!IBCAdminChecks(checks).canonicalParams(kind, p)) return (S.SPEND, "params");
         if (kind == S.KIND_UNPAUSE) {
@@ -442,18 +449,13 @@ contract IBCAdminExec is IIBCAdmin {
         if (proxy == router || proxy == ics20) {
             // the transfer app keeps the controls: the new code answers the pinned probe with at least the running
             // version, before the upgrade (the implementation) and after it (the proxy)
-            uint256 running = proxy == ics20 ? _version(ics20, "gnoControlsVersion()") : 0;
-            uint256 v = proxy == ics20 ? _modulesVersion(impl) : 0;
+            IBCAdminChecks c = IBCAdminChecks(checks);
+            uint256 running = proxy == ics20 ? c.version(ics20, "gnoControlsVersion()") : 0;
+            uint256 v = proxy == ics20 ? c.modulesVersion(impl) : 0;
             if (v < running) revert AuthorityLost(proxy);
             UUPSUpgradeable(proxy).upgradeToAndCall{ gas: CALL_GAS }(impl, call);
             // through the proxy: the fork, its controls and its reconciliation module all answer, at that version
-            if (
-                proxy == ics20
-                    && (_version(ics20, "gnoControlsVersion()") != v
-                        || _version(ics20, "gnoControlsModuleVersion()") != v
-                        || _version(ics20, "gnoReconcileModuleVersion()") != v
-                        || _version(ics20, "gnoEvidenceModuleVersion()") != v)
-            ) revert AuthorityLost(proxy);
+            if (proxy == ics20 && !c.proxyAnswers(ics20, v)) revert AuthorityLost(proxy);
             if (IAccessManaged(proxy).authority() != accessManager) revert AuthorityLost(proxy);
             if (proxy == ics20) {
                 if (IICS20Transfer(ics20).ics26() != router) revert AuthorityLost(proxy);
@@ -477,27 +479,6 @@ contract IBCAdminExec is IIBCAdmin {
         ) {
             revert AuthorityLost(proxy);
         }
-    }
-
-    /// @notice A version probe of `target`, zero if it does not answer one.
-    function _version(address target, string memory probe) private view returns (uint256) {
-        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature(probe));
-        return ok && ret.length == 32 ? abi.decode(ret, (uint256)) : 0;
-    }
-
-    /// @notice A fork implementation's controls version, if its modules (controls, then reconciliation) are code
-    /// answering the same version; zero otherwise.
-    function _modulesVersion(address impl) private view returns (uint256 v) {
-        v = _version(impl, "gnoControlsVersion()");
-        (bool ok, bytes memory ret) = impl.staticcall(abi.encodeWithSignature("CONTROLS()"));
-        address controls = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
-        if (!_isCode(controls) || _version(controls, "gnoControlsModuleVersion()") != v) return 0;
-        (ok, ret) = controls.staticcall(abi.encodeWithSignature("RECONCILE()"));
-        address reconcile = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
-        if (!_isCode(reconcile) || _version(reconcile, "gnoReconcileModuleVersion()") != v) return 0;
-        (ok, ret) = reconcile.staticcall(abi.encodeWithSignature("EVIDENCE()"));
-        address evidence = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
-        if (!_isCode(evidence) || _version(evidence, "gnoEvidenceModuleVersion()") != v) return 0;
     }
 
     /// @notice Runs a step of this executor as IBCAdmin in a call frame of its own (IBCAdmin.selfDelegate), so that

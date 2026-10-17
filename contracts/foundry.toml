@@ -11,6 +11,7 @@ bytecode_hash = "none"
 via_ir = true
 fs_permissions = [
     { access = "read", path = "./test/fixtures" },
+    { access = "read", path = "./out" },
     { access = "read-write", path = "./test/fixtures/gov-vectors.json" },
     { access = "read-write", path = "./deployments" },
 ]

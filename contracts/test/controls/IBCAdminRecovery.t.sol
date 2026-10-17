@@ -386,6 +386,17 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertEq(admin.govClient(), "gnoland-7");
     }
 
+    /// @notice Round 10 #1: IBCAdmin runs the recovery module only while its code is the one the pinned executor
+    /// recorded when it deployed it.
+    function test_r10_1_recoveryModuleCodeChecked() public {
+        lc.setStatus(true, false);
+        address m = IBCAdminExec(d.ibcAdminExec).recoveryModule();
+        vm.etch(m, address(new MockLightClient()).code);
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.ForeignExec.selector);
+        admin.approveRecovery(_proposal("gnoland-7"));
+    }
+
     function test_executeRefusesAClientWithAnotherCode() public {
         _openFrozen();
         vm.etch(address(attested), address(new IBCAdminExec(address(router), d.accessManager, address(ics20))).code);

@@ -31,6 +31,8 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     address private immutable _self;
     /// @notice GnoICS20Reconcile: the reconciliation functions, served by this contract's fallback.
     address public immutable RECONCILE;
+    /// @notice The reconciliation module's code hash when this module was built (see GnoICS20Transfer).
+    bytes32 public immutable RECONCILE_HASH;
 
     error NotDelegated();
 
@@ -38,6 +40,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         require(reconcile.code.length != 0, GnoBadModule());
         _self = address(this);
         RECONCILE = reconcile;
+        RECONCILE_HASH = reconcile.codehash;
     }
 
     /// @notice The controls version this module implements (kind 7 checks it on the module and through the proxy).
@@ -50,6 +53,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     // solhint-disable-next-line no-complex-fallback
     fallback() external {
         address r = RECONCILE;
+        require(r.codehash == RECONCILE_HASH, GnoBadModule());
         // solhint-disable-next-line no-inline-assembly
         assembly {
             calldatacopy(0, 0, calldatasize())

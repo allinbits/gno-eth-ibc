@@ -29,6 +29,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     address private immutable _self;
     /// @notice GnoICS20Evidence: the proofs, views and notifications, served by this contract's fallback.
     address public immutable EVIDENCE;
+    /// @notice The evidence module's code hash when this module was built (see GnoICS20Transfer).
+    bytes32 public immutable EVIDENCE_HASH;
 
     error NotDelegated();
 
@@ -36,12 +38,14 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         require(evidence.code.length != 0, GnoBadModule());
         _self = address(this);
         EVIDENCE = evidence;
+        EVIDENCE_HASH = evidence.codehash;
     }
 
     /// @notice Serves the evidence functions from GnoICS20Evidence, in the transfer proxy's storage.
     // solhint-disable-next-line no-complex-fallback
     fallback() external {
         address e = EVIDENCE;
+        require(e.codehash == EVIDENCE_HASH, GnoBadModule());
         // solhint-disable-next-line no-inline-assembly
         assembly {
             calldatacopy(0, 0, calldatasize())
