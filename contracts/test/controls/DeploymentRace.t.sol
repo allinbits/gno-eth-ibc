@@ -11,7 +11,7 @@ import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
 
 import { DeployGnoIBC } from "../../script/DeployGnoIBC.s.sol";
-import { IGnoICS20ControlsTypes } from "../../src/interfaces/IGnoICS20Controls.sol";
+import { IGnoICS20Controls, IGnoICS20ControlsTypes } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
 import { IBCAdmin } from "../../src/admin/IBCAdmin.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
@@ -218,3 +218,48 @@ contract DeploymentFlagsBeforeSetupTest is RaceBase {
         assertTrue(IBCAdmin(d.ibcAdmin).setupDone());
     }
 }
+
+/// @notice Round 19 #2: the launch quarantine is armed before receives exist, and covers transitions relayed between
+/// the deployment's transactions. With the real GnoLightClient, anyone relays h11 and then h12 (which announces
+/// another validator set: a transition) right after the router's launch, before the quarantine is set. The launch
+/// duration still applies to that transition, so receives wait for it.
+contract DeploymentQuarantineTest is Fixtures, DeployGnoIBC {
+    address internal deployer = makeAddr("deployer");
+    Deployed internal d;
+    uint64 internal transitionTime;
+
+    function _afterRouter(Deployed memory dd) internal override {
+        vm.stopPrank();
+        vm.startPrank(makeAddr("anyone"));
+        GnoLightClient(dd.gnoLightClient).updateClient(_msg("h11"));
+        GnoLightClient(dd.gnoLightClient).updateClient(_msg("h12")); // a transition
+        vm.stopPrank();
+        transitionTime = GnoLightClient(dd.gnoLightClient).lastTransitionTime();
+        vm.startPrank(deployer);
+    }
+
+    function test_r19_2_transitionBeforeArming_stillQuarantined() public {
+        _loadFixtures();
+        vm.warp(t0Seconds + 120);
+        Params memory p;
+        p.deployer = deployer;
+        p.clientState = _initialClientState();
+        p.consensusState = _initialConsensusState();
+        p.counterparty = "ethereum-1";
+        for (uint256 i = 0; i < 4; i++) {
+            p.guardians[i] = makeAddr(string.concat("guardian", vm.toString(i)));
+        }
+        p.watch = [makeAddr("watch0"), makeAddr("watch1")];
+        p.expectedLock = 1_000_000e6;
+        p.gnotLimits = IGnoICS20ControlsTypes.Limits(25_000e6, 100_000e6, 100_000e6, 0, 0);
+        p.quarantineSeconds = 7 days;
+        vm.startPrank(deployer);
+        d = _deploy(p);
+        vm.stopPrank();
+        assertGt(transitionTime, 0, "h12 was a transition");
+        IGnoICS20Controls ctl = IGnoICS20Controls(d.ics20Transfer);
+        assertEq(ctl.quarantineEnd(d.clientId), uint256(transitionTime) + 7 days, "the launch duration applies");
+        assertTrue(IBCAdmin(d.ibcAdmin).setupDone());
+    }
+}
+

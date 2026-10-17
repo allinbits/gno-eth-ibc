@@ -164,4 +164,51 @@ contract IBCAdminChecks {
             && this.version(proxy, "gnoReconcileModuleVersion()") == v
             && this.version(proxy, "gnoEvidenceModuleVersion()") == v;
     }
+
+    // ---------------------------------------------------------------------------------------- recording --
+
+    /// @notice A recorded decision of a kind whose recording checks are its parameters alone (kinds 2, 5, 6, 7, 9,
+    /// 10, 12 and 13): whether they are acceptable (it then waits for its delay; otherwise it is spent).
+    function waitingParams(uint8 kind, bytes calldata p) external pure returns (bool) {
+        if (kind == S.KIND_UNPAUSE) {
+            (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));
+            return (object == 1 && bytes(clientId).length != 0) || (object == 2 && bytes(clientId).length == 0);
+        }
+        if (kind == S.KIND_VOUCHER) {
+            (string memory clientId, string memory baseDenom, address voucher,) =
+                abi.decode(p, (string, string, address, bytes32));
+            return bytes(clientId).length != 0 && S.canonicalGnoDenom(baseDenom) && voucher != address(0);
+        }
+        if (kind == S.KIND_CLIENT) {
+            (uint8 op, string memory clientId, string memory cp, bytes[] memory prefix, address lc,) =
+                abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
+            return (op == 1 || op == 2) && bytes(clientId).length != 0 && lc != address(0)
+                && S.canonicalCounterparty(cp, prefix);
+        }
+        if (kind == S.KIND_UPGRADE) {
+            (address proxy, address impl,,) = abi.decode(p, (address, address, bytes32, bytes));
+            return proxy != address(0) && impl != address(0);
+        }
+        if (kind == S.KIND_HANDOVER) {
+            (address x,,) = abi.decode(p, (address, bytes32, bytes));
+            return x != address(0);
+        }
+        if (kind == S.KIND_ROUTE) {
+            (string memory oldId, string memory newId,) = abi.decode(p, (string, string, uint64));
+            return
+                bytes(oldId).length != 0 && bytes(newId).length != 0
+                    && keccak256(bytes(oldId)) != keccak256(bytes(newId));
+        }
+        if (kind == S.KIND_SETTLE) {
+            (string memory sid, IGnoICS20ControlsTypes.SettleItem[] memory items) =
+                abi.decode(p, (string, IGnoICS20ControlsTypes.SettleItem[]));
+            bool ok = bytes(sid).length != 0 && items.length != 0 && items.length <= S.MAX_SETTLE_ITEMS;
+            for (uint256 i = 0; ok && i < items.length; i++) {
+                ok = items[i].action >= 1 && items[i].action <= 5;
+            }
+            return ok;
+        }
+        if (kind == S.KIND_REOPEN) return bytes(abi.decode(p, (string))).length != 0;
+        return false;
+    }
 }

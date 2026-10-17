@@ -112,6 +112,13 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   verifier to follow IBCAdmin's gno.land chain id, which `finishSetup` checked against the launch client, and the
   counterparty to use gno.land's exact store prefix. The route's identity is therefore preserved; a client of
   another gno chain or store is refused (`test_routeIdentity_anotherGnoChain_refusedOnEveryPath`).
+- **Kind 10 is all or nothing.** The quarantine checkpoint (which bumps the route's verifier generation and voids
+  the old verifier's proofs), the route's migration and the epoch switch run in one frame. A refused migration (for
+  instance a target that already has an escrow) rolls the checkpoint back, and the decision is spent: outcomes proven
+  before stay usable and cannot be voided (`test_r19_3_refusedKind10_keepsTheProofs`).
+- **An initial notice send can be refused** (for instance when the kind 10 is executed from inside another app's
+  receive callback, with the router locked). The epoch switch stands and the notice stays owed for
+  `resendEpochNotice` (`test_epochNotice_refusedInitialSend_resendCompletes`).
 - **Vacancies.** Kind 3 never sets a seat to no key: a vacancy is spent at recording, so it can never land faster than
   a replacement (ADR §7.4).
 - Byte-exact vectors for kinds 1–13 and every ack: `contracts/test/fixtures/gov-vectors.json`, written and checked
@@ -221,9 +228,12 @@ bounds (constant work whatever the number of incidents).
     settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
 5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12). A refund a
    forged success ack hid is reserved from the moment `proveOutcome` proves it owed (refundable or a collision),
-   not from its settlement. Its backing is therefore held however the settlements are split across decisions. If
-   the verifier that proved it stops vouching for it, anyone may call `voidOutcome`, which releases that
-   reservation; a new proof sets it again. The only
+   not from its settlement. Its backing is therefore held however the settlements are split across decisions. The
+   liability outlives the proof (`held`). If the verifier that proved it stops vouching for it, anyone may call
+   `voidOutcome` so that the active verifier can prove it again; the reservation stays. Only its settlement, or a
+   new proof through the active verifier that the packet was delivered, releases it. `voidAndReprove` drives three
+   such refunds against deficient backing: proven, verifier migrated, two voided, one re-proven and settled; it must
+   not pay. The only
    permitted shortfall is the one reconciliation recognizes: the refunds kind 12 owes again for packets a forged
    success ack released, whose backing the compromise consumed. That allowance belongs to those very refunds and
    only while they are unpaid. Every other record's reservation is backed in full at all times, so a payment of one
@@ -468,6 +478,14 @@ a kind 9 hand-over installed an executor whose allow-list admits it.
 
    Governance waits for `finishSetup`: until it passes, IBCAdmin refuses every delivery, execution and emergency
    recovery (`SetupPending`). A mismatch therefore leaves governance off, not captured.
+
+**The launch quarantine is armed before receives exist.** The route's first quarantine setting (the deployment's)
+does not checkpoint the transitions already accepted with a zero duration. Every transition its client accepted since
+the trusted launch checkpoint therefore counts as live with the launch duration: anyone may relay one between the
+deployment's transactions. Later governed changes keep their semantics (transitions already seen keep the duration
+in force when they were accepted). Receive limits, which enable receives, are refused until the route's quarantine
+is armed, and the deploy script sets the quarantine first (`test_r19_2_transitionBeforeArming_stillQuarantined`,
+`test_r19_2_limitsWaitForTheQuarantine`).
 
 `DeploymentRace.t.sol` shows both layers:
 - An attacker registering between the deployer's transactions gets `client-1`, which nothing names.

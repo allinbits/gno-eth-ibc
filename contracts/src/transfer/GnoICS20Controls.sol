@@ -319,6 +319,8 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                 && (l.sendMax == 0 || l.sendMin <= l.sendMax),
             GnoBadLimits()
         );
+        // receive limits (which enable receives) wait for the route's quarantine
+        require(_route(clientId).quarantineArmed, GnoBadLimits());
         GnoTransferStorage.TokenControls storage t = _g().tokens[GnoTransferStorage.routeHash(clientId)][token];
         // the buckets drain at the old caps up to now; the new caps apply from now on
         uint64 now_ = uint64(block.timestamp);
@@ -333,8 +335,11 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     function setQuarantine(string calldata clientId, uint64 seconds_) external delegated restricted nonReentrant {
         require(seconds_ <= MAX_QUARANTINE, GnoBadLimits());
         GnoTransferStorage.Route storage r = _route(clientId);
-        // the transitions accepted so far keep the deadline the old duration gave them
-        _checkpoint(r, clientId);
+        // the transitions accepted so far keep the deadline the old duration gave them; the launch's arming has no
+        // old duration: every transition since the trusted checkpoint (anyone may relay one before it) counts as
+        // live with the launch duration
+        if (r.quarantineArmed) _checkpoint(r, clientId);
+        r.quarantineArmed = true;
         r.quarantineSeconds = seconds_;
         emit GnoQuarantineSet(GnoTransferStorage.routeKey(clientId), seconds_);
     }

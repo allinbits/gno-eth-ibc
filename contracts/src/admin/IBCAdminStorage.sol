@@ -54,6 +54,9 @@ library IBCAdminStorage {
     /// the time everyone has to see an opened recovery and the guardians to cancel it.
     uint64 internal constant MIN_RECOVERY_DELAY = 30 days;
 
+    /// @notice The most items a kind 12 settles.
+    uint256 internal constant MAX_SETTLE_ITEMS = 8;
+
     // kinds (§5.4)
     uint8 internal constant KIND_CANCEL = 1;
     uint8 internal constant KIND_UNPAUSE = 2;

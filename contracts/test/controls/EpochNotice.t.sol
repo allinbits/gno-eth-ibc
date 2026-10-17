@@ -8,10 +8,35 @@ import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
 
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
+import { IBCAdmin } from "../../src/admin/IBCAdmin.sol";
+import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
+
+/// @notice Another IBC app, whose receive callback calls IBCAdmin's permissionless `execute` (the router locked).
+contract ExecutingApp {
+    IBCAdmin internal immutable admin;
+    uint64 public seq;
+
+    constructor(IBCAdmin a) {
+        admin = a;
+    }
+
+    function arm(uint64 s) external {
+        seq = s;
+    }
+
+    function onRecvPacket(IIBCAppCallbacks.OnRecvPacketCallback calldata) external returns (bytes memory) {
+        admin.execute(seq);
+        return bytes("ok");
+    }
+
+    function onAcknowledgementPacket(IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external { }
+
+    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external { }
+}
 
 /// @notice ADR §7.12, the two-phase epoch switch: each executed kind 10 (or emergency recovery) raises the epoch by
 /// one and sends that epoch's notice from `ibcgov` over its new client to gno.land's `gov` port. gno.land answers in
@@ -132,5 +157,43 @@ contract EpochNoticeTest is ControlsFixture {
         // no notice for the launch epoch
         vm.expectRevert(IIBCAdmin.NoNoticeOwed.selector);
         admin.resendEpochNotice(1);
+    }
+
+    /// @notice A kind 10 executed inside another app's receive callback (the router locked): the epoch switch stands,
+    /// the initial notice send is refused and the notice stays owed; a later resend goes out, and its ack ends it.
+    function test_epochNotice_refusedInitialSend_resendCompletes() public {
+        ExecutingApp app = new ExecutingApp(admin);
+        vm.prank(address(admin));
+        router.addIBCApp("probe", address(app));
+        MockLightClient c = new MockLightClient();
+        uint64 seq = admin.lastSeq() + 1;
+        _recvGov(
+            _env(seq, S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(c), address(c).codehash))
+        );
+        _recvGov(_env(seq + 1, S.KIND_ROUTE, P.route(clientId, "gnoland-2")));
+        _skip(7 days);
+        admin.execute(seq);
+        app.arm(seq + 1);
+        IICS26RouterMsgs.Packet memory pkt = _packetFromGno(clientId, "probe", "v", "e", "x");
+        vm.recordLogs();
+        router.recvPacket(IICS26RouterMsgs.MsgRecvPacket(pkt, "", IICS02ClientMsgs.Height(0, 1)));
+        assertEq(admin.epoch(), 2, "the epoch switch stands");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(
+                !(logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector),
+                "no notice sent from inside the lock"
+            );
+        }
+        bytes memory notice = abi.encodePacked(uint8(1), uint32(2), "gnoland-2");
+        assertEq(admin.epochNotice(2), notice, "owed");
+        vm.recordLogs();
+        admin.resendEpochNotice(2);
+        IICS26RouterMsgs.Packet memory sent = _sentNotice();
+        assertEq(sent.sourceClient, "gnoland-2");
+        assertEq(sent.payloads[0].value, notice);
+        _ackNotice(sent, _gnoAck(2, 1));
+        vm.expectRevert(IIBCAdmin.NoNoticeOwed.selector);
+        admin.resendEpochNotice(2);
     }
 }

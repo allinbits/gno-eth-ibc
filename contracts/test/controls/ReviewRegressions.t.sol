@@ -2529,9 +2529,10 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.reserved(clientId, address(usdc)), 90);
     }
 
-    /// @notice r18 #1: an outcome its verifier no longer vouches for (the route's verifier migrated) is voided by
-    /// anyone, releasing the reservation its proof had set; a new proof sets it again.
-    function test_r18_1_voidedOutcome_releasesTheReservation() public {
+    /// @notice r19 #1: an outcome its verifier no longer vouches for is voided by anyone so it can be proven again;
+    /// the hidden refund's liability and reservation stay. Only a trusted proof that the packet was delivered (or its
+    /// settlement) releases it.
+    function test_r19_1_void_keepsTheReservation_deliveredProofReleases() public {
         IICS26RouterMsgs.Packet[] memory p = _hiddenRefunds(1, 100, 100);
         assertEq(ctl.reserved(clientId, address(usdc)), 100);
         vm.expectRevert(T.GnoBadProof.selector);
@@ -2540,8 +2541,75 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.prank(address(admin));
         router.migrateClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), address(next));
         ctl.voidOutcome(clientId, p[0].sequence);
-        assertEq(ctl.reserved(clientId, address(usdc)), 0, "released");
+        assertEq(uint8(ctl.sendRecord(clientId, p[0].sequence).proven), uint8(T.Proven.None));
+        assertEq(ctl.reserved(clientId, address(usdc)), 100, "a void keeps the liability");
+        _proveDelivered(p[0]); // a trusted proof reclassifies it as delivered
+        assertEq(ctl.reserved(clientId, address(usdc)), 0, "released by the delivered proof");
+    }
+
+    /// @notice r19 #1, Codex's sequence: two hidden refunds of 100 proven (200 reserved) against 150; the verifier
+    /// replaced (both proofs void); the second voided, only the first proven again and settled: it must not pay,
+    /// the second's liability still holding its backing.
+    function test_r19_1_voidThenSelectiveReproof_noPaymentTakesTheOthersBacking() public {
+        IICS26RouterMsgs.Packet[] memory p = _hiddenRefunds(2, 100, 150);
+        MockLightClient next = new MockLightClient();
+        vm.prank(address(admin));
+        router.migrateClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), address(next));
+        ctl.voidOutcome(clientId, p[1].sequence);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
         _proveRefundable(p[0]);
-        assertEq(ctl.reserved(clientId, address(usdc)), 100, "reserved again");
+        _settle(_item(p[0].sequence, 1, 100));
+        assertEq(ctl.sendRecord(clientId, p[0].sequence).refunded, 0, "the first pays nothing");
+        assertEq(usdc.balanceOf(ics20.getEscrow(clientId)), 150);
+        _proveRefundable(p[1]);
+        _settle(_item(p[1].sequence, 1, 100));
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
+    }
+
+    /// @notice r19 #2: a route's receive limits wait for its quarantine to be armed.
+    function test_r19_2_limitsWaitForTheQuarantine() public {
+        vm.startPrank(address(admin));
+        vm.expectRevert(T.GnoBadLimits.selector);
+        ctl.setLimits("gnoland-77", address(usdc), T.Limits(1, 1, 1, 0, 0));
+        ctl.setQuarantine("gnoland-77", 7 days);
+        ctl.setLimits("gnoland-77", address(usdc), T.Limits(1, 1, 1, 0, 0));
+        vm.stopPrank();
+    }
+
+    /// @notice r19 #3: a kind 10 whose migration is refused (its target already used: it has an escrow of its own)
+    /// is spent and leaves no trace: the quarantine checkpoint and its verifier generation bump roll back with it, so
+    /// outcomes proven before stay usable and cannot be voided.
+    function test_r19_3_refusedKind10_keepsTheProofs() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId);
+        _retire();
+        _proveRefundable(a);
+        // the target enrolled by kind 6, then used: an escrow of its own
+        MockLightClient c2 = new MockLightClient();
+        uint64 seq = admin.lastSeq() + 1;
+        _recvGov(
+            _env(
+                seq, S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(c2), address(c2).codehash)
+            )
+        );
+        _skip(7 days);
+        admin.execute(seq);
+        vm.startPrank(address(admin));
+        ctl.setQuarantine("gnoland-2", 0);
+        ctl.setLimits("gnoland-2", address(usdc), T.Limits(1000, 1000, 1000, 0, 0));
+        vm.stopPrank();
+        _send(alice, address(usdc), 1, "gnoland-2");
+        assertTrue(ics20.getEscrow("gnoland-2") != address(0));
+        uint64 route = admin.lastSeq() + 1;
+        _recvGov(_env(route, S.KIND_ROUTE, P.route(clientId, "gnoland-2")));
+        _skip(7 days);
+        admin.execute(route);
+        assertEq(_state(route), S.SPENT, "the migration refused");
+        assertEq(admin.epoch(), 1);
+        // the proof still stands: it cannot be voided, and it settles
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.voidOutcome(clientId, a.sequence);
+        _settle(_item(a.sequence, 1, 100));
+        assertEq(ctl.sendRecord(clientId, a.sequence).refunded, 100);
     }
 }

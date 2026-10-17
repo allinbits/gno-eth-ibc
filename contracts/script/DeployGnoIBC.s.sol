@@ -250,8 +250,9 @@ contract DeployGnoIBC is Script {
         ICS26Router(d.ics26Router).addIBCApp(ICS20Lib.DEFAULT_PORT_ID, d.ics20Transfer);
 
         d.ugnotVoucher = GnoDenoms.register(d.ics20Transfer, d.clientId, "ugnot", "Gno.land", "GNOT", 6);
-        IGnoICS20Controls(d.ics20Transfer).setLimits(d.clientId, d.ugnotVoucher, p.gnotLimits);
+        // the quarantine armed first: receive limits (which enable receives) wait for it
         IGnoICS20Controls(d.ics20Transfer).setQuarantine(d.clientId, p.quarantineSeconds);
+        IGnoICS20Controls(d.ics20Transfer).setLimits(d.clientId, d.ugnotVoucher, p.gnotLimits);
 
         d.ibcAdminExec = address(new IBCAdminExec(d.ics26Router, d.accessManager, d.ics20Transfer));
         d.ibcAdmin = address(

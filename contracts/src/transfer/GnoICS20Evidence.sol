@@ -133,6 +133,9 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         rec.proven = proven;
         rec.provenBy = address(lc);
+        // the liability a proof establishes outlives the proof: a hidden refund proven owed stays held until settled,
+        // or until a trusted proof finds the packet delivered
+        if (rec.outcome == Outcome.Success) rec.held = proven != Proven.Delivered;
         if (proven == Proven.Delivered) {
             g.provenAck[keccak256(bytes(packet.sourceClient))][packet.sequence] = keccak256(proof.ack);
         }
@@ -141,6 +144,16 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         // a hidden refund proven owed is reserved now; a new proof of another outcome releases it
         GnoTransferStorage.syncReserve(route, rec, reservedBefore);
         emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function quarantineEnd(string calldata clientId) external view delegated returns (uint256) {
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        string memory current = _g().currentOf[key];
+        if (bytes(current).length == 0) current = key;
+        address lc = address(IICS02Client(GnoTransferStorage.ics20Router()).getClient(current));
+        (uint64 id, uint64 time) = IGnoLightClientStatus(lc).lastTransition();
+        return GnoTransferStorage.quarantineUntil(_g().routes[GnoTransferStorage.routeHash(clientId)], lc, id, time);
     }
 
     /// @notice See IGnoICS20Controls.
@@ -155,10 +168,9 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     || rec.provenGen != g.routes[route].verifierGen),
             GnoBadProof()
         );
-        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        // the outcome cleared for a new proof; a hidden refund's liability (`held`) and its reservation stay
         rec.proven = Proven.None;
         rec.provenBy = address(0);
-        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
         emit GnoOutcomeProven(clientId, sequence, Proven.None);
     }
 

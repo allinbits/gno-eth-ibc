@@ -100,6 +100,9 @@ interface IGnoICS20ControlsTypes {
         /// client that verified it: void once that client is no longer the route's active one (frozen, expired, or
         /// replaced), when kind 12 refuses it and a new proof may replace it.
         Proven proven;
+        /// A refund a forged success ack hid, once proven owed: held (reserved) until settled, or until a new proof
+        /// through the active verifier finds the packet delivered; a void of the proof keeps it.
+        bool held;
         address provenBy;
         /// The route's verifier generation when it was proven: any re-pointing of the route's client since voids it.
         uint64 provenGen;
@@ -276,9 +279,13 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// sha256(sourceClient) | packet commitment)) and compared with the proven one. A non-receipt counts only once
     /// the proven time reaches the packet's timeout (it can then never be received). Proven once, before kind 12.
     /// @notice Clears an outcome its verifier no longer vouches for (the route's active client or its generation
-    /// changed since the proof), releasing what the proof had reserved (a hidden refund's backing). Permissionless; a
-    /// new proof through the active verifier can follow.
+    /// changed since the proof), so that the active verifier can prove it again. A hidden refund's reservation stays:
+    /// only its settlement, or a new trusted proof that the packet was delivered, releases it. Permissionless.
     function voidOutcome(string calldata clientId, uint64 sequence) external;
+
+    /// @notice When the route's quarantine ends (receives wait until then): the deadline of the transitions already
+    /// seen and, with the duration in force, of its current client's latest transition.
+    function quarantineEnd(string calldata clientId) external view returns (uint256);
 
     function proveOutcome(
         IICS26RouterMsgs.Packet calldata packet,

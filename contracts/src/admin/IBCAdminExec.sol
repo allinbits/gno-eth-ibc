@@ -58,7 +58,7 @@ contract IBCAdminExec is IIBCAdmin {
     uint256 internal constant SETTLE_GAS = 6_000_000;
     /// @notice Most records a kind 12 settles (an envelope holds at most eight): each payment's gas is bounded, so
     /// SETTLE_GAS covers them all.
-    uint256 internal constant MAX_SETTLE_ITEMS = 8;
+    uint256 internal constant MAX_SETTLE_ITEMS = S.MAX_SETTLE_ITEMS;
     uint256 internal constant STEP_FLOOR = (CALL_FLOOR + AFTER_GAS + 50_000) * 64 / 63 + 50_000;
     uint64 internal constant MAX_QUARANTINE = 365 days;
 
@@ -122,10 +122,9 @@ contract IBCAdminExec is IIBCAdmin {
         if (checks.codehash != CHECKS_HASH) revert ForeignExec();
         // the parameters exactly the canonical encoding of the kind's tuple (§5.4): anything else is spent
         if (!IBCAdminChecks(checks).canonicalParams(kind, p)) return (S.SPEND, "params");
-        if (kind == S.KIND_UNPAUSE) {
-            (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));
-            bool ok = (object == 1 && bytes(clientId).length != 0) || (object == 2 && bytes(clientId).length == 0);
-            return ok ? (S.WAIT, "") : (S.SPEND, "params");
+        // the kinds whose recording checks are their parameters alone (IBCAdminChecks.waitingParams)
+        if (kind != S.KIND_SEATS && kind != S.KIND_LIMITS && kind != S.KIND_ROLE && kind != S.KIND_SETTINGS) {
+            return IBCAdminChecks(checks).waitingParams(kind, p) ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_SEATS) {
             IGuardians.SeatKey[] memory pairs = abi.decode(p, (IGuardians.SeatKey[]));
@@ -139,24 +138,6 @@ contract IBCAdminExec is IIBCAdmin {
             IGnoICS20Controls(ics20).setLimits(clientId, token, l);
             return (S.DONE_NOW, "");
         }
-        if (kind == S.KIND_VOUCHER) {
-            (string memory clientId, string memory baseDenom, address voucher,) =
-                abi.decode(p, (string, string, address, bytes32));
-            bool ok = bytes(clientId).length != 0 && IBCAdminChecks(checks).canonicalGnoDenom(baseDenom)
-                && voucher != address(0);
-            return ok ? (S.WAIT, "") : (S.SPEND, "params");
-        }
-        if (kind == S.KIND_CLIENT) {
-            (uint8 op, string memory clientId, string memory cp, bytes[] memory prefix, address lc,) =
-                abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
-            bool ok = (op == 1 || op == 2) && bytes(clientId).length != 0 && lc != address(0)
-                && IBCAdminChecks(checks).canonicalCounterparty(cp, prefix);
-            return ok ? (S.WAIT, "") : (S.SPEND, "params");
-        }
-        if (kind == S.KIND_UPGRADE) {
-            (address proxy, address impl,,) = abi.decode(p, (address, address, bytes32, bytes));
-            return proxy != address(0) && impl != address(0) ? (S.WAIT, "") : (S.SPEND, "params");
-        }
         if (kind == S.KIND_ROLE) {
             (bool grant, uint64 roleId, address account) = abi.decode(p, (bool, uint64, address));
             if (roleId != IBCRolesLib.RELAYER_ROLE || account == address(0)) return (S.SPEND, "role");
@@ -164,29 +145,6 @@ contract IBCAdminExec is IIBCAdmin {
             if (grant || suspended) return (S.WAIT, "");
             IAccessManager(accessManager).revokeRole(roleId, account);
             return (S.DONE_NOW, "");
-        }
-        if (kind == S.KIND_HANDOVER) {
-            (address x,,) = abi.decode(p, (address, bytes32, bytes));
-            return x != address(0) ? (S.WAIT, "") : (S.SPEND, "params");
-        }
-        if (kind == S.KIND_ROUTE) {
-            (string memory oldId, string memory newId,) = abi.decode(p, (string, string, uint64));
-            bool ok = bytes(oldId).length != 0 && bytes(newId).length != 0
-                && keccak256(bytes(oldId)) != keccak256(bytes(newId));
-            return ok ? (S.WAIT, "") : (S.SPEND, "params");
-        }
-        if (kind == S.KIND_SETTLE) {
-            (string memory sid, IGnoICS20ControlsTypes.SettleItem[] memory items) =
-                abi.decode(p, (string, IGnoICS20ControlsTypes.SettleItem[]));
-            bool ok = bytes(sid).length != 0 && items.length != 0 && items.length <= MAX_SETTLE_ITEMS;
-            for (uint256 i = 0; ok && i < items.length; i++) {
-                ok = items[i].action >= 1 && items[i].action <= 5;
-            }
-            return ok ? (S.WAIT, "") : (S.SPEND, "params");
-        }
-        if (kind == S.KIND_REOPEN) {
-            string memory rid = abi.decode(p, (string));
-            return bytes(rid).length != 0 ? (S.WAIT, "") : (S.SPEND, "params");
         }
         // KIND_SETTINGS (IBCAdmin records no other kind here)
         (string memory id, uint64 q) = abi.decode(p, (string, uint64));
@@ -547,10 +505,20 @@ contract IBCAdminExec is IIBCAdmin {
         if (!IBCAdminChecks(checks).usableClient(address(IICS02Client(router).getClient(newId)), l.gnoChainId)) {
             return "client";
         }
+        // the quarantine checkpoint (which voids the old verifier's proofs) and the migration in one frame: a refused
+        // migration rolls the checkpoint back with it, and the decision is spent
+        return _selfStep(abi.encodeCall(IBCAdminExec.applyRoute, (oldId, newId, suspectFrom))) ? "" : "route";
+    }
+
+    /// @notice Kind 10's effect, in a frame of its own (`_selfStep`): the quarantine checkpoint, the route's
+    /// migration and the epoch switch, all or nothing.
+    function applyRoute(string calldata oldId, string calldata newId, uint64 suspectFrom) external delegated {
+        _selfOnly();
         IGnoICS20Controls(ics20).checkpointQuarantine(oldId);
-        if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId, suspectFrom)))) return "route";
-        S.replaceRoute(l, router, frozenClient, oldId, newId);
-        return "";
+        if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId, suspectFrom)))) {
+            revert AuthorityLost(ics20);
+        }
+        S.replaceRoute(S.layout(), router, frozenClient, oldId, newId);
     }
 
     // ================================================================================================ setup ==
