@@ -1136,6 +1136,36 @@ contract ReconcileInvariantsTest is ControlsFixture {
         return incident != 0 && incident - 1 < resolvedUpTo;
     }
 
+    /// @notice Boundary seeds: no handler action reverts on the extremes of its inputs (seeds are normalized
+    /// before any arithmetic).
+    function test_handlerSeedBoundaries() public {
+        uint256 max = type(uint256).max;
+        h.send(max, max, true);
+        h.send(0, 0, false);
+        h.sendFromAdapter(max, true);
+        h.relay(max, true, true);
+        h.relay(0, false, false);
+        h.notify(max);
+        h.notify(0);
+        h.receive_(max, max, true);
+        h.receiveVoucher(max, true);
+        h.claim(max);
+        h.claimParked(max);
+        h.refundsFlag(max, true);
+        h.replace(true);
+        h.reconcile(max, true);
+        h.reconcile(max - 2, false);
+        h.verifierEvent(max);
+        h.warp(max);
+        h.lateLoss(max);
+        h.senderReentry(max);
+        h.busyGovernance(max);
+        h.adversarialRound(max);
+        h.transportRound(max);
+        h.continueReopen();
+        h.reopen();
+    }
+
     /// forge-config: default.invariant.runs = 24
     /// forge-config: default.invariant.depth = 40
     /// forge-config: default.invariant.fail-on-revert = true
