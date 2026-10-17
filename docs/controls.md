@@ -168,6 +168,14 @@ bounds (constant work whatever the number of incidents).
    equals the number of its unsettled records whose processed index is at or after `suspectStart`.
 3. Acks and timeouts on the live client never count against any incident.
 4. Every send record is settled at most once, and a refund is never paid twice (`refunded <= amount`).
+4a. A send record is bound to its packet: its token, sender, amount and commitment are those of the packet the
+    router committed (the packet's own data), never changed after the send.
+4b. Payments conserve tokens: every sender holds what it had, less what it sent, plus exactly the refunds its
+    records show; the escrow holds what was sent, less every refund and every receive; receivers hold exactly what
+    was received; a voucher's supply moves only by receives, returns and refunds. An undelivered packet's sender
+    ends refunded its packet's full amount, or the remainder stays reserved.
+4c. Kind 12's actions agree with the proven outcomes (a refund only for a packet not delivered, a delivered
+    settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
 5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12), except by
    the refunds kind 12 owes for packets a forged success ack released (a loss of the compromise, booked or accepted
    by the reconciliation).

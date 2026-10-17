@@ -74,6 +74,8 @@ contract ReconcileHandler is Test {
         bool forgedRefund; // an error ack or timeout relayed for a delivered packet
         bool relayed; // acked or timed out at the router
         address sender;
+        address token; // what the handler sent, independently of the controls' record
+        uint256 amount;
     }
 
     IICS26RouterMsgs.Packet[] internal packets;
@@ -261,7 +263,7 @@ contract ReconcileHandler is Test {
         for (uint256 i = 0; i < logs.length; i++) {
             if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
                 packets.push(abi.decode(logs[i].data, (IICS26RouterMsgs.Packet)));
-                ghost[packets.length - 1] = Ghost(delivered, false, false, false, from);
+                ghost[packets.length - 1] = Ghost(delivered, false, false, false, from, token, amount);
                 if (delivered) redeemable[token] += amount;
                 sentBy[from][token] += amount;
                 return true;
@@ -536,7 +538,7 @@ contract ReconcileHandler is Test {
         for (uint256 i = 0; i < logs.length; i++) {
             if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
                 packets.push(abi.decode(logs[i].data, (IICS26RouterMsgs.Packet)));
-                ghost[packets.length - 1] = Ghost(true, false, false, false, alice);
+                ghost[packets.length - 1] = Ghost(true, false, false, false, alice, address(hookToken), amount);
                 redeemable[address(hookToken)] += amount;
                 sentBy[alice][address(hookToken)] += amount;
             }
@@ -1124,10 +1126,24 @@ contract ReconcileInvariantsTest is ControlsFixture {
         excludeSelector(FuzzSelector(address(h), sel));
     }
 
-    function _reserveOf(T.SendRecord memory rec) internal pure returns (uint256) {
+    /// @notice The reservation a record's state calls for, from the packet's own amount (the ghost's).
+    function _reserveOf(T.SendRecord memory rec, uint256 amount) internal pure returns (uint256) {
         if (rec.burned) return 0;
-        if (rec.payment == T.Payment.Queued || rec.payment == T.Payment.Parked) return rec.amount - rec.refunded;
-        return rec.outcome == T.Outcome.Pending && rec.settlement == 0 ? rec.amount : 0;
+        if (rec.payment == T.Payment.Queued || rec.payment == T.Payment.Parked) return amount - rec.refunded;
+        return rec.outcome == T.Outcome.Pending && rec.settlement == 0 ? amount : 0;
+    }
+
+    /// @notice The record is bound to its packet: the token, sender and amount the handler sent, which the packet the
+    /// router committed (and emitted) carries too.
+    function _checkBinding(IICS26RouterMsgs.Packet memory pkt, T.SendRecord memory rec, uint256 i) internal view {
+        (,,,, address sender, address token, uint256 amount) = h.ghost(i);
+        IICS20TransferMsgs.FungibleTokenPacketData memory data =
+            abi.decode(pkt.payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
+        assertEq(data.amount, amount, "the packet carries the amount sent");
+        assertEq(rec.amount, amount, "the record's amount is the packet's");
+        assertEq(rec.token, token, "the record's token is the packet's");
+        assertEq(rec.sender, sender, "the record's sender is the packet's");
+        assertEq(rec.commitment, ICS24Host.packetCommitmentBytes32(pkt), "the record's commitment is the packet's");
     }
 
     function _resolved(string memory client) internal view returns (bool) {
@@ -1204,22 +1220,23 @@ contract ReconcileInvariantsTest is ControlsFixture {
         for (uint256 i = 0; i < n; i++) {
             IICS26RouterMsgs.Packet memory pkt = h.packet(i);
             T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
-            (bool delivered, bool forgedSuccess,,, address sender) = h.ghost(i);
-            uint256 t = _tokenIndex(rec.token, tn);
-            uint256 r = _reserveOf(rec);
+            (bool delivered, bool forgedSuccess,,, address sender, address gtoken, uint256 amount) = h.ghost(i);
+            _checkBinding(pkt, rec, i);
+            uint256 t = _tokenIndex(gtoken, tn);
+            uint256 r = _reserveOf(rec, amount);
             f.reserve[t] += r;
             f.refundedAll[t] += rec.refunded;
             if (sender == alice) f.refundedAlice[t] += rec.refunded;
             else f.refundedSenders[t] += rec.refunded;
             // every record settled at most once, never refunded beyond its amount
             assertLe(h.settledCount(keccak256(abi.encode(pkt.sourceClient, pkt.sequence))), 1, "settled once");
-            assertLe(rec.refunded, rec.amount, "refunded once");
+            assertLe(rec.refunded, amount, "refunded once");
             // kind 12's actions agree with the truth (the proofs are honest)
             if (rec.settlement == 1) assertFalse(delivered, "a refund settled for a delivered packet");
             if (rec.settlement >= 2) assertTrue(delivered, "a delivered settlement for an undelivered packet");
             // an undelivered record ends refunded in full or still reserved, unless a forged success ack hides it
             // until its incident's reconciliation (the refunds are real: the senders' balances are checked below)
-            if (!delivered && rec.refunded != rec.amount && r != rec.amount - rec.refunded) {
+            if (!delivered && rec.refunded != amount && r != amount - rec.refunded) {
                 assertTrue(
                     rec.outcome == T.Outcome.Success && rec.settlement == 0 && !_resolved(pkt.sourceClient),
                     "an undelivered refund neither paid nor reserved"
