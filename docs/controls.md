@@ -288,14 +288,28 @@ immutables set in its constructor, the address and the code hash of each delegat
 the controls: the reconciliation module; that module: the evidence module; the executor: its checks and recovery
 modules), so an implementation's single pinned hash fixes its whole delegate graph. Each delegated call checks the
 delegate's live code hash against the recorded one (`GnoBadModule`), kind 7 checks every module of a candidate, and
-IBCAdmin checks the recovery module before running it (`ForeignExec`).
+IBCAdmin checks the recovery module before running it (`ForeignExec`). Kind 7 also requires each module's recorded
+own address (`gnoSelf()`) to be its address. Kind 9 requires the same of the executor: its `bindings()` answer
+nothing otherwise. A module whose own address was recorded as another would refuse every delegated call
+(`NotDelegated`), and a module behind a proxy answers its implementation's address.
 
 A hash says nothing of the source, and a proxy's hash never changes when its target does. So **every pinned hash
 must equal a reproducible build of the named source, and no module may hold a mutable implementation pointer** (a
 beacon or an ERC-1967 proxy as a module would keep its hash while its owner changed what it runs; on chain it
 passes, as governance pinned it). `scripts/verify-codehashes.sh` (`script/VerifyCodehashes.s.sol`,
-`script/CodeVerifier.sol`) checks against a clean build, the compiler's immutables aside, with each delegate address
-the one its holder records:
+`script/CodeVerifier.sol`) checks against a clean build, taking no deployed byte on trust. Each contract is rebuilt in
+the verifier's own simulation: its build's creation code runs at its own address, with the constructor arguments the
+system's graph calls for, and the result must equal the deployed code byte for byte. So every immutable is checked
+against its constructor relationship:
+
+- a recorded own address (`_self`, UUPS's `__self`) is the contract's address;
+- bindings and dependencies are the graph's actual contracts: IBCAdmin is the router's `ibcgov` app, the transfer app
+  its `transfer` app, the access manager the router's authority, and each module the one its holder records;
+- every recorded code hash is that dependency's live code hash.
+
+An executor is rebuilt from its creation nonce, so the four modules it deploys come out at their recorded addresses,
+and they are compared too. IBCAdmin's deployer and recovery settings are configuration values with no relationship to
+check; the verifier prints them, for comparison with the deployment plan. Every rebuild is rolled back. It covers:
 
 - **What runs now** (`verifyLive`), read from the chain and never from the deployment file, which goes stale after
   any kind 7 or 9: the transfer proxy's and the router proxy's live ERC-1967 implementation slots, the escrow and
@@ -307,7 +321,21 @@ the one its holder records:
   executor and its modules.
 
 The watch tool (T5) runs both: after every deployment and every executed decision, and for each recorded kind 7 or 9
-as soon as it is recorded, within its seven-day delay. A failure is the signal to cancel the decision (kind 2). On
+as soon as it is recorded, within its seven-day delay. A failure is the signal to cancel the decision with **kind 1**
+(cancel), never kind 2 (kind 2 unpauses). Kind 1 takes the sequence ranges to cancel, `abi.encode((uint64 from,
+uint64 to)[])`; to cancel the pending decision at sequence `s`, send the range `[(s, s)]` in the current epoch. The
+`kind1-cancel` entry of `contracts/test/fixtures/gov-vectors.json` is a byte-exact example: epoch 1, sequence 11,
+cancelling sequences 2 to 3:
+
+```
+version 01 | epoch 00000001 | seq 000000000000000b | kind 01 | params:
+0000000000000000000000000000000000000000000000000000000000000020   offset of the array
+0000000000000000000000000000000000000000000000000000000000000001   one range
+0000000000000000000000000000000000000000000000000000000000000002   from 2
+0000000000000000000000000000000000000000000000000000000000000003   to 3
+```
+
+`test_r12_3_runbookCancel_cancelsAPendingKind7` cancels a pending kind 7 this way. On
 chain, a hand-over to an executor behind a proxy would pass, since its bindings answer through the proxy and its hash
 is the one governance pinned; only this step refuses it (`test_r11_3_pendingProxyBackedExecutor_refused`).
 

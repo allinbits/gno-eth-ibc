@@ -93,8 +93,10 @@ contract IBCAdminExec is IIBCAdmin {
         _self = address(this);
     }
 
-    /// @notice What this executor is bound to; IBCAdmin and kind 9 require it to be IBCAdmin's own.
+    /// @notice What this executor is bound to; IBCAdmin and kind 9 require it to be IBCAdmin's own. Asked of an
+    /// executor whose recorded own address is another (it would refuse every delegated call), nothing.
     function bindings() external view returns (address, address, address) {
+        if (address(this) != _self) return (address(0), address(0), address(0));
         return (router, accessManager, ics20);
     }
 

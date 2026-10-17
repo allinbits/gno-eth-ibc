@@ -48,6 +48,12 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         return 1;
     }
 
+    /// @notice The address this module recorded as its own at construction (kind 7 requires it to be the module's
+    /// address: a module whose recorded address is another, such as the proxy's, would refuse every delegated call).
+    function gnoSelf() external view returns (address) {
+        return _self;
+    }
+
     /// @notice Serves the reconciliation functions (claimParked, settleRecords, reopenRoute, continueReopen) from
     /// GnoICS20Reconcile, in the transfer proxy's storage (EIP-170 keeps them apart).
     // solhint-disable-next-line no-complex-fallback

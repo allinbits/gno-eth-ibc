@@ -38,6 +38,12 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         return 1;
     }
 
+    /// @notice The address this module recorded as its own at construction (kind 7 requires it to be the module's
+    /// address: a module whose recorded address is another, such as the proxy's, would refuse every delegated call).
+    function gnoSelf() external view returns (address) {
+        return _self;
+    }
+
     modifier delegated() {
         if (address(this) == _self) revert NotDelegated();
         _;

@@ -137,18 +137,22 @@ contract IBCAdminChecks {
     }
 
     /// @notice A fork implementation's controls version, if its delegate graph is whole: the controls, the
-    /// reconciliation and the evidence modules are code answering that version, each with the code hash its holder
-    /// recorded at construction (so the implementation's pinned hash fixes them all); zero otherwise.
+    /// reconciliation and the evidence modules are code answering that version, each recording its own address as
+    /// its own (`gnoSelf`) and with the code hash its holder recorded at construction (so the implementation's pinned
+    /// hash fixes them all); zero otherwise.
     function modulesVersion(address impl) external view returns (uint256 v) {
         v = this.version(impl, "gnoControlsVersion()");
         address controls = _module(impl, "CONTROLS()");
         if (!_code(controls) || this.version(controls, "gnoControlsModuleVersion()") != v) return 0;
+        if (_module(controls, "gnoSelf()") != controls) return 0;
         if (controls.codehash != _word(impl, "CONTROLS_HASH()")) return 0;
         address reconcile = _module(controls, "RECONCILE()");
         if (!_code(reconcile) || this.version(reconcile, "gnoReconcileModuleVersion()") != v) return 0;
+        if (_module(reconcile, "gnoSelf()") != reconcile) return 0;
         if (reconcile.codehash != _word(controls, "RECONCILE_HASH()")) return 0;
         address evidence = _module(reconcile, "EVIDENCE()");
         if (!_code(evidence) || this.version(evidence, "gnoEvidenceModuleVersion()") != v) return 0;
+        if (_module(evidence, "gnoSelf()") != evidence) return 0;
         if (evidence.codehash != _word(reconcile, "EVIDENCE_HASH()")) return 0;
     }
 

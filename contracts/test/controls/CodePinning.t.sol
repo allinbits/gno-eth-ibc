@@ -37,7 +37,7 @@ contract CodePinningTest is ControlsFixture {
     }
 
     /// @notice The deployment matches a build of its sources, delegates included.
-    function test_r10_1_deploymentMatchesTheBuild() public view {
+    function test_r10_1_deploymentMatchesTheBuild() public {
         assertTrue(verifier.verifyLive(address(admin)));
     }
 
@@ -53,7 +53,7 @@ contract CodePinningTest is ControlsFixture {
         vm.etch(reconcile, address(new MockLightClient()).code);
         vm.expectRevert(T.GnoBadModule.selector);
         ctl.incidents(clientId);
-        assertFalse(verifier.matchesBuild(reconcile, "GnoICS20Reconcile.sol", "GnoICS20Reconcile"));
+        assertFalse(verifier.verifyTransfer(d.ics20Implementation));
     }
 
     /// @notice Kind 7 refuses a candidate whose module's code is not the one it recorded.
@@ -82,7 +82,7 @@ contract CodePinningTest is ControlsFixture {
         assertEq(recorded, proxied.codehash);
         beacon.upgradeTo(address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence()))))));
         assertEq(proxied.codehash, recorded, "the proxy's hash never changes");
-        assertFalse(verifier.matchesBuild(proxied, "GnoICS20Controls.sol", "GnoICS20Controls"), "the build check");
+        assertFalse(verifier.verifyTransfer(fork), "the build check");
     }
 
     // ================================================================================================ round 11 ==
@@ -122,11 +122,11 @@ contract CodePinningTest is ControlsFixture {
         assertTrue(verifier.verifyPending(address(admin), seq + 1, keccak256(env2), address(genuine)));
         assertFalse(verifier.verifyPending(address(admin), seq + 1, keccak256(env), address(genuine)), "other hash");
         assertFalse(verifier.verifyPending(address(admin), seq + 1, keccak256(env2), proxied), "other candidate");
-        // on chain, the proxy-backed hand-over would execute: only the verification catches it
+        // on chain, since r12, the executor's bindings answer nothing through a proxy (its recorded own address is the
+        // implementation's), so kind 9 is spent too
         _skip(7 days);
         admin.execute(seq);
-        assertEq(admin.decision(admin.epoch(), seq).state, S.EXECUTED, "governance pinned it");
-        assertFalse(verifier.verifyLive(address(admin)), "and the live check refuses it after");
+        assertEq(admin.decision(admin.epoch(), seq).state, S.SPENT, "refused on chain");
     }
 
     /// @notice r11 #3: a pending kind 7 of the transfer app is checked through its whole graph: a candidate whose
@@ -145,5 +145,148 @@ contract CodePinningTest is ControlsFixture {
         _recvGov(e2);
         assertFalse(verifier.verifyPending(address(admin), seq, keccak256(e1), bad));
         assertTrue(verifier.verifyPending(address(admin), seq + 1, keccak256(e2), good));
+    }
+
+    // ================================================================================================ round 12 ==
+
+    /// @notice r12 #3, the runbook's response to a failed verification: kind 1 with the range [(s, s)] cancels the
+    /// pending kind 7 at s (kind 2 would only unpause); its encoding is the `kind1-cancel` vector's.
+    function test_r12_3_runbookCancel_cancelsAPendingKind7() public {
+        GnoICS20Controls controls =
+            new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence()))));
+        address fork = address(new GnoICS20Transfer(address(controls)));
+        uint64 s = admin.lastSeq() + 1;
+        _recvGov(_env(s, S.KIND_UPGRADE, P.upgrade(address(ics20), fork, fork.codehash, "")));
+        P.Range[] memory ranges = new P.Range[](1);
+        ranges[0] = P.Range(s, s);
+        bytes memory cancel = _env(s + 1, S.KIND_CANCEL, P.cancel(ranges));
+        // the vector's layout: header, then abi.encode of the ranges array
+        assertEq(uint8(cancel[13]), 1, "kind 1");
+        assertEq(cancel.length, 14 + 32 * 4);
+        _recvGov(cancel);
+        assertTrue(admin.isTombstoned(admin.epoch(), s));
+        _skip(7 days + 1);
+        admin.execute(s);
+        assertEq(admin.decision(admin.epoch(), s).state, S.CANCELLED);
+        assertEq(verifier.implementationOf(address(ics20)), d.ics20Implementation, "not installed");
+    }
+
+    struct Ref {
+        uint256 length;
+        uint256 start;
+    }
+
+    /// @notice The round 10 check, kept here to show the gap: the build's bytes with every immutable byte taken from
+    /// the deployed code, unvalidated.
+    function _splicedMatch(address a, string memory source, string memory name) internal view returns (bool) {
+        string memory json = vm.readFile(string.concat(vm.projectRoot(), "/out/", source, "/", name, ".json"));
+        bytes memory expected = vm.parseJsonBytes(json, ".deployedBytecode.object");
+        bytes memory live = a.code;
+        if (live.length != expected.length) return false;
+        string[] memory ids = vm.parseJsonKeys(json, ".deployedBytecode.immutableReferences");
+        for (uint256 i = 0; i < ids.length; i++) {
+            Ref[] memory refs = abi.decode(
+                vm.parseJson(json, string.concat(".deployedBytecode.immutableReferences.", ids[i])), (Ref[])
+            );
+            for (uint256 k = 0; k < refs.length; k++) {
+                for (uint256 b = 0; b < refs[k].length; b++) {
+                    expected[refs[k].start + b] = live[refs[k].start + b];
+                }
+            }
+        }
+        return keccak256(expected) == keccak256(live);
+    }
+
+    /// @notice `code` with every 32-byte word holding `from` (as an address) replaced by `to`: an immutable patched.
+    function _patch(bytes memory code, address from, address to) internal pure returns (bytes memory out, uint256 n) {
+        out = code;
+        bytes32 f = bytes32(uint256(uint160(from)));
+        bytes32 t = bytes32(uint256(uint160(to)));
+        for (uint256 i = 0; i + 32 <= out.length; i++) {
+            bytes32 w;
+            assembly {
+                w := mload(add(add(out, 32), i))
+            }
+            if (w == f) {
+                assembly {
+                    mstore(add(add(out, 32), i), t)
+                }
+                n++;
+                i += 31;
+            }
+        }
+    }
+
+    /// @notice r12 #1: a pending kind 7 whose controls module is the build's code with one immutable altered (its
+    /// recorded own address set to the transfer proxy, so every delegated call would revert `NotDelegated`). Every
+    /// other byte is the build's. The verification rebuilds the module at its address and refuses it; on chain, kind 7
+    /// refuses it too (`gnoSelf` must be the module's address).
+    function test_r12_1_pendingKind7_alteredImmutable_refused() public {
+        GnoICS20Controls genuine = new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence()))));
+        (bytes memory patched, uint256 n) = _patch(address(genuine).code, address(genuine), address(ics20));
+        assertGt(n, 0, "the immutable holding the module's own address, at each of its uses");
+        address altered = address(0xA17E4ED);
+        vm.etch(altered, patched);
+        assertEq(GnoICS20Controls(altered).gnoSelf(), address(ics20));
+        assertTrue(_splicedMatch(altered, "GnoICS20Controls.sol", "GnoICS20Controls"), "the round 10 check passed it");
+        address fork = address(new GnoICS20Transfer(altered));
+        uint64 seq = admin.lastSeq() + 1;
+        bytes memory env = _env(seq, S.KIND_UPGRADE, P.upgrade(address(ics20), fork, fork.codehash, ""));
+        _recvGov(env);
+        assertFalse(verifier.verifyPending(address(admin), seq, keccak256(env), fork), "refused before maturity");
+        _skip(7 days + 1);
+        admin.execute(seq);
+        assertEq(admin.decision(admin.epoch(), seq).state, S.SPENT, "refused on chain");
+        assertEq(verifier.implementationOf(address(ics20)), d.ics20Implementation);
+    }
+
+    /// @notice r12 #1, the executor: a pending kind 9 whose executor is the build's code with its recorded own address
+    /// altered. Refused by the verification (rebuilt at its address with its creation nonce) and on chain (its
+    /// bindings answer nothing).
+    function test_r12_1_pendingKind9_alteredImmutable_refused() public {
+        IBCAdminExec genuine = new IBCAdminExec(address(router), d.accessManager, address(ics20));
+        (bytes memory patched, uint256 n) = _patch(address(genuine).code, address(genuine), address(admin));
+        assertGt(n, 0);
+        address altered = address(0xE7EC);
+        vm.etch(altered, patched);
+        uint64 seq = admin.lastSeq() + 1;
+        bytes memory env = _env(seq, S.KIND_HANDOVER, P.handover(altered, altered.codehash, ""));
+        _recvGov(env);
+        assertFalse(verifier.verifyPending(address(admin), seq, keccak256(env), altered));
+        _skip(7 days + 1);
+        admin.execute(seq);
+        assertEq(admin.decision(admin.epoch(), seq).state, S.SPENT);
+        // the genuine executor, rebuilt at its address with its creation nonce and modules, passes
+        bytes memory env2 = _env(seq + 1, S.KIND_HANDOVER, P.handover(address(genuine), address(genuine).codehash, ""));
+        _recvGov(env2);
+        assertTrue(verifier.verifyPending(address(admin), seq + 1, keccak256(env2), address(genuine)));
+    }
+
+    /// @notice r12 #1: a recorded dependency hash that is not its dependency's live hash fails the rebuild (a module
+    /// built against other code, then that code replaced at the same address).
+    function test_r12_1_staleDependencyHash_refused() public {
+        address evidence = address(new GnoICS20Evidence());
+        address reconcile = address(new GnoICS20Reconcile(evidence));
+        assertTrue(
+            verifier.rebuilds(
+                reconcile,
+                "GnoICS20Reconcile.sol:GnoICS20Reconcile",
+                abi.encode(evidence),
+                address(0),
+                0,
+                new address[](0)
+            )
+        );
+        vm.etch(evidence, address(new MockLightClient()).code);
+        assertFalse(
+            verifier.rebuilds(
+                reconcile,
+                "GnoICS20Reconcile.sol:GnoICS20Reconcile",
+                abi.encode(evidence),
+                address(0),
+                0,
+                new address[](0)
+            )
+        );
     }
 }

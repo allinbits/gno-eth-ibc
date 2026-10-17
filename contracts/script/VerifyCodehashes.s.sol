@@ -17,7 +17,7 @@ import { CodeVerifier } from "./CodeVerifier.sol";
 contract VerifyCodehashes is CodeVerifier {
     using stdJson for string;
 
-    function run() external view {
+    function run() external {
         string memory json = vm.readFile(vm.envString("DEPLOYMENTS_FILE"));
         address admin = json.readAddress(".ibcAdmin");
         require(verifyLive(admin), "live code does not match the build");
