@@ -663,8 +663,15 @@ contract ReconcileHandler is Test {
         if (_reconcile(how, all)) ok["reconcile"]++;
     }
 
-    /// @notice Kind 13 through IBCAdmin, then its continuation until the route opens (or the reopening aborts).
+    /// @notice Governance reconciles completely (every unsettled record of the retired clients and every forged
+    /// receive on them, as §7.12 asks; the controls enforce only the suspected interval), then kind 13.
     function _reopen() internal returns (bool) {
+        _reconcile(0, true);
+        return _reopenOnly();
+    }
+
+    /// @notice Kind 13 through IBCAdmin, then its continuation until the route opens (or the reopening aborts).
+    function _reopenOnly() internal returns (bool) {
         if (!_executeAll(_one(_decide(S.KIND_REOPEN, P.reopen(_live()))))) return false;
         ok["reopen"]++;
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
@@ -847,8 +854,9 @@ contract ReconcileHandler is Test {
         this.relay(packets.length - 1, true, false); // a forged error ack: refunded at once
         _skip(1 days);
         if (!_replace(false)) return; // its interval starts after the forged refund
-        _reconcile(0, false);
-        if (!_reopen()) return;
+        _reconcile(0, false); // only what kind 13 waits for: the forged refund is left
+        if (!_reopenOnly()) return;
+        // found after the reopening (in this same step): its loss closes the route again
         if (_reconcile(1, true) && ctl.routeClosed(_live())) {
             ok["lateLoss"]++;
             _reopen();
