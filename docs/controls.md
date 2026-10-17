@@ -304,7 +304,7 @@ reopening, emergency recovery, verifier freeze, expiry and migration, kind 12 ba
 over seventeen loss tokens, backfill and the abort after it, busy delivery and drain, contract senders and their
 notification retries, refunds flags, claims; every required transition covered in each run; 24 runs of depth 40 in
 the suite). Its invariants assume governance reconciles completely before kind 13, as §7.12 asks: the controls
-themselves enforce the suspected interval and the open records, not the identification of every forged payout, `ProvenOutcomes.t.sol` (a strict
+themselves enforce the suspected interval and the open records, not the identification of every forged payout. Also `ProvenOutcomes.t.sol` (a strict
 mock light client checks every path and value `proveOutcome` computes; the R19 vectors), `ControlsGas.t.sol`,
 `GovVectors.t.sol`. Library and client tests: `Guardians.t.sol` (differential fuzz against a model),
 `LeakyBucket.t.sol`, `Quarantine.t.sol`. Foundry runs in Docker, image `ghcr.io/foundry-rs/foundry:v1.7.1` (pinned:
