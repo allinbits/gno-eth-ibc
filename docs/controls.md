@@ -483,7 +483,11 @@ between deficit batches (spent, no loss changed, invariant 7), authority changes
 approval and its execution (`Suspended`), a guardian withdrawing its approval before a recovery opens (the next
 approval no longer opens it), a delivered packet whose forged success ack (other bytes than the proven one) the
 sender refused, settled by action 3 and then notified once with the proven ack, and success acks whose bytes vary.
-The defensive re-check at the last deficit batch (the route aborts its reopening rather than open with an incident
+Governance tightenings that apply at recording (kind 4 lowering a limit, kind 11 lengthening a quarantine) are
+driven through delivery, through `drain()` behind a full drain, and from inside a token hook (refused whole, nothing
+recorded), then relayed again outside; each must change the controls exactly at recording. A timeout of an unsettled
+record of a retired client reaches the callback (the freeze defeated for that call) and must join the client's
+processed history as suspect work, with its refund paid or owed. The defensive re-check at the last deficit batch (the route aborts its reopening rather than open with an incident
 pending) is reached two ways: an ack on a retired client that is not frozen (kind 10 freezes it; the campaign
 defeats the freeze for one call by running the mock client's code at the frozen client's address), which counts as
 suspect work of the reopening incident, and fault injection: a test-only `vm.store` raises the pending-incident count

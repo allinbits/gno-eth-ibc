@@ -1962,6 +1962,128 @@ contract ReconcileHandler is Test {
 
     // ------------------------------------------------------------------------------------- round 17 actions --
 
+    /// @notice A governance delivery at a chosen number (the packet, for a later relay of the same bytes).
+    function _govAt(uint64 seq, uint8 kind, bytes memory params) internal returns (IICS26RouterMsgs.Packet memory) {
+        return _govPacket(abi.encodePacked(uint8(1), admin.epoch(), seq, kind, params));
+    }
+
+    function _relayGov(IICS26RouterMsgs.Packet memory pkt) internal returns (bool) {
+        try router.recvPacket(IICS26RouterMsgs.MsgRecvPacket(pkt, "", IICS02ClientMsgs.Height(0, 1))) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @notice A tightening (kind 4 lowering a loss token's maximum per message, or kind 11 lengthening the live
+    /// route's quarantine), applied at recording. `mode`: 0 delivered in order; 1 buffered beyond one drain, then
+    /// recorded by `drain()`; 2 relayed and drained from inside a token hook (refused whole, nothing recorded), then
+    /// relayed again outside, where it applies. The controls change exactly, the decision is executed at recording.
+    function tightenAtRecording(uint256 mode, bool quarantine) public {
+        calls++;
+        _ratchet();
+        mode = mode % 3;
+        if (!_ensureOpen()) return;
+        while (admin.drain() != 0) { }
+        string memory live = _live();
+        address tok = tokens[LOSS_TOKENS];
+        _limits(tok);
+        T.Limits memory cur = ctl.limits(live, tok).limits;
+        uint64 q = ctl.quarantineSeconds(live);
+        bytes memory params = quarantine
+            ? P.settings(live, q + 1)
+            : P.limits(live, tok, cur.maxPerMessage - 1, cur.dayCap, cur.refundCap, cur.sendMax, cur.sendMin);
+        uint8 kind = quarantine ? S.KIND_SETTINGS : S.KIND_LIMITS;
+        uint64 last = admin.lastSeq();
+        uint64 seq = last + 1;
+        if (mode == 1) {
+            // DRAIN + 1 harmless decisions first, buffered, then the tightening behind them
+            seq = last + uint64(S.DRAIN) + 2;
+            for (uint64 k = last + 2; k < seq; k++) {
+                if (!_relayGov(_govAt(k, S.KIND_UNPAUSE, P.unpause(1, live)))) return;
+            }
+        }
+        IICS26RouterMsgs.Packet memory tight = _govAt(seq, kind, params);
+        if (mode == 2) {
+            // from inside a send's token hook: the delivery reverts whole, the drain records nothing
+            if (ics20.getEscrow(live) == address(0) && !_send(alice, address(hookToken), 1, true)) return;
+            hookToken.setHook(
+                ics20.getEscrow(live),
+                address(router),
+                abi.encodeCall(
+                    router.recvPacket, (IICS26RouterMsgs.MsgRecvPacket(tight, "", IICS02ClientMsgs.Height(0, 1)))
+                )
+            );
+            _limits(address(hookToken));
+            if (!_send(alice, address(hookToken), 1, true)) {
+                hookToken.setHook(address(0), address(0), "");
+                return;
+            }
+            hookToken.setHook(address(0), address(0), "");
+            bool unchanged = !hookToken.hookOk() && admin.lastSeq() == last
+                && (quarantine
+                        ? ctl.quarantineSeconds(live) == q
+                        : ctl.limits(live, tok).limits.maxPerMessage == cur.maxPerMessage);
+            if (!unchanged) return;
+            ok["tightenInHookRefused"]++;
+        }
+        if (!_relayGov(tight)) return;
+        if (mode == 1) {
+            if (admin.decision(admin.epoch(), seq).state != S.BUFFERED) return; // the drain bound left it buffered
+            // the gap filled: the first relayed now records it and DRAIN after it; the rest by drain()
+            if (!_relayGov(_govAt(last + 1, S.KIND_UNPAUSE, P.unpause(1, live)))) return;
+            while (admin.drain() != 0) { }
+        }
+        IIBCAdmin.Decision memory dec = admin.decision(admin.epoch(), seq);
+        bool applied = quarantine
+            ? ctl.quarantineSeconds(live) == q + 1
+            : ctl.limits(live, tok).limits.maxPerMessage == cur.maxPerMessage - 1;
+        assertTrue(applied && dec.state == S.EXECUTED, "a tightening applies at recording");
+        ok[mode == 0 ? "tightenDelivery" : (mode == 1 ? "tightenDrain" : "tightenAfterHook")]++;
+        _checkpoint();
+    }
+
+    /// @notice A timeout of an unsettled record of a retired client (its freeze defeated for this one call, test
+    /// only): it reaches the callback, joins the client's processed history as suspect work, and its refund is
+    /// paid or owed.
+    function retiredTimeout(uint256 i) public {
+        calls++;
+        _ratchet();
+        if (packets.length == 0) return;
+        i = i % packets.length;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        if (ghost[i].relayed || ghost[i].delivered || !ctl.isRetired(pkt.sourceClient) || !ctl.routeClosed(_live())) {
+            return;
+        }
+        T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        if (rec.settlement != 0 || rec.outcome != T.Outcome.Pending) return;
+        (,,, uint64 suspect0, uint64 processed0) = ctl.clientRecon(pkt.sourceClient);
+        address frozen = address(router.getClient(pkt.sourceClient));
+        bytes memory code = frozen.code;
+        vm.etch(frozen, address(new MockLightClient()).code);
+        MockLightClient(frozen).setTimestamp(pkt.timeoutTimestamp);
+        bool done;
+        try router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(pkt, "", IICS02ClientMsgs.Height(0, 1))) {
+            done = true;
+        } catch { }
+        MockLightClient(frozen).setTimestamp(0);
+        vm.etch(frozen, code); // frozen again
+        if (!done) return;
+        _relayed(i);
+        T.SendRecord memory after_ = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        (,,, uint64 suspect1, uint64 processed1) = ctl.clientRecon(pkt.sourceClient);
+        assertEq(uint8(after_.outcome), uint8(T.Outcome.Timeout), "the timeout reached the callback");
+        assertEq(processed1, processed0 + 1, "processed history");
+        assertEq(suspect1, suspect0 + 1, "suspect work of the incident");
+        assertTrue(
+            after_.refunded == after_.amount || after_.payment == T.Payment.Queued
+                || after_.payment == T.Payment.Parked,
+            "the refund paid or owed"
+        );
+        ok["retiredTimeout"]++;
+        _checkpoint();
+    }
+
     /// @notice Two refunds a forged success ack hid, owed again in ONE kind 12 (in either order) against 150 of
     /// backing: both are reserved before either is paid, so neither payment may proceed (it would take the
     /// other's backing).
@@ -2048,6 +2170,14 @@ contract ReconcileHandler is Test {
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["tightenDelivery"] == 0) tightenAtRecording(0, false);
+        if (ok["tightenDrain"] == 0) tightenAtRecording(1, true);
+        if (ok["tightenAfterHook"] == 0 || ok["tightenInHookRefused"] == 0) tightenAtRecording(2, false);
+        if (ok["retiredTimeout"] == 0 && _ensureOpen() && clients.length < 40) {
+            _send(alice, tokens[0], 3, false);
+            if (_replace(true)) retiredTimeout(packets.length - 1);
+            _ensureOpen();
+        }
         if (ok["twinInitialHeld"] == 0) twinHiddenInitial(false);
         if (ok["twinInitialHeldReversed"] == 0) twinHiddenInitial(true);
         if (ok["twinRefundHeld"] == 0) this.twinEligibleRefunds();
@@ -2500,7 +2630,12 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[61] memory names = [
+        string[66] memory names = [
+            "tightenDelivery",
+            "tightenDrain",
+            "tightenInHookRefused",
+            "tightenAfterHook",
+            "retiredTimeout",
             "twinInitialHeld",
             "twinInitialHeldReversed",
             "twinRefundHeld",
@@ -2568,7 +2703,12 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[44] memory required = [
+        string[49] memory required = [
+            "tightenDelivery",
+            "tightenDrain",
+            "tightenInHookRefused",
+            "tightenAfterHook",
+            "retiredTimeout",
             "twinInitialHeld",
             "twinInitialHeldReversed",
             "twinRefundHeld",
