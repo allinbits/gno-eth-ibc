@@ -82,7 +82,14 @@ contract ReconcileHandler is Test {
     BusyProbe internal busyProbe;
     SenderAdapter internal adapter;
 
-    address[] public tokens; // usdc first; seventeen more (deficits beyond one batch); the hook token last
+    address[] public tokens; // usdc first; LOSS_TOKENS more (deficits over several batches); the partial-backing
+    // token; the hook token last
+    uint256 internal constant LOSS_TOKENS = 33;
+    address public partialToken; // only `partialBacking` sends it
+    // the permitted shortfall per token: what reconciliation recognized as compromise losses (the refunds a forged
+    // success ack hid, owed again), never raised by a receive or a payment, lowered as the escrow covers it again
+    mapping(address => uint256) public permittedShortfall;
+    uint256 internal contSeed;
     HookToken internal hookToken;
     mapping(address => bool) internal limited;
 
@@ -153,11 +160,12 @@ contract ReconcileHandler is Test {
         (router, ctl, ics20, admin, alice, bob, G) = (router_, ctl_, ics20_, admin_, alice_, bob_, guardians);
         clients.push(clientId);
         tokens.push(usdc);
-        for (uint256 i = 0; i < 17; i++) {
+        for (uint256 i = 0; i <= LOSS_TOKENS; i++) {
             ERC20Mock t = new ERC20Mock();
             t.mint(alice, 1e30);
             tokens.push(address(t));
         }
+        partialToken = tokens[LOSS_TOKENS + 1];
         hookToken = new HookToken();
         hookToken.mint(alice, 1e30);
         tokens.push(address(hookToken));
@@ -178,6 +186,24 @@ contract ReconcileHandler is Test {
 
     function adapterAddress() external view returns (address) {
         return address(adapter);
+    }
+
+    /// @notice How far the route's escrow of `token` falls short of its reservation now.
+    function uncovered(address token) public view returns (uint256) {
+        address escrow = ics20.getEscrow(clients[0]);
+        if (escrow == address(0)) return 0;
+        uint256 reserved = ctl.reserved(clients[0], token);
+        uint256 bal = IERC20(token).balanceOf(escrow);
+        return reserved > bal ? reserved - bal : 0;
+    }
+
+    /// @notice The permitted shortfall never exceeds what is uncovered now: covered again, it is no longer
+    /// permitted. Run at the start of every step that could move escrow.
+    function _ratchet() internal {
+        for (uint256 t = 0; t < tokens.length; t++) {
+            uint256 u = uncovered(tokens[t]);
+            if (permittedShortfall[tokens[t]] > u) permittedShortfall[tokens[t]] = u;
+        }
     }
 
     /// @notice The ghost's transport history: packet `i`'s ack or timeout processed now.
@@ -225,8 +251,9 @@ contract ReconcileHandler is Test {
     }
 
     /// @notice The invariants, between two steps of a composite transition.
-    function _checkpoint() internal view {
+    function _checkpoint() internal {
         if (address(checker) != address(0)) checker.checkpoint();
+        _ratchet();
     }
 
     function setVoucher(GnoVoucher v) external {
@@ -353,6 +380,11 @@ contract ReconcileHandler is Test {
             (string memory c, T.SettleItem[] memory items) = abi.decode(dec.params, (string, T.SettleItem[]));
             for (uint256 k = 0; k < items.length; k++) {
                 if (items[k].action != 5) settledCount[keccak256(abi.encode(c, items[k].sequence))]++;
+                // a refund a forged success ack hid, owed again: the compromise loss reconciliation recognizes
+                if (items[k].action == 1) {
+                    uint256 j = _packetIndex(c, items[k].sequence);
+                    if (ghost[j].forgedSuccess) permittedShortfall[ghost[j].token] += items[k].amount;
+                }
             }
         } else if (dec.kind == S.KIND_ROUTE) {
             (string memory old, string memory next, uint64 from) = abi.decode(dec.params, (string, string, uint64));
@@ -361,6 +393,14 @@ contract ReconcileHandler is Test {
             _snapshotNew();
         }
         return true;
+    }
+
+    function _packetIndex(string memory c, uint64 seq) internal view returns (uint256) {
+        bytes32 ch = keccak256(bytes(c));
+        for (uint256 i = 0; i < packets.length; i++) {
+            if (packets[i].sequence == seq && keccak256(bytes(packets[i].sourceClient)) == ch) return i;
+        }
+        revert("no such packet");
     }
 
     function _one(uint64 s) internal pure returns (uint64[] memory a) {
@@ -414,13 +454,15 @@ contract ReconcileHandler is Test {
 
     function send(uint256 tokenSeed, uint256 amount, bool delivered) external {
         calls++;
-        address token = tokens[tokenSeed % 2 == 0 ? 0 : bound(tokenSeed, 0, tokens.length - 1)];
+        _ratchet();
+        address token = _pick(tokenSeed);
         if (_send(alice, token, bound(amount, 1, 100), delivered)) ok["send"]++;
     }
 
     /// @notice A contract sender (notified through IIBCSenderCallbacks; it takes callbacks only from ICS20).
     function sendFromAdapter(uint256 amount, bool delivered) external {
         calls++;
+        _ratchet();
         amount = bound(amount, 1, 100);
         ERC20Mock(tokens[0]).mint(address(adapter), amount);
         mintedToSenders[tokens[0]] += amount;
@@ -434,6 +476,7 @@ contract ReconcileHandler is Test {
     /// @notice Relays a packet's outcome, honestly or forged against its truth.
     function relay(uint256 i, bool forged, bool useTimeout) external {
         calls++;
+        _ratchet();
         if (packets.length == 0) return;
         i = bound(i, 0, packets.length - 1);
         if (ghost[i].relayed) return;
@@ -471,9 +514,21 @@ contract ReconcileHandler is Test {
     /// @notice A receive returning a token to bob: honest (vouchers of a delivered send) or forged.
     function receive_(uint256 tokenSeed, uint256 amount, bool forged) external {
         calls++;
-        address token = tokens[tokenSeed % 2 == 0 ? 0 : bound(tokenSeed, 0, tokens.length - 1)];
+        _ratchet();
+        address token = _pick(tokenSeed);
         amount = bound(amount, 1, 50);
         if (!forged && redeemable[token] < amount) return;
+        _receiveToken(token, amount, forged);
+    }
+
+    /// @notice A random token, never the partial-backing one.
+    function _pick(uint256 seed) internal view returns (address token) {
+        token = tokens[seed % 2 == 0 ? 0 : bound(seed, 0, tokens.length - 1)];
+        if (token == partialToken) token = tokens[0];
+    }
+
+    /// @notice A receive of `amount` of `token` to bob over the live client; whether it was received.
+    function _receiveToken(address token, uint256 amount, bool forged) internal returns (bool done) {
         string memory dest = _live();
         IICS26RouterMsgs.Payload[] memory pl = new IICS26RouterMsgs.Payload[](1);
         pl[0] = IICS26RouterMsgs.Payload(
@@ -508,12 +563,14 @@ contract ReconcileHandler is Test {
                 received[token] += got;
                 if (!forged) redeemable[token] -= amount;
                 ok[forged ? "receiveForged" : "receiveHonest"]++;
+                done = true;
             }
         } catch { }
     }
 
     function claim(uint256 tokenSeed) external {
         calls++;
+        _ratchet();
         try ctl.claim(_live(), tokens[bound(tokenSeed, 0, tokens.length - 1)], 5) returns (uint256 n) {
             if (n != 0) ok["claim"]++;
         } catch { }
@@ -521,6 +578,7 @@ contract ReconcileHandler is Test {
 
     function claimParked(uint256 i) external {
         calls++;
+        _ratchet();
         if (packets.length == 0) return;
         IICS26RouterMsgs.Packet memory pkt = packets[bound(i, 0, packets.length - 1)];
         try ctl.claimParked(pkt.sourceClient, pkt.sequence, 300_000) {
@@ -531,6 +589,7 @@ contract ReconcileHandler is Test {
     /// @notice A guardian's refunds flag, set or cleared.
     function refundsFlag(uint256 seat, bool set) external {
         calls++;
+        _ratchet();
         vm.prank(G[bound(seat, 0, 3)]);
         if (set) {
             try ctl.setRefundsFlag(_live()) {
@@ -546,6 +605,7 @@ contract ReconcileHandler is Test {
     /// @notice A notification of an adapter's packet: a transport retry or the reconciliation's, with a budget.
     function notify(uint256 i) external {
         calls++;
+        _ratchet();
         uint256 n = packets.length;
         if (n == 0) return;
         i %= n; // no overflow in the walk below
@@ -605,6 +665,7 @@ contract ReconcileHandler is Test {
     /// router writes) and the drain records nothing; outside the send, the drain records the buffered decision.
     function busyGovernance(uint256 amount) external {
         calls++;
+        _ratchet();
         if (ctl.routeClosed(_live())) return;
         // buffer: decisions L+2 .. L+10, then L+1 records itself and drains eight, leaving L+10 buffered
         uint64 last = admin.lastSeq();
@@ -676,6 +737,7 @@ contract ReconcileHandler is Test {
     /// @notice A contract sender whose refund callback tries to re-enter the transfer app: the shared lock refuses it.
     function senderReentry(uint256 amount) external {
         calls++;
+        _ratchet();
         amount = bound(amount, 1, 50);
         if (ctl.routeClosed(_live())) return;
         for (uint256 g = 0; g < 4; g++) {
@@ -711,6 +773,7 @@ contract ReconcileHandler is Test {
     /// @notice A voucher (ugnot) received by bob: honest or forged; minted, never escrowed.
     function receiveVoucher(uint256 amount, bool forged) external {
         calls++;
+        _ratchet();
         amount = bound(amount, 1, 1000);
         string memory dest = _live();
         IICS26RouterMsgs.Payload[] memory pl = new IICS26RouterMsgs.Payload[](1);
@@ -748,6 +811,7 @@ contract ReconcileHandler is Test {
     /// @notice The live verifier freezes or expires (proofs through it are void), or kind 6 migrates it.
     function verifierEvent(uint256 what) external {
         calls++;
+        _ratchet();
         what = bound(what, 0, 2);
         if (what == 0) {
             _liveClient().setStatus(true, false);
@@ -793,6 +857,7 @@ contract ReconcileHandler is Test {
 
     function replace(bool fromZero) external {
         calls++;
+        _ratchet();
         if (clients.length >= 6) return;
         if (_replace(fromZero)) ok["replace"]++;
     }
@@ -801,6 +866,7 @@ contract ReconcileHandler is Test {
     /// and after the delay anyone executes it.
     function recover() external {
         calls++;
+        _ratchet();
         if (clients.length >= 6) return;
         string memory next = string.concat("gnoland-", vm.toString(100 + clients.length));
         MockLightClient fresh = new MockLightClient();
@@ -927,6 +993,7 @@ contract ReconcileHandler is Test {
 
     function reconcile(uint256 how, bool all) external {
         calls++;
+        _ratchet();
         if (_reconcile(how, all)) ok["reconcile"]++;
     }
 
@@ -943,7 +1010,7 @@ contract ReconcileHandler is Test {
         ok["reopen"]++;
         _snapshotNew();
         _checkpoint();
-        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
+        for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
             if (_continue(true)) ok["continueReopen"]++;
         }
         return !ctl.routeClosed(_live());
@@ -951,11 +1018,13 @@ contract ReconcileHandler is Test {
 
     function reopen() external {
         calls++;
+        _ratchet();
         _reopen();
     }
 
     function continueReopen() external {
         calls++;
+        _ratchet();
         if (_continue(true)) ok["continueReopen"]++;
     }
 
@@ -966,7 +1035,9 @@ contract ReconcileHandler is Test {
         string memory live = _live();
         if (!ctl.routeReopening(live)) return false;
         (T.Incident[] memory before, uint64 r0,) = ctl.incidents(live);
-        try ctl.continueReopen(live, 16) {
+        // a batch of 1 to 8 deficits (kind 13 takes 16; LOSS_TOKENS leaves several continuations, some not the last)
+        uint256 size = 1 + uint256(keccak256(abi.encode(contSeed++))) % 8;
+        try ctl.continueReopen(live, size) {
             done = true;
         } catch {
             return false;
@@ -982,11 +1053,12 @@ contract ReconcileHandler is Test {
         }
         assertEq(r1, opened ? uint64(after_.length) : r0, "resolvedUpTo");
         if (aborted) ok["abortObserved"]++;
+        if (!opened && !aborted) ok["continueNonTerminal"]++;
         if (check) _checkpoint();
     }
 
-    /// @notice Forged refunds paid on seventeen tokens, a replacement and its reconciliation: a kind 13 whose deficits
-    /// need more than one batch, left reopening.
+    /// @notice Forged refunds paid on LOSS_TOKENS tokens, a replacement and its reconciliation: a kind 13 whose
+    /// deficits need more than one batch, left reopening.
     function _startLongReopening() internal returns (bool) {
         if (ctl.routeReopening(_live())) return true;
         // the forged refunds must be paid (no refunds hold): every guardian clears its own flag
@@ -998,7 +1070,7 @@ contract ReconcileHandler is Test {
         if (ctl.routeClosed(_live()) && (!_reconcile(0, true) || !_reopen())) return false;
         {
             if (clients.length >= 40) return false;
-            for (uint256 t = 1; t <= 17; t++) {
+            for (uint256 t = 1; t <= LOSS_TOKENS; t++) {
                 if (!_send(alice, tokens[t], 1, true)) return false;
                 uint256 i = packets.length - 1;
                 try router.ackPacket(
@@ -1023,6 +1095,7 @@ contract ReconcileHandler is Test {
     /// @notice A replacement while a reopening is under way: it aborts the reopening.
     function replaceDuringReopening() external {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_startLongReopening()) return;
         if (_replace(true) && !ctl.routeReopening(_live())) ok["replaceDuringReopening"]++;
     }
@@ -1031,6 +1104,7 @@ contract ReconcileHandler is Test {
     /// forged receive) closes the route again; a new kind 13 accepts it.
     function lateLoss(uint256 how) external {
         calls++;
+        _ratchet();
         if (ctl.routeClosed(_live())) return;
         if (_reconcile(how, true) && ctl.routeClosed(_live())) {
             ok["lateLoss"]++;
@@ -1040,6 +1114,7 @@ contract ReconcileHandler is Test {
 
     function warp(uint256 dt) external {
         calls++;
+        _ratchet();
         _skip(bound(dt, 1, 2 days));
     }
 
@@ -1052,7 +1127,7 @@ contract ReconcileHandler is Test {
             try admin.cancelRecovery() { } catch { }
             (, openedAt,,) = admin.recovery();
         }
-        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
+        for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
             if (_continue(true)) ok["continueReopen"]++;
         }
         if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
@@ -1071,6 +1146,7 @@ contract ReconcileHandler is Test {
     /// refund claimed, a refused refund parked and claimed, honest and forged receives.
     function transportRound(uint256 seed) public {
         calls++;
+        _ratchet();
         if (!_ensureOpen()) return;
         for (uint256 k = 0; k < 4; k++) {
             if (!_send(alice, tokens[0], 20, (seed >> k) & 1 == 1)) return;
@@ -1098,6 +1174,7 @@ contract ReconcileHandler is Test {
     /// a new kind 13 accepts it.
     function lateLossScenario() public {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
         if (!_send(alice, tokens[1], 10, true)) return;
         this.relay(packets.length - 1, true, false); // a forged error ack: refunded at once
@@ -1137,6 +1214,7 @@ contract ReconcileHandler is Test {
     /// recovery approved then cancelled by the guardians.
     function adversarialRound(uint256 seed) public {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
         if (!_send(alice, tokens[0], 10, false)) return;
         uint256 i = packets.length - 1;
@@ -1219,6 +1297,7 @@ contract ReconcileHandler is Test {
     /// @notice Records a replacement (kind 6 adding a client, kind 10) without executing it.
     function startReplacement(bool fromZero) external {
         calls++;
+        _ratchet();
         if (clients.length >= 40) return;
         string memory next = string.concat("gnoland-s", vm.toString(++nonce));
         MockLightClient fresh = new MockLightClient();
@@ -1244,6 +1323,7 @@ contract ReconcileHandler is Test {
     /// @notice Records a kind 12 for a retired record (the action its truth calls for), without executing it.
     function decideSettle(uint256 i) external {
         calls++;
+        _ratchet();
         if (packets.length == 0) return;
         i = i % packets.length;
         if (!ctl.isRetired(packets[i].sourceClient)) return;
@@ -1257,6 +1337,7 @@ contract ReconcileHandler is Test {
     /// @notice Records a kind 13 without executing it.
     function startReopen() external {
         calls++;
+        _ratchet();
         uint64 s = _decide(S.KIND_REOPEN, P.reopen(_live()));
         if (s == 0) return;
         pending.push(s);
@@ -1266,6 +1347,7 @@ contract ReconcileHandler is Test {
     /// @notice Proves a retired record's outcome through the live client, whatever its health.
     function proveOne(uint256 i, uint256 how) external {
         calls++;
+        _ratchet();
         if (packets.length == 0) return;
         i = i % packets.length;
         if (!ctl.isRetired(packets[i].sourceClient)) return;
@@ -1277,6 +1359,7 @@ contract ReconcileHandler is Test {
     /// @notice Matures and executes the recorded decisions, in order (a decision of another epoch is gone).
     function executePending() external {
         calls++;
+        _ratchet();
         if (pending.length == 0) return;
         _skip(7 days + 1);
         uint32 ep = admin.epoch();
@@ -1302,6 +1385,7 @@ contract ReconcileHandler is Test {
     /// @notice bob returns vouchers to gno.land (a burn); its outcome is relayed honestly or forged later.
     function sendVoucher(uint256 amount, bool delivered) external {
         calls++;
+        _ratchet();
         uint256 bal = ugnot.balanceOf(bob);
         if (bal == 0) return;
         if (_send(bob, address(ugnot), (amount % bal) + 1, delivered)) ok["sendVoucher"]++;
@@ -1310,6 +1394,7 @@ contract ReconcileHandler is Test {
     /// @notice A contract sender refuses its refund notification: the refund stands, the notification is kept.
     function adapterRefuses(uint256 amount) external {
         calls++;
+        _ratchet();
         if (ctl.routeClosed(_live())) return;
         amount = amount % 50 + 1;
         ERC20Mock(tokens[0]).mint(address(adapter), amount);
@@ -1351,6 +1436,7 @@ contract ReconcileHandler is Test {
     /// generation) made stale: both spent, the record unchanged.
     function staleSettlements(uint256 seed) public {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
         if (!_send(alice, tokens[0], 10, false)) return;
         uint256 i = packets.length - 1;
@@ -1392,6 +1478,7 @@ contract ReconcileHandler is Test {
     /// batches run, is spent with every loss unchanged; booked after the route opened, it is a late loss.
     function lossDuringReopening(uint256 amount) external {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
         // a delivered send first: the escrow then holds what the forged receive releases
         if (!_send(alice, tokens[0], 60, true)) return;
@@ -1420,6 +1507,7 @@ contract ReconcileHandler is Test {
     /// @notice Authority changes between an emergency recovery's approval and its execution are suspended.
     function recoverWithAuthorityAttempts() external {
         calls++;
+        _ratchet();
         if (clients.length >= 40) return;
         _ensureOpen();
         string memory next = string.concat("gnoland-r", vm.toString(++nonce));
@@ -1475,13 +1563,14 @@ contract ReconcileHandler is Test {
     /// the route; restored, the route reopens.
     function faultInjectedAbort() external {
         calls++;
+        _ratchet();
         if (!_startLongReopening()) return;
         (bytes32 slot, uint256 shift) = _pendingSlot();
         if (slot == bytes32(0)) return;
         (, uint64 resolved0,) = ctl.incidents(_live());
         vm.store(address(ics20), slot, bytes32(uint256(vm.load(address(ics20), slot)) + (uint256(1) << shift)));
         // the batches check the exact transitions themselves (`_continue`); the invariants wait for the fault's removal
-        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
+        for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
             _continue(false);
         }
         bool aborted = !ctl.routeReopening(_live()) && ctl.routeClosed(_live());
@@ -1528,6 +1617,7 @@ contract ReconcileHandler is Test {
     /// authentic ack B and settles action 3: the sender is told of the success once, with B.
     function forgedSuccessAck(uint256 amount) external {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
         amount = amount % 50 + 1;
         ERC20Mock(tokens[0]).mint(address(adapter), amount);
@@ -1569,6 +1659,7 @@ contract ReconcileHandler is Test {
     /// approved again, it opens, and three guardians cancel it.
     function withdrawApproval() external {
         calls++;
+        _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
         (, uint64 openedAt,,) = admin.recovery();
         if (openedAt != 0) return;
@@ -1620,6 +1711,7 @@ contract ReconcileHandler is Test {
     /// suspect work of that incident (a reopening under way then aborts at its last batch).
     function retiredAck(uint256 i) external {
         calls++;
+        _ratchet();
         if (packets.length == 0) return;
         i = i % packets.length;
         IICS26RouterMsgs.Packet memory pkt = packets[i];
@@ -1648,6 +1740,7 @@ contract ReconcileHandler is Test {
     /// (an open or a suspect record): it must be spent, and the route stay closed. No reconciliation first.
     function prematureReopen() public {
         calls++;
+        _ratchet();
         if (!ctl.routeClosed(_live()) || ctl.routeReopening(_live())) return;
         bool work;
         for (uint256 k = 0; k + 1 < clients.length && !work; k++) {
@@ -1671,6 +1764,7 @@ contract ReconcileHandler is Test {
     /// only, as in `retiredAck`): ignored, nothing paid, the record unchanged.
     function lateOnSettled(uint256 i, bool useTimeout) public {
         calls++;
+        _ratchet();
         if (packets.length == 0) return;
         i = i % packets.length;
         IICS26RouterMsgs.Packet memory pkt = packets[i];
@@ -1707,10 +1801,94 @@ contract ReconcileHandler is Test {
         _checkpoint();
     }
 
+    // ------------------------------------------------------------------------------------- round 13 actions --
+
+    /// @notice A refund partly backed: a forged success ack hides an undelivered send's refund, a forged receive
+    /// takes most of the escrow it would have used, and reconciliation owes the refund again with only part of it
+    /// left (the payment fails: it stays owed). Receives must not take the rest: the shortfall stays what
+    /// reconciliation recognized.
+    function partialBacking() external {
+        calls++;
+        _ratchet();
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        address p = partialToken;
+        _limits(p);
+        if (!_send(alice, p, 100, false)) return;
+        uint256 i = packets.length - 1;
+        this.relay(i, true, false); // a forged success ack: the reservation released
+        if (!ghost[i].forgedSuccess) return;
+        address escrow = ics20.getEscrow(_live());
+        uint256 bal = IERC20(p).balanceOf(escrow);
+        uint256 reserved = ctl.reserved(_live(), p);
+        if (bal < reserved + 50) return;
+        // a forged receive takes all but 50 above the reservation (allowed: nothing reserves it)
+        if (bal - reserved - 50 != 0 && !_receiveToken(p, bal - reserved - 50, true)) return;
+        if (!_replace(true)) return;
+        _reconcile(0, true); // the refund owed again: 100 against 50
+        T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
+        if (rec.settlement != 1 || rec.refunded != 0 || uncovered(p) == 0) {
+            _ensureOpen();
+            return;
+        }
+        // the route reopened (the forged receive booked and accepted), the refund still owed and partly backed: a
+        // receive on the new live client (forged, or honest) must not take the 50 left
+        if (!_reopen() || uncovered(p) == 0) {
+            _ensureOpen();
+            return;
+        }
+        uint256 before = IERC20(p).balanceOf(escrow);
+        bool refused = !_receiveToken(p, 50, true) && !_receiveToken(p, 1, false);
+        if (refused && IERC20(p).balanceOf(escrow) == before) ok["partialBackingHeld"]++;
+        _ensureOpen();
+    }
+
+    /// @notice The route-wide seal: a loss on a record of an incident already resolved (A) is refused while another
+    /// incident (B) reopens. The forged receive on A's client is left out of A's reconciliation (the deliberate
+    /// late-loss exception), so A resolves with it unbooked; booked during B's reopening, the incident-status check
+    /// passes (A is resolved) and only the route-wide seal refuses it.
+    function lossResolvedIncidentDuringReopening() external {
+        calls++;
+        _ratchet();
+        if (clients.length >= 38 || !_ensureOpen()) return;
+        if (!_send(alice, tokens[0], 60, true)) return;
+        this.relay(packets.length - 1, false, false);
+        uint256 before = receives.length;
+        this.receive_(0, 7, true);
+        if (receives.length == before) return;
+        Receive memory r = receives[before];
+        heldBack = before + 1;
+        leftOut[before + 1] = true;
+        // incident A: the receive's client retired, reconciled without it, reopened
+        bool aDone = _replace(true) && _reopen() && !ctl.routeClosed(_live());
+        // incident B, reopening over several batches
+        bool bReopening = aDone && _startLongReopening();
+        heldBack = 0;
+        if (!bReopening || ctl.lossBooked(r.client, r.sequence, 2)) {
+            _ensureOpen();
+            return;
+        }
+        uint256 l = ctl.losses(_live(), r.token);
+        uint64 s = _decide(S.KIND_SETTLE, P.settle1(r.client, r.sequence, 5, r.amount));
+        _executeAll(_one(s));
+        if (
+            s != 0 && admin.decision(admin.epoch(), s).state == S.SPENT && ctl.losses(_live(), r.token) == l
+                && !ctl.lossBooked(r.client, r.sequence, 2) && ctl.routeReopening(_live())
+        ) ok["lossResolvedIncidentSealed"]++;
+        // B finishes; the left-out receive is then a late loss, accepted by a new kind 13
+        _ensureOpen();
+        if (_reconcile(0, true) && ctl.routeClosed(_live())) _reopen();
+    }
+
     // ----------------------------------------------------------------------------------- coverage sweep --
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["partialBackingHeld"] == 0) this.partialBacking();
+        if (ok["lossResolvedIncidentSealed"] == 0) this.lossResolvedIncidentDuringReopening();
+        if (ok["continueNonTerminal"] == 0) {
+            _startLongReopening();
+            _ensureOpen();
+        }
         if (ok["prematureReopenRefused"] == 0 && _ensureOpen() && clients.length < 40) {
             _send(alice, tokens[0], 4, false); // outstanding: an open record
             if (_replace(true)) prematureReopen();
@@ -1811,7 +1989,7 @@ contract ReconcileHandler is Test {
             _reconcile(0, true);
             _reopen();
         }
-        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
+        for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
             if (_continue(true)) ok["continueReopen"]++;
         }
     }
@@ -1934,7 +2112,6 @@ contract ReconcileInvariantsTest is ControlsFixture {
 
     struct Flows {
         uint256[] reserve;
-        uint256[] shortfall;
         uint256[] refundedAlice;
         uint256[] refundedSenders;
         uint256[] refundedAll;
@@ -1943,7 +2120,6 @@ contract ReconcileInvariantsTest is ControlsFixture {
 
     function _flows(uint256 tn) internal pure returns (Flows memory f) {
         f.reserve = new uint256[](tn + 1);
-        f.shortfall = new uint256[](tn + 1);
         f.refundedAlice = new uint256[](tn + 1);
         f.refundedSenders = new uint256[](tn + 1);
         f.refundedAll = new uint256[](tn + 1);
@@ -1963,7 +2139,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
         for (uint256 i = 0; i < n; i++) {
             IICS26RouterMsgs.Packet memory pkt = h.packet(i);
             T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
-            (bool delivered, bool forgedSuccess,,, address sender, address gtoken, uint256 amount) = h.ghost(i);
+            (bool delivered,,,, address sender, address gtoken, uint256 amount) = h.ghost(i);
             _checkBinding(pkt, rec, i);
             // open iff the commitment is outstanding or a refund is owed; settled iff governance settled it (the
             // ghost's, never the record's own flags)
@@ -1995,8 +2171,6 @@ contract ReconcileInvariantsTest is ControlsFixture {
                     "an undelivered refund neither paid nor reserved"
                 );
             }
-            // the outstanding shortfall a forged success ack left: owed by reconciliation, still unpaid
-            if (forgedSuccess && rec.settlement == 1) f.shortfall[t] += r;
             // losses, per packet as amounts: a refund paid for a delivered packet, never an undelivered one's
             bool booked = ctl.lossBooked(pkt.sourceClient, pkt.sequence, 1);
             if (!delivered) assertFalse(booked, "a loss booked for an undelivered packet");
@@ -2054,8 +2228,12 @@ contract ReconcileInvariantsTest is ControlsFixture {
                 IERC20(token).balanceOf(escrow), sent - f.refundedAll[t] - h.received(token), "the escrow's tokens"
             );
             assertEq(IERC20(token).balanceOf(bob), h.received(token), "bob's tokens");
-            // and the escrow covers the reservation, but for the unpaid shortfalls of forged success acks
-            assertGe(IERC20(token).balanceOf(escrow) + f.shortfall[t], reserved, "escrow covers the reservation");
+            // and the escrow covers the reservation, but for the shortfall reconciliation recognized (the ghost's:
+            // a forged success ack's hidden refund, owed again), which no receive or payment may increase
+            uint256 bal = IERC20(token).balanceOf(escrow);
+            assertLe(
+                reserved > bal ? reserved - bal : 0, h.permittedShortfall(token), "uncovered beyond the recognized loss"
+            );
             // the booked losses equal the independently computed forged payouts
             assertEq(ctl.losses(clientId, token), f.loss[t], "losses equal the forged payouts");
             if (open) assertEq(ctl.acceptedDeficit(clientId, token), f.loss[t], "deficit accepted exactly");
@@ -2124,7 +2302,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[52] memory names = [
+        string[55] memory names = [
+            "partialBackingHeld",
+            "lossResolvedIncidentSealed",
+            "continueNonTerminal",
             "prematureReopenRefused",
             "lateOnSettledIgnored",
             "provenAckReplaced",
@@ -2183,7 +2364,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[35] memory required = [
+        string[38] memory required = [
+            "partialBackingHeld",
+            "lossResolvedIncidentSealed",
+            "continueNonTerminal",
             "prematureReopenRefused",
             "lateOnSettledIgnored",
             "provenAckReplaced",

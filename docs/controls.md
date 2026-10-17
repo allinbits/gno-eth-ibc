@@ -193,14 +193,22 @@ bounds (constant work whatever the number of incidents).
     ends refunded its packet's full amount, or the remainder stays reserved.
 4c. Kind 12's actions agree with the proven outcomes (a refund only for a packet not delivered, a delivered
     settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
-5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12), except by
-   the refunds kind 12 owes for packets a forged success ack released (a loss of the compromise, booked or accepted
-   by the reconciliation).
+5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12). The only
+   permitted shortfall is the one reconciliation recognizes: the refunds kind 12 owes again for packets a forged
+   success ack released, whose backing the compromise consumed. No receive or payment ever increases the shortfall.
+   The invariant campaign tracks the permitted shortfall in its ghost. It is raised only by those refunds' amounts
+   when kind 12 settles them, and lowered to what is actually uncovered at every step, so escrow covered again is
+   never given away later. `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
+   receives on the new live client, which must be refused. Removing the receive path's reservation guard fails the
+   campaign.
 6. When a route opens, every token's losses equal its accepted deficit.
-7. While a route is reopening, its losses do not change (reconciliation is sealed: no kind 12 on a client whose
-   incident is reopening, and no loss booked on the route). The invariant campaign snapshots every token's losses
-   only when a kind 13 starts a new reopening (right after it executes, never at any other moment) and compares them
-   after every call, and between the steps of every composite call, while that reopening runs.
+7. While a route is reopening, its losses do not change. Reconciliation is sealed: no kind 12 on a client whose
+   incident is reopening, and no loss booked anywhere on the route. The invariant campaign snapshots every token's
+   losses only when a kind 13 starts a new reopening (right after it executes, never at any other moment). It
+   compares them after every call, and between the steps of every composite call, while that reopening runs.
+   `lossResolvedIncidentDuringReopening` books a loss on a record of an incident already resolved while another
+   reopens, so only the route-wide seal refuses it; removing that seal fails the campaign. Continuation batches of 1
+   to 8 deficits over 33 loss tokens make several continuations that are not the last.
 
 ### Transitions
 
