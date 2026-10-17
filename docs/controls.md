@@ -17,6 +17,7 @@ built, where each rule lives, and where the implementation departs from the ADR.
 | `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: every kind at recording and at execution. Delegatecalled at a pinned code hash; replaced only by kind 9. |
 | `IBCAdminRecovery` | `contracts/src/admin/IBCAdminRecovery.sol` | The optional emergency route replacement (§7.12). Deployed by the executor (so pinned with it) and delegatecalled by IBCAdmin. |
 | `IBCAdminStorage` | `contracts/src/admin/IBCAdminStorage.sol` | IBCAdmin's ERC-7201 layout (`gno.storage.IBCAdmin`), constants, tombstones, hold history. |
+| `IBCAdminChecks` | `contracts/src/admin/IBCAdminChecks.sol` | The executor's stateless checks (a view contract it deploys): canonical parameters per kind, gno.land denoms and counterparties, and whether a light client may verify for gno.land (code, chain id, neither frozen nor expired). |
 | `IBCAdminSetupCheck` | `contracts/src/admin/IBCAdminSetupCheck.sol` | `finishSetup`'s numbered check list (a view contract the executor calls). |
 | `FrozenLightClient` | `contracts/src/admin/FrozenLightClient.sol` | What a retired client id is `migrateClient`ed to: proves nothing, reads as frozen. |
 | `Guardians` | `contracts/src/lib/Guardians.sol` | Ported from gnolang/bridges `lib/Guardians.sol` (GNO Network GPL): 4 guardian seats, 2 watch keys, flags, holds, 24 h dip, replacement rules. |
@@ -107,7 +108,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | §5.4 envelope, acks, statuses, window W = 64, drain D = 8 (every delivery and `drain()`), duplicates, conflicts | `IBCAdmin.onRecvPacket`, `_deliver`, `_record`, `_drain` |
 | §5.4 cancels anywhere: tombstones on arrival of the ranges as given (≤ 64 merged per epoch), a cancel beyond the window bound to its hash, redispatch | `IBCAdmin._deliver`, `_parseCancel`, `_tombstone`; `IBCAdminStorage.addTombstone` |
 | §5.4 epochs: another epoch refused, everything keyed by (epoch, seq) | `IBCAdmin.onRecvPacket`; `IBCAdminStorage.Layout` |
-| §5.4 unknown kind / bad params recorded and spent; a decision failing its checks at execution spent (no code, another code hash, a refused call, failed after-checks, rolled back) | `IBCAdmin._record`, `execute`; `IBCAdminExec.atRecording`, `_codeIs`, `_call`, `_selfStep` |
+| §5.4 unknown kind / bad params recorded and spent; a decision's parameters must be exactly the canonical `abi.encode` of its tuple (decoded, re-encoded and compared: trailing data, offsets or padding otherwise are spent at recording); a decision failing its checks at execution spent (no code, another code hash, a refused call, failed after-checks, rolled back) | `IBCAdmin._record`, `execute`; `IBCAdminExec.atRecording`, `_codeIs`, `_call`, `_selfStep` |
 | no one spends a decision by starving it of gas: recording, refusable calls and self-steps run with fixed budgets and floors | `IBCAdmin._atRecording`; `IBCAdminExec._call`, `_selfStep` |
 | §5.4 kind delays: cancel / kind 4 tightening / kind 8 revoke / kind 11 lengthening at recording; unpause 24 h; others 7 d | `IBCAdminExec.atRecording`, `IBCAdmin.execute`, `_delay` |
 | §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, through a hold at ≥ day 21 | `IBCAdmin.execute`, `_replacementFloor` |
@@ -115,11 +116,11 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | kind 3 at most 2 guardian seats, never a current key; both key copies follow; a replaced seat loses its recovery approval | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule; an older decision maturing later never overwrites a newer setting (kinds 4, 11) | `IBCAdminExec._loosens`; `IBCAdminStorage.supersede` |
 | kind 5 voucher registration, code-hash pinned, bound to the fork; the base denom only in the exact form gno-realms' transfer app puts on the wire, by a strict grammar: a native denom `[a-z][a-z0-9]{2,15}` (`ugnot`) or a GRC20 alias `gno.land:r(:[a-z][a-z0-9_]*){2,}(\.[A-Za-z0-9_-]{1,32})?` (`GRC20Alias` of a grc20reg key), at most 128 bytes; anything else is spent at recording | `IBCAdminExec._voucher` |
-| kind 6 add (custom id, enrolled for kind 10) / migrate a client (quarantine checkpointed and the verifier generation bumped first), code-hash pinned; the counterparty only in canonical form (gno.land's exact merkle prefix `main`, `/pv/vm:gno.land/r/aib/ibc/core:`, and a client id in [a-z0-9-], 1 to 64 characters; spent at recording otherwise), and a swap keeps the client's counterparty id; a retired client id is never migrated (spent); the emergency recovery's proposal is held to the same counterparty rule | `IBCAdminExec._client`; `GnoICS20Controls.checkpointQuarantine` |
+| kind 6 add (custom id, enrolled for kind 10) / migrate a client (quarantine checkpointed and the verifier generation bumped first), code-hash pinned; the verifier usable: for gno.land's chain id, neither frozen nor expired (`IBCAdminChecks.usableClient`, as the emergency recovery checks); the counterparty only in canonical form (gno.land's exact merkle prefix `main`, `/pv/vm:gno.land/r/aib/ibc/core:`, and a client id in [a-z0-9-], 1 to 64 characters; spent at recording otherwise), and a swap keeps the client's counterparty id; a retired client id is never migrated (spent); the emergency recovery's proposal is held to the same counterparty rule | `IBCAdminExec._client`; `GnoICS20Controls.checkpointQuarantine` |
 | kind 7 upgrades (router, transfer app, its two beacons), code-hash pinned, fixed call gas, after-checks (including that every beacon the decision does not name keeps its implementation and owner), a migration call that is empty or carries a selector on the executor's pinned allow-list (`migrationAllowed`: empty in this executor, so every migration call is refused; only a kind 9 hand-over to an executor with its own list extends it), and under any list never an upgrade-setting selector (`upgradeToAndCall`, `multicall`, `upgradeEscrowTo`, `upgradeIBCERC20To`), and on the transfer proxy only code that keeps the controls (`gnoControlsVersion()` at least the running one's, on the implementation before and on the proxy after: never the stock ICS20Transfer or an older fork), rolled back whole on failure | `IBCAdminExec._upgrade`, `migrationAllowed`, `applyUpgrade` |
 | kind 8 relayer role only; never ADMIN or any role that upgrades or re-points | `IBCAdminExec.atRecording`/`run` |
 | kind 9 hand-over: swap the pinned executor (same bindings), optional migration call, rolled back whole on failure | `IBCAdminExec._handover`, `applyHandover` |
-| kind 10 / E12 route replacement `(string oldClientId, string newClientId, uint64 suspectFrom)`: only to a client id kind 6 enrolled; quarantine checkpointed; retire + freeze the old id, `migrateRoute` (a new incident; the route closes), next epoch over the new id; allowed while the route is closed (an earlier incident carries over untouched; a reopening under way is aborted), only from the route's current client | `IBCAdminExec._route`; `IBCAdminStorage.replaceRoute`; `GnoICS20Controls.migrateRoute` |
+| kind 10 / E12 route replacement `(string oldClientId, string newClientId, uint64 suspectFrom)`: only to a client id kind 6 enrolled, whose verifier is still usable (gno.land's chain id, neither frozen nor expired) immediately before the old route is retired and the epoch switches (spent otherwise, the old route untouched); quarantine checkpointed; retire + freeze the old id, `migrateRoute` (a new incident; the route closes), next epoch over the new id; allowed while the route is closed (an earlier incident carries over untouched; a reopening under way is aborted), only from the route's current client | `IBCAdminExec._route`; `IBCAdminStorage.replaceRoute`; `GnoICS20Controls.migrateRoute` |
 | §7.12 suspected compromise interval, per incident: every ack and timeout the retired client processed from block `suspectFrom` on (found by binary search in that client's own processed list), and any it processes later, must be settled by kind 12 before kind 13; the live client's never count; the emergency recovery proposal carries the same field (the reconciliation state machine above) | `GnoICS20Controls.migrateRoute`, `ackHook`, `suspectRecords`; `GnoICS20Reconcile.settleRecords`, `reopenRoute` (`GnoSuspectUnsettled`) |
 | kind 11 route quarantine setting | `IBCAdminExec.atRecording`/`run`; `GnoICS20Controls.setQuarantine` |
 | §7.12 proven outcomes: anyone proves a send record's destination outcome through the route's replacement client (`proveOutcome`): the packet authenticated against the record's commitment, gno.land's receipt recomputed (R19: `sha256(0x03 ‖ uint64be(sequence) ‖ sha256(sourceClient) ‖ packet commitment)`, the gno-realms vectors) and compared with the proven one, the ack commitment proven with it; delivered (its receipt, a success ack), refundable (an error ack, or no receipt once the proven time reaches the packet's timeout), or a collision (another receipt at the sequence); final once proven; the replacement client must be active (the route's current client, neither frozen nor expired) when the outcome is proven and when kind 12 uses it: the outcome stores its verifier and the route's verifier generation, and one whose verifier has since frozen, expired or been replaced, or whose route was re-pointed since (even back to the same client), is void (kind 12 refuses it, all or nothing, and a new proof through the active client may replace it); kind 12 checks the verifier again for every outcome it consumes and after its last payment, so a token hook that freezes or swaps it mid-batch rolls the batch back. GnoLightClient has no path that unfreezes it or restores trust in earlier roots | `GnoICS20Reconcile.proveOutcome`, `gnoReceipt`, `_activeClient` |
@@ -150,9 +151,14 @@ the transitions.
     at closure, plus every ack or timeout processed on that client later (a retired client cannot normally process
     any: it is frozen).
   - kind *late loss*: a loss kind 12 booked while the route was open. It covers no records.
-  - status *open* → *reopening* → *resolved*. Incidents are appended; every incident below `resolvedUpTo` is
-    resolved.
-- **Route.** `closed`, `reopening` and the deficit cursor; the losses and accepted deficits per token.
+  - status *open* → *reopening* → *resolved*, derived from two bounds: incidents below `resolvedUpTo` are resolved,
+    those from it below `reopenUpTo` reopening, the rest open. Incidents are appended.
+- **Route.** `closed`, `reopening` and the deficit cursor; `pendingIncidents`, the unresolved replacement incidents
+  whose client still has an open or unsettled suspect record (kept by every change of those counts); the losses and
+  accepted deficits per token, and every loss's canonical identity (client id, sequence, direction).
+
+No transition walks the incidents: kind 13 reads `pendingIncidents`, and reopening, resolving and aborting move the
+bounds (constant work whatever the number of incidents).
 
 ### Invariants
 
@@ -178,8 +184,8 @@ the transitions.
 | kind 12 on a retired client's records | its incident not *reopening*; the outcome proven by the active verifier | the record settled once; its client's open and suspect counts follow |
 | kind 12 booking a loss | the route not reopening | the loss recorded; if the route was open, a *late-loss* incident opens and the route closes |
 | backfill | the router still holds the packet | a record opened for its client |
-| kind 13 | the route closed and not reopening; every unresolved incident settled (a replacement's client with no open and no suspect record; a late loss always) | unresolved incidents become *reopening*; deficits accepted in batches (`continueReopen`) |
-| last deficit batch | — | every reopening incident checked again: all settled → *resolved*, the route opens; otherwise the reopening aborts (incidents back to *open*, the route stays closed) |
+| kind 13 | the route closed and not reopening; `pendingIncidents` zero (every replacement's client with no open and no suspect record; a late loss needs none) | `reopenUpTo` moves to the end: unresolved incidents become *reopening*; deficits accepted in batches (`continueReopen`) |
+| last deficit batch | — | `pendingIncidents` checked again: zero → `resolvedUpTo` moves to `reopenUpTo` (*resolved*), the route opens; otherwise the reopening aborts (`reopenUpTo` back: incidents *open*, the route stays closed) |
 
 Each client id is retired once, so its suspect range never overlaps another incident's and a record reconciled by
 one incident is never counted by another; nothing is counted on the live client.
@@ -277,8 +283,9 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
 - **Unbackfilled legacy packets.** The open-record count only knows recorded packets; the upgrade runbook
   backfills every outstanding one before relaying resumes.
 - **Expensive tokens are parked.** A refund paid by an ack, a claim or kind 12 gives the token 200,000 gas per call;
-  a token needing more is parked, and `claimParked` (not bounded) pays it. A caller starving a payment below what it
-  needs makes the whole call revert (`GnoPaymentStarved`) rather than park it.
+  a token needing more (for its transfer or its `balanceOf`, which gets 30,000) is parked, and `claimParked` pays it
+  with a gas budget its caller chooses (at least the automatic one, for the balance read and each call). A caller
+  starving a payment below what it needs makes the whole call revert (`GnoPaymentStarved`) rather than park it.
 - **Delivering a notification needs its bytes.** Only a hash is stored, so whoever retries a notification rebuilds
   the callback calldata from the router's ack or timeout transaction (packet, acknowledgement, relayer).
 - **The deployer cannot be the relayer** (`RELAYER_ADDRESS`): check 2 refuses any role left with the deployer.
@@ -289,10 +296,14 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
 
 `contracts/test/controls/` drives the real `ICS26Router` (mock light client) through the full deployment of
 `DeployGnoIBC`: `GnoICS20Transfer.t.sol`, `UpgradeCompat.t.sol`, `IBCAdminDelivery.t.sol`, `IBCAdminKinds.t.sol`,
-`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (the seven
-review rounds' regressions, `test_r…` to `test_r7_…`), `ReconcileInvariants.t.sol` (invariant tests of the
-reconciliation state machine: a handler of random sends, acks, timeouts, receives, replacements, proofs, kind 12
-actions, late losses, kind 13 and its continuation, claims; 64 runs of depth 100 in the suite), `ProvenOutcomes.t.sol` (a strict
+`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (the eight
+review rounds' regressions, `test_r…` to `test_r8_…`), `ReconcileInvariants.t.sol` (invariant tests of the
+reconciliation state machine against a ghost entitlement model: every packet's truth chosen when sent, relays honest
+or forged against it, honest proofs, governance through IBCAdmin.execute; replacements also while closed or
+reopening, emergency recovery, verifier freeze, expiry and migration, kind 12 batches, kind 13 and its continuation
+over seventeen loss tokens, backfill and the abort after it, busy delivery and drain, contract senders and their
+notification retries, refunds flags, claims; every required transition covered in each run; 24 runs of depth 40 in
+the suite), `ProvenOutcomes.t.sol` (a strict
 mock light client checks every path and value `proveOutcome` computes; the R19 vectors), `ControlsGas.t.sol`,
 `GovVectors.t.sol`. Library and client tests: `Guardians.t.sol` (differential fuzz against a model),
 `LeakyBucket.t.sol`, `Quarantine.t.sol`. Foundry runs in Docker, image `ghcr.io/foundry-rs/foundry:v1.7.1` (pinned:
