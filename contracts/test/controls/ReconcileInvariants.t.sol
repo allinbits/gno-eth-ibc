@@ -10,6 +10,7 @@ import { Strings } from "@openzeppelin-contracts/utils/Strings.sol";
 
 import { ICS26Router } from "@eureka/ICS26Router.sol";
 import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
+import { IICS26RouterErrors } from "@eureka/errors/IICS26RouterErrors.sol";
 import { IICS20Transfer } from "@eureka/interfaces/IICS20Transfer.sol";
 import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
 import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
@@ -31,7 +32,8 @@ import { GnoVoucher } from "../../src/GnoVoucher.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
 /// @notice Called from a token hook inside a send (the transfer app busy, the router free): a governance delivery
-/// (the router writes IBCAdmin's Busy refusal as an error ack) and a drain with a decision buffered (nothing recorded).
+/// (reverted whole: the router reports `IBCFailedCallback` and writes nothing) and a drain with a decision buffered
+/// (nothing recorded).
 contract BusyProbe {
     ICS26Router internal immutable router;
     IBCAdmin internal immutable admin;
@@ -42,8 +44,13 @@ contract BusyProbe {
         (router, admin) = (r, a);
     }
 
+    bool public deliveryReverted;
+
     function probe(IICS26RouterMsgs.Packet calldata gov) external {
-        router.recvPacket(IICS26RouterMsgs.MsgRecvPacket(gov, "", IICS02ClientMsgs.Height(0, 1)));
+        try router.recvPacket(IICS26RouterMsgs.MsgRecvPacket(gov, "", IICS02ClientMsgs.Height(0, 1))) { }
+        catch (bytes memory r) {
+            deliveryReverted = r.length >= 4 && bytes4(r) == IICS26RouterErrors.IBCFailedCallback.selector;
+        }
         drained = admin.drain();
         lastSeqSeen = admin.lastSeq();
     }
@@ -53,7 +60,18 @@ contract BusyProbe {
 /// chosen when it is sent; relays are honest or forged against it; proofs are honest (through the active client):
 /// every refund, reservation, settlement and loss is checked against the truth, independently of the controls'
 /// own bookkeeping. Governance (kinds 6, 10, 12, 13) runs through IBCAdmin.execute.
+/// @notice The test contract's invariant check, run by the handler between the steps of a composite transition.
+interface ICheckpoint {
+    function checkpoint() external view;
+}
+
 contract ReconcileHandler is Test {
+    ICheckpoint internal checker;
+    // forged receives governance deliberately leaves out of its reconciliation (index + 1 => true): booked later as
+    // late losses, the only departure from the complete-reconciliation precondition, and a deliberate one
+    mapping(uint256 => bool) public leftOut;
+    mapping(uint256 => bool) public leftOutSend; // the same for send records (packet index + 1)
+
     ICS26Router internal router;
     IGnoICS20Controls internal ctl;
     GnoICS20Transfer internal ics20;
@@ -156,6 +174,15 @@ contract ReconcileHandler is Test {
         return address(adapter);
     }
 
+    function setChecker(ICheckpoint c) external {
+        checker = c;
+    }
+
+    /// @notice The invariants, between two steps of a composite transition.
+    function _checkpoint() internal view {
+        if (address(checker) != address(0)) checker.checkpoint();
+    }
+
     function setVoucher(GnoVoucher v) external {
         ugnot = v;
         ugnotSupply0 = v.totalSupply();
@@ -163,8 +190,9 @@ contract ReconcileHandler is Test {
         v.approve(address(ics20), type(uint256).max);
     }
 
-    /// @notice After a kind 13: the losses at the start of the reopening (invariant 7 compares them while it runs).
-    function _snapshotIfReopening() internal {
+    /// @notice Right after a kind 13 executed (a new reopening started): the losses at its start, which invariant 7
+    /// compares while it runs. Never taken at any other moment.
+    function _snapshotNew() internal {
         if (!ctl.routeReopening(_live())) return;
         for (uint256 t = 0; t < tokens.length; t++) {
             lossSnapshot[tokens[t]] = ctl.losses(_live(), tokens[t]);
@@ -263,8 +291,11 @@ contract ReconcileHandler is Test {
                 continue;
             }
             try admin.execute(seqs[i]) { } catch { }
-            if (admin.decision(ep, seqs[i]).state != S.EXECUTED) all = false;
+            IIBCAdmin.Decision memory dec = admin.decision(ep, seqs[i]);
+            if (dec.state != S.EXECUTED) all = false;
+            else if (dec.kind == S.KIND_REOPEN) _snapshotNew();
         }
+        _checkpoint();
     }
 
     function _one(uint64 s) internal pure returns (uint64[] memory a) {
@@ -345,9 +376,9 @@ contract ReconcileHandler is Test {
         bool success = ghost[i].delivered != forged;
         bool done;
         if (success) {
-            try router.ackPacket(
-                IICS26RouterMsgs.MsgAckPacket(pkt, bytes("{\"result\":\"AQ==\"}"), "", IICS02ClientMsgs.Height(0, 1))
-            ) {
+            // a success ack's bytes vary (any non-error ack is a success): the proven ack may differ from the relayed
+            bytes memory okAck = useTimeout ? bytes("{\"result\":\"Zm9yZ2Vk\"}") : bytes("{\"result\":\"AQ==\"}");
+            try router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, okAck, "", IICS02ClientMsgs.Height(0, 1))) {
                 done = true;
             } catch { }
         } else if (useTimeout) {
@@ -557,8 +588,8 @@ contract ReconcileHandler is Test {
         hookToken.setHook(address(0), address(0), "");
         Vm.Log[] memory logs = vm.getRecordedLogs();
         if (!hookToken.hookOk()) return;
-        // the specific refusal: the router reported IBCAdmin's Busy for the delivery from inside the send
-        bool busy;
+        // the specific refusal: the delivery from inside the send reverted whole, nothing written
+        bool busy = busyProbe.deliveryReverted();
         for (uint256 i = 0; i < logs.length; i++) {
             if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
                 packets.push(abi.decode(logs[i].data, (IICS26RouterMsgs.Packet)));
@@ -566,12 +597,8 @@ contract ReconcileHandler is Test {
                 redeemable[address(hookToken)] += amount;
                 sentBy[alice][address(hookToken)] += amount;
             }
-            if (
-                logs[i].emitter == address(router)
-                    && logs[i].topics[0] == IICS26Router.IBCAppRecvPacketCallbackError.selector
-            ) {
-                bytes memory reason = abi.decode(logs[i].data, (bytes));
-                if (reason.length >= 4 && bytes4(reason) == IIBCAdmin.Busy.selector) busy = true;
+            if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.WriteAcknowledgement.selector) {
+                busy = false; // an ack written for the delivery: consumed
             }
         }
         bool nothing = busyProbe.drained() == 0 && busyProbe.lastSeqSeen() == before
@@ -856,11 +883,10 @@ contract ReconcileHandler is Test {
     function _reopenOnly() internal returns (bool) {
         if (!_executeAll(_one(_decide(S.KIND_REOPEN, P.reopen(_live()))))) return false;
         ok["reopen"]++;
-        _snapshotIfReopening();
+        _snapshotNew();
+        _checkpoint();
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
-            try ctl.continueReopen(_live(), 16) {
-                ok["continueReopen"]++;
-            } catch { }
+            if (_continue(true)) ok["continueReopen"]++;
         }
         return !ctl.routeClosed(_live());
     }
@@ -872,9 +898,33 @@ contract ReconcileHandler is Test {
 
     function continueReopen() external {
         calls++;
-        try ctl.continueReopen(_live(), 16) {
-            ok["continueReopen"]++;
-        } catch { }
+        if (_continue(true)) ok["continueReopen"]++;
+    }
+
+    /// @notice One `continueReopen` batch, with the exact incident transitions it may make: the reopening incidents
+    /// stay reopening, all become resolved when the route opens, or all open again when it aborts; no other incident
+    /// changes. `check`: the invariants after it (not while a test-only fault stands).
+    function _continue(bool check) internal returns (bool done) {
+        string memory live = _live();
+        if (!ctl.routeReopening(live)) return false;
+        (T.Incident[] memory before, uint64 r0,) = ctl.incidents(live);
+        try ctl.continueReopen(live, 16) {
+            done = true;
+        } catch {
+            return false;
+        }
+        (T.Incident[] memory after_, uint64 r1,) = ctl.incidents(live);
+        bool opened = !ctl.routeClosed(live);
+        bool aborted = !opened && !ctl.routeReopening(live);
+        assertEq(after_.length, before.length, "no incident added by a batch");
+        for (uint256 k = 0; k < before.length; k++) {
+            uint8 want = before[k].status;
+            if (want == 2) want = opened ? 3 : (aborted ? 1 : 2);
+            assertEq(after_[k].status, want, "an incident's transition");
+        }
+        assertEq(r1, opened ? uint64(after_.length) : r0, "resolvedUpTo");
+        if (aborted) ok["abortObserved"]++;
+        if (check) _checkpoint();
     }
 
     /// @notice Forged refunds paid on seventeen tokens, a replacement and its reconciliation: a kind 13 whose deficits
@@ -907,7 +957,8 @@ contract ReconcileHandler is Test {
         if (!_reconcile(0, true)) return false;
         if (!_executeAll(_one(_decide(S.KIND_REOPEN, P.reopen(_live()))))) return false;
         ok["reopen"]++;
-        _snapshotIfReopening();
+        _snapshotNew();
+        _checkpoint();
         return ctl.routeReopening(_live());
     }
 
@@ -944,9 +995,7 @@ contract ReconcileHandler is Test {
             (, openedAt,,) = admin.recovery();
         }
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
-            try ctl.continueReopen(_live(), 16) {
-                ok["continueReopen"]++;
-            } catch { }
+            if (_continue(true)) ok["continueReopen"]++;
         }
         if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
             _reconcile(0, true);
@@ -997,11 +1046,31 @@ contract ReconcileHandler is Test {
         _skip(1 days);
         if (!_replace(false)) return; // its interval starts after the forged refund
         _reconcile(0, false); // only what kind 13 waits for: the forged refund is left
+        _markLeftOut(); // and so is every forged payout not yet booked: governance finds them late, by design
         if (!_reopenOnly()) return;
         // found after the reopening (in this same step): its loss closes the route again
         if (_reconcile(1, true) && ctl.routeClosed(_live())) {
             ok["lateLoss"]++;
             _reopen();
+        }
+    }
+
+    /// @notice Marks every forged outcome not reconciled yet (a forged refund's record, a refund a forged success ack
+    /// hides, a forged receive) as left out of the reconciliation: the scenario's governance finds them only after the
+    /// reopening.
+    function _markLeftOut() internal {
+        for (uint256 i = 0; i < packets.length; i++) {
+            bool unbooked = ghost[i].forgedRefund && !ctl.lossBooked(packets[i].sourceClient, packets[i].sequence, 1);
+            bool hidden =
+                ghost[i].forgedSuccess && ctl.sendRecord(packets[i].sourceClient, packets[i].sequence).settlement == 0;
+            if (unbooked || hidden) {
+                leftOutSend[i + 1] = true;
+            }
+        }
+        for (uint256 j = 0; j < receives.length; j++) {
+            if (receives[j].forged && !ctl.lossBooked(receives[j].client, receives[j].sequence, 2)) {
+                leftOut[j + 1] = true;
+            }
         }
     }
 
@@ -1160,15 +1229,21 @@ contract ReconcileHandler is Test {
         for (uint256 k = 0; k < pending.length; k++) {
             uint64 s = pending[k];
             if (admin.decision(ep, s).state != S.PENDING) continue;
+            // the documented precondition of kind 13 (§7.12): governance has reconciled completely before it
+            // executes; the controls enforce only the suspected interval and the open records (their own refusals
+            // are tested separately)
+            if (admin.decision(ep, s).kind == S.KIND_REOPEN) _reconcile(0, true);
             string memory live = _live();
             try admin.execute(s) { } catch { }
-            if (admin.decision(ep, s).state == S.EXECUTED) {
+            IIBCAdmin.Decision memory dec = admin.decision(ep, s);
+            if (dec.state == S.EXECUTED) {
                 n++;
                 if (bytes(replacing[s]).length != 0 && ctl.isRetired(live)) clients.push(replacing[s]);
+                if (dec.kind == S.KIND_REOPEN) _snapshotNew();
             }
+            _checkpoint();
         }
         delete pending;
-        _snapshotIfReopening();
         if (n != 0) ok["executePending"]++;
     }
 
@@ -1276,6 +1351,7 @@ contract ReconcileHandler is Test {
         if (receives.length == before) return;
         Receive memory r = receives[before];
         heldBack = before + 1;
+        leftOut[before + 1] = true;
         bool started = _startLongReopening();
         heldBack = 0;
         if (!started || !ctl.isRetired(r.client)) return;
@@ -1352,13 +1428,21 @@ contract ReconcileHandler is Test {
         if (!_startLongReopening()) return;
         (bytes32 slot, uint256 shift) = _pendingSlot();
         if (slot == bytes32(0)) return;
-        bytes32 orig = vm.load(address(ics20), slot);
-        vm.store(address(ics20), slot, bytes32(uint256(orig) + (uint256(1) << shift)));
+        (, uint64 resolved0,) = ctl.incidents(_live());
+        vm.store(address(ics20), slot, bytes32(uint256(vm.load(address(ics20), slot)) + (uint256(1) << shift)));
+        // the batches check the exact transitions themselves (`_continue`); the invariants wait for the fault's removal
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
-            try ctl.continueReopen(_live(), 16) { } catch { }
+            _continue(false);
         }
         bool aborted = !ctl.routeReopening(_live()) && ctl.routeClosed(_live());
-        vm.store(address(ics20), slot, orig); // the fault removed
+        // the fault removed: only the injected bit, never the transition's own writes in the same word
+        vm.store(address(ics20), slot, bytes32(uint256(vm.load(address(ics20), slot)) - (uint256(1) << shift)));
+        (T.Incident[] memory inc, uint64 resolved1,) = ctl.incidents(_live());
+        assertEq(resolved1, resolved0, "an abort resolves nothing");
+        for (uint256 k = resolved1; aborted && k < inc.length; k++) {
+            assertEq(inc[k].status, 1, "aborted: every unresolved incident open again");
+        }
+        _checkpoint();
         if (aborted) ok["abortInjected"]++;
         _reopen();
     }
@@ -1387,10 +1471,142 @@ contract ReconcileHandler is Test {
         return (bytes32(0), 0);
     }
 
+    // ------------------------------------------------------------------------------------- round 11 actions --
+
+    /// @notice A delivered packet of a contract sender whose success ack A (other bytes than the one gno.land wrote)
+    /// a compromised verifier accepted while the sender refused the notification; reconciliation proves the
+    /// authentic ack B and settles action 3: the sender is told of the success once, with B.
+    function forgedSuccessAck(uint256 amount) external {
+        calls++;
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        amount = amount % 50 + 1;
+        ERC20Mock(tokens[0]).mint(address(adapter), amount);
+        mintedToSenders[tokens[0]] += amount;
+        _limits(tokens[0]);
+        try ctl.claim(_live(), tokens[0], 20) { } catch { }
+        vm.recordLogs();
+        try adapter.send(amount, _live()) { }
+        catch {
+            return;
+        }
+        if (!_record(true, address(adapter), tokens[0], amount)) return;
+        uint256 i = packets.length - 1;
+        adapter.setRefuse(true);
+        try router.ackPacket(
+            IICS26RouterMsgs.MsgAckPacket(
+                packets[i], bytes("{\"result\":\"Zm9yZ2Vk\"}"), "", IICS02ClientMsgs.Height(0, 1)
+            )
+        ) {
+            ghost[i].relayed = true;
+        } catch { }
+        adapter.setRefuse(false);
+        if (!ghost[i].relayed || !_replace(true) || !_prove(i, 0)) return;
+        T.SettleItem[] memory items = new T.SettleItem[](1);
+        items[0] = _action(i);
+        if (items[0].action != 3 || !_settleBatch(packets[i].sourceClient, items, 1)) return;
+        uint256 before = adapter.successes();
+        bytes memory proven = bytes("{\"result\":\"AQ==\"}");
+        try ctl.notifySettled(packets[i], proven, 0) returns (bool d) {
+            if (d && adapter.successes() == before + 1 && adapter.lastAck() == keccak256(proven)) {
+                ok["provenAckReplaced"]++;
+            }
+        } catch { }
+        _checkpoint();
+        _reopen();
+    }
+
+    /// @notice Before a recovery opens, a guardian withdraws its approval: the third approval no longer opens it;
+    /// approved again, it opens, and three guardians cancel it.
+    function withdrawApproval() external {
+        calls++;
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        (, uint64 openedAt,,) = admin.recovery();
+        if (openedAt != 0) return;
+        string memory next = string.concat("gnoland-w", vm.toString(++nonce));
+        MockLightClient fresh = new MockLightClient();
+        IIBCAdmin.RecoveryProposal memory p = IIBCAdmin.RecoveryProposal({
+            newClientId: next,
+            counterpartyClientId: string.concat("ethereum-w", vm.toString(nonce)),
+            merklePrefix: _prefix(),
+            lightClient: address(fresh),
+            codeHash: address(fresh).codehash,
+            suspectFrom: 0
+        });
+        _liveClient().setStatus(true, false); // eligible
+        bool ok_ = _approve(0, p) && _approve(1, p);
+        if (ok_) {
+            vm.prank(G[0]);
+            admin.cancelRecovery(); // before it opens: a withdrawal
+            ok_ = _approve(2, p);
+        }
+        (, openedAt,,) = admin.recovery();
+        bool held = ok_ && openedAt == 0;
+        _checkpoint();
+        if (held && _approve(0, p)) {
+            (, openedAt,,) = admin.recovery();
+            if (openedAt != 0) ok["approvalWithdrawn"]++;
+        }
+        _checkpoint();
+        for (uint256 g = 0; g < 3 && openedAt != 0; g++) {
+            vm.prank(G[g]);
+            admin.cancelRecovery();
+            (, openedAt,,) = admin.recovery();
+        }
+        _liveClient().setStatus(false, false);
+    }
+
+    function _approve(uint256 g, IIBCAdmin.RecoveryProposal memory p) internal returns (bool) {
+        vm.prank(G[g]);
+        try admin.approveRecovery(p) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @notice A retired client that is not frozen (kind 10 freezes it; here the freeze is defeated, test only, by
+    /// running the mock client's code at the frozen client's address for one call) delivers an honest ack or error ack
+    /// of one of its outstanding records while its incident is unresolved: the transfer app's ack hook counts it as
+    /// suspect work of that incident (a reopening under way then aborts at its last batch).
+    function retiredAck(uint256 i) external {
+        calls++;
+        if (packets.length == 0) return;
+        i = i % packets.length;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        if (ghost[i].relayed || !ctl.isRetired(pkt.sourceClient) || !ctl.routeClosed(_live())) return;
+        T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        if (rec.settlement != 0 || rec.outcome != T.Outcome.Pending) return;
+        address frozen = address(router.getClient(pkt.sourceClient));
+        bytes memory code = frozen.code;
+        vm.etch(frozen, address(new MockLightClient()).code);
+        bytes memory ack = ghost[i].delivered ? bytes("{\"result\":\"AQ==\"}") : ICS24Host.UNIVERSAL_ERROR_ACK;
+        bool done;
+        try router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, ack, "", IICS02ClientMsgs.Height(0, 1))) {
+            done = true;
+        } catch { }
+        vm.etch(frozen, code); // frozen again
+        if (!done) return;
+        ghost[i].relayed = true;
+        (,,, uint64 suspect,) = ctl.clientRecon(pkt.sourceClient);
+        if (suspect != 0) ok["retiredAck"]++;
+        _checkpoint();
+    }
+
     // ----------------------------------------------------------------------------------- coverage sweep --
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["provenAckReplaced"] == 0) this.forgedSuccessAck(9);
+        if (ok["approvalWithdrawn"] == 0) this.withdrawApproval();
+        if (ok["retiredAck"] == 0 && _ensureOpen() && clients.length < 40) {
+            _send(alice, tokens[0], 5, true);
+            _send(alice, tokens[0], 6, false);
+            if (_replace(true)) {
+                this.retiredAck(packets.length - 2);
+                this.retiredAck(packets.length - 1);
+            }
+            _ensureOpen();
+        }
         if (ok["settleExpiredRefused"] == 0 || ok["settleStaleGenRefused"] == 0) staleSettlements(0x1);
         if (ok["adapterRefused"] == 0) {
             _ensureOpen();
@@ -1426,8 +1642,10 @@ contract ReconcileHandler is Test {
                 this.proveOne(i, 0);
             }
             for (uint256 i = 0; i < packets.length && ok["decideSettle"] == 0; i++) {
+                if (!ctl.isRetired(packets[i].sourceClient)) continue;
                 T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
-                if (rec.settlement == 0 && rec.proven != T.Proven.None) this.decideSettle(i);
+                if (rec.settlement != 0) continue;
+                if (_prove(i, 0)) this.decideSettle(i);
             }
             this.executePending();
             this.startReopen();
@@ -1463,9 +1681,7 @@ contract ReconcileHandler is Test {
             _reopen();
         }
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
-            try ctl.continueReopen(_live(), 16) {
-                ok["continueReopen"]++;
-            } catch { }
+            if (_continue(true)) ok["continueReopen"]++;
         }
     }
 }
@@ -1484,12 +1700,14 @@ contract ReconcileInvariantsTest is ControlsFixture {
         super.setUp();
         h = new ReconcileHandler(router, ctl, ics20, admin, alice, bob, G, clientId, address(usdc));
         h.setVoucher(ugnot);
+        h.setChecker(ICheckpoint(address(this)));
         vm.prank(alice);
         usdc.approve(address(ics20), type(uint256).max);
         targetContract(address(h));
-        bytes4[] memory sel = new bytes4[](2);
+        bytes4[] memory sel = new bytes4[](3);
         sel[0] = ReconcileHandler.sweep.selector;
         sel[1] = ReconcileHandler.setVoucher.selector;
+        sel[2] = ReconcileHandler.setChecker.selector;
         excludeSelector(FuzzSelector(address(h), sel));
     }
 
@@ -1554,9 +1772,32 @@ contract ReconcileInvariantsTest is ControlsFixture {
     }
 
     /// forge-config: default.invariant.runs = 24
+    /// (no shrinking: replaying a failure reports its sequence at once; shrinking one takes many minutes)
+    /// forge-config: default.invariant.shrink-run-limit = 0
     /// forge-config: default.invariant.depth = 40
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_ghostModel() public view {
+        _checkAll();
+    }
+
+    /// @notice The same checks, run by the handler between the steps of its composite transitions.
+    function checkpoint() external view {
+        _checkAll();
+    }
+
+    /// @notice r11 #5, Codex's sequence: a forged voucher receive, a replacement and a kind 13, each recorded and
+    /// executed by the split steps. Governance reconciles completely before the generated kind 13 executes (the
+    /// documented precondition), so the forged receive is booked and every invariant holds.
+    function test_r11_5_generatedReopen_reconcilesFirst() public {
+        h.receiveVoucher(1, true);
+        h.startReplacement(true);
+        h.executePending();
+        h.startReopen();
+        h.executePending();
+        ReconcileHandler.Receive memory rv = h.receiveAt(0);
+        assertTrue(rv.forged);
+        assertTrue(ctl.lossBooked(rv.client, rv.sequence, 2), "booked before the reopening");
+        assertFalse(ctl.routeClosed(clientId), "reopened");
         _checkAll();
     }
 
@@ -1609,7 +1850,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
             // until its incident's reconciliation (the refunds are real: the senders' balances are checked below)
             if (!delivered && rec.refunded != amount && _entitlement(rec, amount) != amount - rec.refunded) {
                 assertTrue(
-                    rec.outcome == T.Outcome.Success && rec.settlement == 0 && !_resolved(pkt.sourceClient),
+                    rec.outcome == T.Outcome.Success && rec.settlement == 0
+                        && (!_resolved(pkt.sourceClient) || h.leftOutSend(i + 1)),
                     "an undelivered refund neither paid nor reserved"
                 );
             }
@@ -1619,7 +1861,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
             bool booked = ctl.lossBooked(pkt.sourceClient, pkt.sequence, 1);
             if (!delivered) assertFalse(booked, "a loss booked for an undelivered packet");
             if (booked) f.loss[t] += rec.refunded;
-            if (open && delivered && rec.refunded != 0 && _resolved(pkt.sourceClient)) {
+            if (open && delivered && rec.refunded != 0 && _resolved(pkt.sourceClient) && !h.leftOutSend(i + 1)) {
                 assertTrue(booked, "a forged refund not booked");
             }
         }
@@ -1629,7 +1871,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
             bool booked = ctl.lossBooked(rv.client, rv.sequence, 2);
             if (!rv.forged) assertFalse(booked, "a loss booked for an honest receive");
             if (booked) f.loss[_tokenIndex(rv.token, tn)] += rv.amount;
-            if (open && rv.forged && _resolved(rv.client)) assertTrue(booked, "a forged receive not booked");
+            if (open && rv.forged && _resolved(rv.client) && !h.leftOut(j + 1)) {
+                assertTrue(booked, "a forged receive not booked");
+            }
         }
         _checkFlows(f, tn, open);
         _checkCounters(n);
@@ -1738,7 +1982,11 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[46] memory names = [
+        string[50] memory names = [
+            "provenAckReplaced",
+            "approvalWithdrawn",
+            "retiredAck",
+            "abortObserved",
             "startReplacement",
             "executePending",
             "proveOne",
@@ -1791,7 +2039,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[30] memory required = [
+        string[33] memory required = [
+            "provenAckReplaced",
+            "approvalWithdrawn",
+            "retiredAck",
             "startReplacement",
             "executePending",
             "proveOne",

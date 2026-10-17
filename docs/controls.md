@@ -81,6 +81,10 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   clears it only when the latest conflict came strictly before the unpause was recorded. Guardian flags work the
   same way: setting one again refreshes its block. Hold and dip moments keep their first block, but only to measure
   how long a hold has lasted; no unpause is compared against them.
+- One exception, which is not a refusal of the packet: a delivery made from inside a transfer-app entry point (a token,
+  permit2 or sender hook relaying while relaying is public) reverts with no data. The router then reverts the whole
+  delivery (`IBCFailedCallback`), writes nothing, and the packet is relayed again later. This holds for IBCAdmin and
+  the transfer app alike.
 - Every refusal is an error acknowledgement (the router's universal error ack; the custom error is only in the
   router's `IBCAppRecvPacketCallbackError` event): wrong port/version/encoding/client, undecodable envelope, other
   epoch (`StaleEpoch`), beyond the window (`BeyondWindow`), a decision starved of gas (`ExecutionStarved`).
@@ -187,7 +191,8 @@ bounds (constant work whatever the number of incidents).
 6. When a route opens, every token's losses equal its accepted deficit.
 7. While a route is reopening, its losses do not change (reconciliation is sealed: no kind 12 on a client whose
    incident is reopening, and no loss booked on the route). The invariant campaign snapshots every token's losses
-   when a kind 13 starts a reopening and compares them after every call while that reopening runs.
+   only when a kind 13 starts a new reopening (right after it executes, never at any other moment) and compares them
+   after every call, and between the steps of every composite call, while that reopening runs.
 
 ### Transitions
 
@@ -195,7 +200,7 @@ bounds (constant work whatever the number of incidents).
 |---|---|---|
 | replacement (kind 10, emergency recovery) | the old id is the route's current client; the new id fresh | a new *replacement* incident covering the old id (suspect range from `suspectFrom`); the route closes; a reopening under way is aborted (its incidents back to *open*); earlier incidents, their records, reservations and counters untouched. Allowed while the route is closed |
 | ack or timeout | a record of the client | appended to the client's processed list; counted as suspect only if the client is retired |
-| delivery or drain of a governance decision | the transfer app not busy (a delivery from inside a hook reverts `Busy`, an error ack ibcgov re-sends; `drain()` records nothing) | the decision recorded; one acting at recording (kind 4 or 11 tightening) applies |
+| delivery or drain of a governance decision | the transfer app not busy (a delivery from inside a hook reverts whole with no data, so the router writes nothing and the packet is relayed again later; `drain()` records nothing) | the decision recorded; one acting at recording (kind 4 or 11 tightening) applies |
 | kind 12 on a retired client's records | its incident not *reopening*; the outcome proven by the active verifier | the record settled once; its client's open and suspect counts follow |
 | kind 12 booking a loss | the route not reopening | the loss recorded; if the route was open, a *late-loss* incident opens and the route closes |
 | kind 13 | the route closed and not reopening; `pendingIncidents` zero (every replacement's client with no open and no suspect record; a late loss needs none) | `reopenUpTo` moves to the end: unresolved incidents become *reopening*; deficits accepted in batches (`continueReopen`) |
@@ -326,6 +331,24 @@ unless the executor's allow-list names it), a kind 9 migration call (delegatecal
 router's or a beacon's switch to the new implementation. The router's `addClient` and `migrateClient` store the
 client and call nothing.
 
+### External callees during privileged operations
+
+Every state-changing entry point of the transfer app (the fork, the controls, reconciliation, evidence) holds one
+shared transient lock. While it is held, IBCAdmin refuses `execute` (`Busy`) and its delivery (a whole revert), and
+`drain()` records nothing. The router holds its own lock around every packet it processes. A callee therefore
+reaches no privileged entry point, whatever state it sees.
+
+| Callee (who chooses it) | Where it is called, and how | State during the call | Under the lock | Can reach a privileged entry point |
+|---|---|---|---|---|
+| ERC-20 token of a send (the sender) | `transferFrom` (eureka's `_transferFrom`), a CALL | tokens moved, the send record not yet written | yes | no: the lock (`CalleeReentry`, `busyGovernance`); a delivery it relays reverts whole (`test_r11_callee_tokenHookRelaysAnInboundTransfer_notConsumed`) |
+| ERC-20 token or voucher of a refund (sender's token; registered voucher) | `tryPayRefund`: `balanceOf` STATICCALL, then `mint`/`Escrow.send` CALLs with PAY_GAS, in ack hooks, claims, `claimParked`, kind 12 | paid, `rec.refunded` updated after the call | yes | no: the lock (`ReentrantToken`, `HookToken` regressions); kind 12 rechecks its verifier after the payments |
+| ERC-20 token of a receive | `balanceOf` STATICCALL; voucher `mint`; `Escrow.send` CALL | the receive charged and recorded before the release | yes | no: the lock |
+| sender adapter (the sender) | IIBCSenderCallbacks with CALLBACK_GAS (ack hook, `retryNotification`, `notifySettled`) | after the record's outcome and payment are written; marked done after the call | yes | no: the lock (`senderReentry`, `ReentrantSender`) |
+| permit2 (fixed at deployment) | `permitTransferFrom`, a CALL, in `sendTransferWithPermit2` | as a send's token | yes | no: the lock (`test_r11_callee_permit2InSend`) |
+| route's active verifier (governance's kind 6/10; never caller-supplied: `proveOutcome` reads it from storage) | `verifyMembership`/`verifyNonMembership`, CALLs (eureka's interface is not `view`) | before any write of the proof | yes | no: the lock (`test_r11_callee_verifierInProveOutcome`) |
+| live client's status views (governance's) | `lastTransition`, `isFrozen`, `isExpired`, `getClientState` | — | — | STATICCALL only |
+| candidates (kind 6, 7, 9, recovery proposals) | see the table above | — | — | STATICCALL only |
+
 ## Deployment
 
 `DeployGnoIBC` deploys the fork as the ICS20 proxy's first implementation and initializes its controls
@@ -359,7 +382,7 @@ reconciliation state machine against a ghost model: every packet's truth chosen 
 against it, honest proofs, governance through IBCAdmin.execute; replacements also while closed or reopening,
 emergency recovery and its cancellation, verifier freeze, expiry and migration, kind 12 batches and its refusals (a
 mismatched action, a verifier frozen after the proof, a replay), kind 13 and its continuation over seventeen loss
-tokens, busy delivery and drain from a send hook (IBCAdmin's Busy, a buffered decision left unrecorded), contract
+tokens, busy delivery and drain from a send hook (the delivery reverted whole, a buffered decision left unrecorded), contract
 senders, their notification retries and a re-entering callback, refunds flags, claims, voucher receives, voucher
 sends (burns) and their refunds (mints). Governance is also driven in separate steps (`startReplacement`,
 `decideSettle`, `startReopen` record decisions that `executePending` matures and executes later, and `proveOne`
@@ -367,11 +390,21 @@ proves outcomes on its own), so other actions interleave between a decision, its
 adversaries: settlement against an expired verifier and against a proof made stale by a verifier migration (both
 spent, the record unchanged), a contract sender refusing its refund notification (the refund stands), a loss booked
 between deficit batches (spent, no loss changed, invariant 7), authority changes between an emergency recovery's
-approval and its execution (`Suspended`). The defensive re-check at the last deficit batch (the route aborts its
-reopening rather than open with an incident pending) cannot be reached through the public interface, since every
-path that adds a pending incident also aborts the reopening; the campaign drives it by fault injection: a test-only
-`vm.store` raises the pending-incident count between batches (the word located by probing what `incidents` reads),
-the last batch must abort, and the fault is removed before the route is reopened. Payment
+approval and its execution (`Suspended`), a guardian withdrawing its approval before a recovery opens (the next
+approval no longer opens it), a delivered packet whose forged success ack (other bytes than the proven one) the
+sender refused, settled by action 3 and then notified once with the proven ack, and success acks whose bytes vary.
+The defensive re-check at the last deficit batch (the route aborts its reopening rather than open with an incident
+pending) is reached two ways: an ack on a retired client that is not frozen (kind 10 freezes it; the campaign
+defeats the freeze for one call by running the mock client's code at the frozen client's address), which counts as
+suspect work of the reopening incident, and fault injection: a test-only `vm.store` raises the pending-incident count
+between batches (the word located by probing what `incidents` reads), the last batch must abort, and only the
+injected bit is removed afterwards. Every `continueReopen` batch is checked for its exact incident transitions:
+reopening incidents stay reopening, all become resolved when the route opens, or all open again when it aborts. The
+handler runs the invariant checks between the steps of every composite (after each executed decision, each batch,
+each step of a scenario), not only after each call. A generated kind 13 executes only after the handler's governance
+has reconciled completely, the documented precondition (the controls' own refusals of an early kind 13 are tested
+separately); the two scenarios that model governance finding a forged payout late are marked as such, and that
+forged payout is exempt from the completeness check until it is booked. Payment
 conservation is checked against the tokens themselves (the senders', the escrow's, bob's, the voucher's supply) and
 losses as per-packet amounts that the booked losses and the accepted deficit must equal; every required transition is
 covered in each run, counted only on its intended outcome; 24 runs of depth 40 in the suite). Its invariants assume governance reconciles completely before kind 13, as §7.12 asks: the controls

@@ -1716,7 +1716,7 @@ contract ReviewRegressionsTest is ControlsFixture {
 
     /// @notice Round 7 #3: a token hook calling drain() while the transfer app is busy records nothing, so a
     /// buffered tightening (kind 4, applied at recording) is never spent by the locked setter; drained later, it
-    /// applies. A delivery from inside the hook is an error ack (Busy), its number not consumed.
+    /// applies. A delivery from inside the hook reverts whole (nothing written), its number not consumed.
     function test_r7_3_drainFromATokenHook_recordsNothing() public {
         _setLimits(address(usdc), 1000, 1000, 1000);
         uint64 first = admin.lastSeq() + 1;

@@ -128,8 +128,15 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     function onRecvPacket(IIBCAppCallbacks.OnRecvPacketCallback calldata m) external returns (bytes memory) {
         if (msg.sender != router) revert NotRouter(msg.sender);
         // never recorded from inside a transfer-app entry point (a token or sender hook): a decision acting at
-        // recording would find the transfer app locked and be spent; an error ack, and ibcgov re-sends
-        if (IGnoICS20Busy(ics20).gnoBusy()) revert Busy();
+        // recording would find the transfer app locked and be spent. No data, so the router reverts the whole
+        // delivery (`IBCFailedCallback`): never an error ack, which would let a hook that relays (relaying public)
+        // turn every delivery into a refusal ibcgov must re-send; the packet is relayed again later
+        if (IGnoICS20Busy(ics20).gnoBusy()) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                revert(0, 0)
+            }
+        }
         IICS26RouterMsgs.Payload calldata p = m.payload;
         if (
             keccak256(bytes(p.sourcePort)) != COUNTERPARTY_PORT_HASH || keccak256(bytes(p.destPort)) != PORT_HASH

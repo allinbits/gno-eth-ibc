@@ -333,6 +333,20 @@ contract GnoICS20Transfer is
         $._ibcERC20Denoms[token] = routeDenom;
     }
 
+    /// @notice GNO: a delivery relayed from inside one of this app's own entry points (a token, permit2 or sender
+    /// hook, when relaying is public) reverts with no data, so the router reverts the whole delivery: the packet is
+    /// neither received nor acknowledged and is relayed again later. A refusal of the packet itself is an error ack;
+    /// this is not one: the app is only mid-operation.
+    modifier notMidOperation() {
+        if (_reentrancyGuardEntered()) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                revert(0, 0)
+            }
+        }
+        _;
+    }
+
     /// @inheritdoc IIBCApp
     // NOTE: Reentrancy disabled for this function via the `nonReentrant` modifier.
     // slither-disable-next-line reentrancy-no-eth
@@ -340,6 +354,7 @@ contract GnoICS20Transfer is
         // solhint-disable-previous-line function-max-lines
         external
         onlyRouter
+        notMidOperation
         nonReentrant
         whenNotPaused
         returns (bytes memory)

@@ -18,6 +18,8 @@ import { IGnoLightClientMsgs } from "../../src/msgs/IGnoLightClientMsgs.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
 import { IGnoICS20Controls } from "../../src/interfaces/IGnoICS20Controls.sol";
+import { ILightClient } from "@eureka/interfaces/ILightClient.sol";
+import { ILightClientMsgs } from "@eureka/msgs/ILightClientMsgs.sol";
 
 /// @notice A Permit2 stand-in that moves the tokens without checking a signature (the fork's balance check still
 /// runs).
@@ -376,5 +378,94 @@ contract MuteRevertToken is ERC20 {
             }
         }
         super._update(from, to, value);
+    }
+}
+
+/// @notice Tries the system's privileged entry points from inside a call it was given, records what each answered.
+abstract contract Reenterer {
+    address public ics20;
+    address public admin;
+    string public clientId;
+    uint256 public attempts;
+    uint256 public succeeded;
+    bytes[] internal reasons;
+
+    function arm(address ics20_, address admin_, string calldata clientId_) external {
+        (ics20, admin, clientId) = (ics20_, admin_, clientId_);
+    }
+
+    function reason(uint256 i) external view returns (bytes memory) {
+        return reasons[i];
+    }
+
+    /// @notice A call counts as getting through if it succeeded, except `drain`, which inside a transfer-app entry
+    /// point succeeds and records nothing: it gets through only if it recorded something.
+    function _try(address target, bytes memory data) private {
+        (bool ok, bytes memory r) = target.call(data);
+        bool drained = bytes4(data) == bytes4(keccak256("drain()"));
+        if (ok && (!drained || abi.decode(r, (uint256)) != 0)) succeeded++;
+        reasons.push(r);
+    }
+
+    function _reenter() internal {
+        if (ics20 == address(0) || attempts != 0) return;
+        attempts++;
+        _try(ics20, abi.encodeWithSignature("claim(string,address,uint256)", clientId, address(0), 1));
+        _try(ics20, abi.encodeWithSignature("continueReopen(string,uint256)", clientId, 1));
+        _try(admin, abi.encodeWithSignature("drain()"));
+        _try(admin, abi.encodeWithSignature("execute(uint64)", uint64(1)));
+        _try(admin, abi.encodeWithSignature("executeRecovery()"));
+    }
+}
+
+/// @notice A verifier that, asked to verify, tries the privileged entry points first (and then proves anything).
+contract ReentrantVerifier is ILightClient, Reenterer {
+    function updateClient(bytes calldata) external pure returns (ILightClientMsgs.UpdateResult) {
+        return ILightClientMsgs.UpdateResult.Update;
+    }
+
+    function verifyMembership(ILightClientMsgs.MsgVerifyMembership calldata) external returns (uint256) {
+        _reenter();
+        return block.timestamp;
+    }
+
+    function verifyNonMembership(ILightClientMsgs.MsgVerifyNonMembership calldata) external returns (uint256) {
+        _reenter();
+        return block.timestamp;
+    }
+
+    function misbehaviour(bytes calldata) external { }
+
+    function getClientState() external pure returns (bytes memory) {
+        IGnoLightClientMsgs.ClientState memory cs;
+        cs.chainId = "gno-test";
+        return abi.encode(cs);
+    }
+
+    function lastTransition() external pure returns (uint64, uint64) {
+        return (0, 0);
+    }
+
+    function isFrozen() external pure returns (bool) {
+        return false;
+    }
+
+    function isExpired() external pure returns (bool) {
+        return false;
+    }
+}
+
+/// @notice A permit2 that tries the privileged entry points before moving the tokens.
+contract ReentrantPermit2 is Reenterer {
+    function permitTransferFrom(
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        ISignatureTransfer.SignatureTransferDetails calldata details,
+        address owner,
+        bytes calldata
+    )
+        external
+    {
+        _reenter();
+        IERC20(permit.permitted.token).transferFrom(owner, details.to, details.requestedAmount);
     }
 }
