@@ -2078,6 +2078,33 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(address(router.getClient(clientId)), before);
     }
 
+    /// @notice Round 8 #3: 512 incidents (replacements while the route is closed), all reconciled; kind 13 through
+    /// IBCAdmin.execute (its fixed frame and 1M call budget) reopens, walking none of them.
+    function test_r8_3_reopen_512Incidents_throughIBCAdmin() public {
+        string memory live = clientId;
+        address lcx = address(new MockLightClient());
+        vm.startPrank(address(admin));
+        for (uint256 i = 0; i < 512; i++) {
+            string memory next = string.concat("gnoland-", vm.toString(1000 + i));
+            router.addClient(next, IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), lcx);
+            ctl.migrateRoute(live, next, 0);
+            live = next;
+        }
+        vm.stopPrank();
+        (T.Incident[] memory inc, uint64 resolved, uint64 pending) = ctl.incidents(clientId);
+        assertEq(inc.length, 512);
+        assertEq(resolved, 0);
+        assertEq(pending, 0);
+        uint64 seq = _decide(S.KIND_REOPEN, P.reopen(live));
+        _skip(7 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+        assertFalse(ctl.routeClosed(clientId));
+        (inc, resolved,) = ctl.incidents(clientId);
+        assertEq(resolved, 512);
+        assertEq(inc[511].status, 3);
+    }
+
     IICS26RouterMsgs.Packet[] internal _later;
 
     function _retireLater(IICS26RouterMsgs.Packet memory pkt) internal {
