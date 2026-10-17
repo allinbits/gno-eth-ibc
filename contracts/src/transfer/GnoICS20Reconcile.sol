@@ -142,9 +142,14 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         // payment runs token code that could freeze or swap it (any change rolls the whole batch back)
         address active = GnoTransferStorage.activeClient(clientId);
         uint64 gen = g.routes[route].verifierGen;
-        for (uint256 i = 0; i < items.length; i++) {
-            if (items[i].action == 5) _bookForgedReceive(g, route, clientHash, clientId, items[i], i);
-            else _settleRecord(g, route, clientHash, clientId, items[i], i, active, gen);
+        // two passes: every action that moves no tokens first (rejections, delivered, forged refunds and receives),
+        // so each payment checks the escrow against the batch's complete reservations, whatever the items' order
+        for (uint256 pass = 0; pass < 2; pass++) {
+            for (uint256 i = 0; i < items.length; i++) {
+                if ((items[i].action == 1) != (pass == 1)) continue;
+                if (items[i].action == 5) _bookForgedReceive(g, route, clientHash, clientId, items[i], i);
+                else _settleRecord(g, route, clientHash, clientId, items[i], i, active, gen);
+            }
         }
         require(
             GnoTransferStorage.activeClient(clientId) == active && g.routes[route].verifierGen == gen,

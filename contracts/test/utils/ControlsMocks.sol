@@ -347,3 +347,28 @@ contract ReentrantSender is IIBCSenderCallbacks {
         return id == type(IIBCSenderCallbacks).interfaceId || id == type(IERC165).interfaceId;
     }
 }
+
+/// @notice A token whose transfers to `mute` revert with no data at all (a bare `revert()`).
+contract MuteRevertToken is ERC20 {
+    address public mute;
+
+    constructor() ERC20("Mute", "MUTE") { }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setMute(address a) external {
+        mute = a;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (to != address(0) && to == mute) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                revert(0, 0)
+            }
+        }
+        super._update(from, to, value);
+    }
+}

@@ -41,7 +41,8 @@ import {
     OlderFork,
     GasBurnToken,
     CostlyBalanceToken,
-    StatusMock
+    StatusMock,
+    MuteRevertToken
 } from "../utils/ControlsMocks.sol";
 import { ICS26Router } from "@eureka/ICS26Router.sol";
 import { ICS20Transfer } from "@eureka/ICS20Transfer.sol";
@@ -2150,6 +2151,62 @@ contract ReviewRegressionsTest is ControlsFixture {
                 assertFalse(ctl.isRetired(clientId));
             }
         }
+    }
+
+    // ====================================================================================== round 10 ==
+
+    /// @notice Round 10 (a): kind 12 checks each payment against the batch's complete reservations: a rejection in
+    /// the same batch frees its reservation before the refund is paid, in either item order (tight escrow).
+    function test_r10_a_tightEscrow_mixedBatch_bothOrders() public {
+        _setLimits(address(usdc), 1000, 1000, 1);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId); // never delivered
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 100, clientId); // delivered
+        _errorAck(b); // a forged error ack: queued under the 1-unit meter, reserved
+        address escrow = ics20.getEscrow(clientId);
+        vm.prank(escrow);
+        usdc.transfer(address(0xdead), 100); // an incident: escrow 100 for 200 reserved
+        _retire();
+        _proveRefundable(a);
+        _proveDelivered(b);
+        T.SettleItem[] memory ab = new T.SettleItem[](2);
+        ab[0] = T.SettleItem(a.sequence, 1, 100);
+        ab[1] = T.SettleItem(b.sequence, 2, 0);
+        T.SettleItem[] memory ba = new T.SettleItem[](2);
+        ba[0] = T.SettleItem(b.sequence, 2, 0);
+        ba[1] = T.SettleItem(a.sequence, 1, 100);
+        uint256 snap = vm.snapshotState();
+        uint256 before = usdc.balanceOf(alice);
+        _settle(ab);
+        assertEq(usdc.balanceOf(alice), before + 100, "paid with the payment first");
+        assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Claimed));
+        vm.revertToState(snap);
+        _settle(ba);
+        assertEq(usdc.balanceOf(alice), before + 100, "paid with the rejection first");
+    }
+
+    /// @notice Round 10 (b): a receive whose packet data does not decode is refused with a custom error (an error
+    /// ack), never an empty revert that would make the relayer's whole transaction fail.
+    function test_r10_b_undecodableReceive_errorAck() public {
+        IICS26RouterMsgs.Packet memory pkt = _packetFromGno(
+            clientId, ICS20Lib.DEFAULT_PORT_ID, ICS20Lib.ICS20_VERSION, ICS20Lib.ICS20_ENCODING, hex"deadbeef"
+        );
+        assertTrue(_isErrorAck(_recv(pkt)));
+    }
+
+    /// @notice Round 10 (b): a returning token whose transfer reverts with no data is an error ack too.
+    function test_r10_b_tokenRevertingEmpty_errorAck() public {
+        MuteRevertToken m = new MuteRevertToken();
+        m.mint(alice, 100);
+        vm.prank(alice);
+        m.approve(address(ics20), type(uint256).max);
+        _setLimits(address(m), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory out = _send(alice, address(m), 100, clientId);
+        _ack(out, bytes("{\"result\":\"AQ==\"}"));
+        m.setMute(bob);
+        string memory back = string.concat("transfer/", CP, "/", Strings.toHexString(address(m)));
+        assertTrue(_isErrorAck(_transferIn(clientId, back, 10, bob)));
+        m.setMute(address(0));
+        assertTrue(_isSuccessAck(_transferIn(clientId, back, 10, bob)));
     }
 
     IICS26RouterMsgs.Packet[] internal _later;

@@ -136,6 +136,9 @@ interface IGnoICS20ControlsTypes {
     error GnoNoNotification(string clientId, uint64 sequence);
     error GnoBadProof();
     error GnoBadModule();
+    /// @notice A receive refused: its packet data does not decode, or the token or escrow refused the transfer.
+    error GnoBadPacketData();
+    error GnoReceiveFailed(address token);
     /// @notice Less gas left than a bounded refund payment needs: the caller starves it (retry with more gas).
     error GnoPaymentStarved();
     /// @notice Less gas left than a caller-funded notification's budget and reserve.

@@ -361,8 +361,13 @@ contract GnoICS20Transfer is
             ICS20InvalidPort(ICS20Lib.DEFAULT_PORT_ID, msg_.payload.destPort)
         );
 
-        IICS20TransferMsgs.FungibleTokenPacketData memory packetData =
-            abi.decode(msg_.payload.value, (IICS20TransferMsgs.FungibleTokenPacketData));
+        // GNO: undecodable data is refused with a custom error (an error ack), never an empty revert
+        IICS20TransferMsgs.FungibleTokenPacketData memory packetData;
+        try this.gnoDecodePacketData(msg_.payload.value) returns (IICS20TransferMsgs.FungibleTokenPacketData memory d) {
+            packetData = d;
+        } catch {
+            revert GnoBadPacketData();
+        }
         require(packetData.amount > 0, ICS20InvalidAmount(0));
         // GNO: a receive's amount is recorded in 96 bits (kind 12 books a forged one); every limit is far below
         require(packetData.amount <= type(uint96).max, ICS20InvalidAmount(packetData.amount));
@@ -401,7 +406,9 @@ contract GnoICS20Transfer is
             } // else: Case 2: "Native" ERC20
             _chargeReceive(route, msg_.destinationClient, erc20Address, packetData.amount); // GNO: E5
             // GNO: never below the escrow reserved for refunds owed (ADR §7.12)
-            uint256 balance = IERC20(erc20Address).balanceOf(address(escrow));
+            (bool ok, bytes memory ret) = erc20Address.staticcall(abi.encodeCall(IERC20.balanceOf, (address(escrow))));
+            require(ok && ret.length == 32, GnoReceiveFailed(erc20Address));
+            uint256 balance = abi.decode(ret, (uint256));
             uint256 reserved = _gno().tokens[route][erc20Address].reserved;
             require(
                 balance >= packetData.amount && balance - packetData.amount >= reserved,
@@ -419,14 +426,21 @@ contract GnoICS20Transfer is
             erc20Address = address(_getICS20TransferStorage()._ibcERC20Contracts[string(_toRouteDenom(newDenom))]);
             require(erc20Address != address(0), GnoDenomNotRegistered(string(newDenom)));
             _chargeReceive(route, msg_.destinationClient, erc20Address, packetData.amount); // GNO: E5
-            IMintableAndBurnable(erc20Address).mint(address(escrow), packetData.amount);
+            // GNO: a token refusing is an error ack (a custom error), never an empty revert
+            try IMintableAndBurnable(erc20Address).mint(address(escrow), packetData.amount) { }
+            catch {
+                revert GnoReceiveFailed(erc20Address);
+            }
         }
 
         // GNO: the receive recorded, for a reconciliation that finds it forged (kind 12 action 5)
         GnoTransferStorage.recordReceive(msg_.destinationClient, msg_.sequence, erc20Address, packetData.amount);
 
-        // transfer the tokens to the receiver
-        escrow.send(IERC20(erc20Address), receiver, packetData.amount);
+        // transfer the tokens to the receiver (GNO: a refusal, whatever its data, is a custom error: an error ack)
+        try escrow.send(IERC20(erc20Address), receiver, packetData.amount) { }
+        catch {
+            revert GnoReceiveFailed(erc20Address);
+        }
 
         return ICS20Lib.SUCCESSFUL_ACKNOWLEDGEMENT_JSON;
     }
@@ -690,6 +704,15 @@ contract GnoICS20Transfer is
     // Everything below is new: the hot path of the controls of ADR pr6375. Their governance, guardian, claim and
     // view functions (IGnoICS20Controls) run in GnoICS20Controls, which `fallback` delegatecalls, so this contract
     // stays under EIP-170; both share GnoTransferStorage's layout.
+
+    /// @notice Decodes ICS20 packet data (called by the receive path, so a malformed payload is a custom error).
+    function gnoDecodePacketData(bytes calldata value)
+        external
+        pure
+        returns (IICS20TransferMsgs.FungibleTokenPacketData memory)
+    {
+        return abi.decode(value, (IICS20TransferMsgs.FungibleTokenPacketData));
+    }
 
     /// @notice The version of the controls this implementation keeps (records, reservations, route aliases, the
     /// controls' namespace). Kind 7 installs on the transfer proxy only an implementation answering at least the
