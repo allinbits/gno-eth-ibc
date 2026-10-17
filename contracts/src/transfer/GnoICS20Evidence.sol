@@ -130,13 +130,36 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
                     : Proven.Delivered;
             }
         }
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         rec.proven = proven;
         rec.provenBy = address(lc);
         if (proven == Proven.Delivered) {
             g.provenAck[keccak256(bytes(packet.sourceClient))][packet.sequence] = keccak256(proof.ack);
         }
-        rec.provenGen = g.routes[GnoTransferStorage.routeHash(packet.sourceClient)].verifierGen;
+        bytes32 route = GnoTransferStorage.routeHash(packet.sourceClient);
+        rec.provenGen = g.routes[route].verifierGen;
+        // a hidden refund proven owed is reserved now; a new proof of another outcome releases it
+        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
         emit GnoOutcomeProven(packet.sourceClient, packet.sequence, proven);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function voidOutcome(string calldata clientId, uint64 sequence) external delegated nonReentrant {
+        GnoTransferStorage.Layout storage g = _g();
+        SendRecord storage rec = g.records[keccak256(bytes(clientId))][sequence];
+        bytes32 route = GnoTransferStorage.routeHash(clientId);
+        // void: proven, unsettled, and its verifier no longer the route's active one under the same generation
+        require(
+            rec.proven != Proven.None && rec.settlement == 0
+                && (rec.provenBy != GnoTransferStorage.activeClient(clientId)
+                    || rec.provenGen != g.routes[route].verifierGen),
+            GnoBadProof()
+        );
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        rec.proven = Proven.None;
+        rec.provenBy = address(0);
+        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+        emit GnoOutcomeProven(clientId, sequence, Proven.None);
     }
 
     /// @notice See IGnoICS20Controls.

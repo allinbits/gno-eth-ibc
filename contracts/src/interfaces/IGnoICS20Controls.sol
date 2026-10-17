@@ -275,6 +275,11 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// the record's commitment; gno.land's receipt is recomputed from it (R19: sha256(0x03 | uint64be(sequence) |
     /// sha256(sourceClient) | packet commitment)) and compared with the proven one. A non-receipt counts only once
     /// the proven time reaches the packet's timeout (it can then never be received). Proven once, before kind 12.
+    /// @notice Clears an outcome its verifier no longer vouches for (the route's active client or its generation
+    /// changed since the proof), releasing what the proof had reserved (a hidden refund's backing). Permissionless; a
+    /// new proof through the active verifier can follow.
+    function voidOutcome(string calldata clientId, uint64 sequence) external;
+
     function proveOutcome(
         IICS26RouterMsgs.Packet calldata packet,
         OutcomeProof calldata proof

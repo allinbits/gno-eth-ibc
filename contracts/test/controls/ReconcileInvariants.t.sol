@@ -97,6 +97,9 @@ contract ReconcileHandler is Test {
     // the refunds that allowance belongs to (packet index => true): a forged success ack hid them, kind 12 owes them
     // again; the allowance is never more than what of them is still unpaid
     mapping(uint256 => bool) public eligible;
+    // the ghost's own record of a proof that a packet's refund is owed (it was not delivered, and the handler proved
+    // that through the active verifier): from then on its reservation is held, until settled (ADR §7.12)
+    mapping(uint256 => bool) public provenOwed;
     bool internal partialDone; // after its scenario, ordinary sends may use the partial-backing token
     uint256 internal contSeed;
     HookToken internal hookToken;
@@ -397,7 +400,7 @@ contract ReconcileHandler is Test {
                 // a refund a forged success ack hid, owed again: the compromise loss reconciliation recognizes
                 if (items[k].action == 1) {
                     uint256 j = _packetIndex(c, items[k].sequence);
-                    if (ghost[j].forgedSuccess) {
+                    if (ghost[j].forgedSuccess && !eligible[j]) {
                         permittedShortfall[ghost[j].token] += items[k].amount;
                         eligible[j] = true;
                     }
@@ -934,6 +937,14 @@ contract ReconcileHandler is Test {
         }
         try ctl.proveOutcome(pkt, proof) returns (T.Proven pr) {
             done = true;
+            // a refund a forged success ack hid, proven owed: its backing is protected from now on
+            if (!ghost[i].delivered) {
+                provenOwed[i] = true;
+                if (ghost[i].forgedSuccess && !eligible[i]) {
+                    eligible[i] = true;
+                    permittedShortfall[ghost[i].token] += ghost[i].amount;
+                }
+            }
             if (pr == T.Proven.Collision) ok["proveCollision"]++;
             else if (proof.receipt == bytes32(0)) ok["proveNonReceipt"]++;
             else ok["prove"]++;
@@ -2087,7 +2098,7 @@ contract ReconcileHandler is Test {
     /// @notice Two refunds a forged success ack hid, owed again in ONE kind 12 (in either order) against 150 of
     /// backing: both are reserved before either is paid, so neither payment may proceed (it would take the
     /// other's backing).
-    function twinHiddenInitial(bool reversed) public {
+    function twinHiddenInitial(bool reversed, bool separate) public {
         calls++;
         _ratchet();
         if (clients.length >= 40 || !_ensureOpen()) return;
@@ -2111,11 +2122,23 @@ contract ReconcileHandler is Test {
         T.SettleItem[] memory items = new T.SettleItem[](2);
         items[reversed ? 1 : 0] = _action(a);
         items[reversed ? 0 : 1] = _action(a + 1);
-        bool settled = items[0].action == 1 && items[1].action == 1 && _settleBatch(c, items, 2);
+        bool settled;
+        if (items[0].action == 1 && items[1].action == 1) {
+            if (separate) {
+                // two decisions: the second refund was reserved by its proof, before the first decision
+                T.SettleItem[] memory one = new T.SettleItem[](1);
+                one[0] = items[0];
+                settled = _settleBatch(c, one, 1);
+                one[0] = items[1];
+                settled = settled && _settleBatch(c, one, 1);
+            } else {
+                settled = _settleBatch(c, items, 2);
+            }
+        }
         T.SendRecord memory ra = ctl.sendRecord(c, packets[a].sequence);
         T.SendRecord memory rb = ctl.sendRecord(c, packets[a + 1].sequence);
         if (settled && ra.refunded == 0 && rb.refunded == 0 && ra.settlement == 1 && rb.settlement == 1) {
-            ok[reversed ? "twinInitialHeldReversed" : "twinInitialHeld"]++;
+            ok[separate ? "twinInitialHeldSeparate" : (reversed ? "twinInitialHeldReversed" : "twinInitialHeld")]++;
         }
         _ensureOpen();
     }
@@ -2178,8 +2201,9 @@ contract ReconcileHandler is Test {
             if (_replace(true)) retiredTimeout(packets.length - 1);
             _ensureOpen();
         }
-        if (ok["twinInitialHeld"] == 0) twinHiddenInitial(false);
-        if (ok["twinInitialHeldReversed"] == 0) twinHiddenInitial(true);
+        if (ok["twinInitialHeld"] == 0) twinHiddenInitial(false, false);
+        if (ok["twinInitialHeldReversed"] == 0) twinHiddenInitial(true, false);
+        if (ok["twinInitialHeldSeparate"] == 0) twinHiddenInitial(false, true);
         if (ok["twinRefundHeld"] == 0) this.twinEligibleRefunds();
         if (ok["replaceInDipRefunds"] == 0) replaceDuringDip(true);
         if (ok["replaceInDipRoute"] == 0) replaceDuringDip(false);
@@ -2322,14 +2346,39 @@ contract ReconcileInvariantsTest is ControlsFixture {
     }
 
     /// @notice The reservation a record's state calls for, from the packet's own amount (the ghost's).
-    function _reserveOf(T.SendRecord memory rec, uint256 amount) internal pure returns (uint256) {
-        return rec.burned ? 0 : _entitlement(rec, amount);
+    function _reserveOf(T.SendRecord memory rec, uint256 i) internal view returns (uint256) {
+        return _burnedOf(i) ? 0 : _entitlement(rec, i);
+    }
+
+    /// @notice Whether packet `i` burned a voucher rather than escrowing a native token, from the ghost's own token
+    /// origin (the voucher gno.land's ugnot mints) and the authenticated packet's denom (a returning voucher carries
+    /// its `transfer/<client>/` trace; a native token its address), never from the record's flag; both must agree.
+    function _burnedOf(uint256 i) internal view returns (bool) {
+        (,,,,, address gtoken,) = h.ghost(i);
+        IICS20TransferMsgs.FungibleTokenPacketData memory data =
+            abi.decode(h.packet(i).payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
+        bytes memory denom = bytes(data.denom);
+        bool traced = denom.length > 9 && keccak256(_head(denom, 9)) == keccak256("transfer/");
+        bool voucher = gtoken == address(ugnot);
+        require(traced == voucher, "the packet's denom and the ghost's token origin disagree");
+        return voucher;
+    }
+
+    function _head(bytes memory b, uint256 n) internal pure returns (bytes memory out) {
+        out = new bytes(n);
+        for (uint256 k = 0; k < n; k++) {
+            out[k] = b[k];
+        }
     }
 
     /// @notice What the record still owes its sender: escrowed tokens reserved, or vouchers to mint again (a burn).
-    function _entitlement(T.SendRecord memory rec, uint256 amount) internal pure returns (uint256) {
+    function _entitlement(T.SendRecord memory rec, uint256 i) internal view returns (uint256) {
+        (,,,,,, uint256 amount) = h.ghost(i);
         if (rec.payment == T.Payment.Queued || rec.payment == T.Payment.Parked) return amount - rec.refunded;
-        return rec.outcome == T.Outcome.Pending && rec.settlement == 0 ? amount : 0;
+        bool settled = h.settledCount(keccak256(abi.encode(h.packet(i).sourceClient, h.packet(i).sequence))) != 0;
+        // a refund a forged success ack hid, held from the moment the ghost proved it owed
+        if (!settled && rec.outcome == T.Outcome.Success && h.provenOwed(i)) return amount - rec.refunded;
+        return rec.outcome == T.Outcome.Pending && !settled ? amount : 0;
     }
 
     /// @notice The record is bound to its packet: the token, sender and amount the handler sent, which the packet the
@@ -2353,6 +2402,38 @@ contract ReconcileInvariantsTest is ControlsFixture {
 
     /// @notice Boundary seeds: no handler action reverts on the extremes of its inputs (seeds are normalized
     /// before any arithmetic).
+    /// @notice r18 #2, a corruption probe: an outstanding native send whose record is flipped to `burned` (its
+    /// reservation dropped) must fail the oracle at once, from the ghost's independent classification.
+    function test_r18_2_burnedFlagCorruption_failsAtOnce() public {
+        h.send(0, 40, true); // usdc, outstanding
+        IICS26RouterMsgs.Packet memory pkt = h.packet(0);
+        this.checkpoint();
+        // find the record's `burned` bit: flip each word the record view reads and watch the flag
+        vm.record();
+        ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        (bytes32[] memory reads,) = vm.accesses(address(ics20));
+        for (uint256 k = 0; k < reads.length; k++) {
+            if (reads[k] == 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc) continue; // the proxy's
+            bytes32 orig = vm.load(address(ics20), reads[k]);
+            for (uint256 b = 0; b < 256; b += 8) {
+                vm.store(address(ics20), reads[k], bytes32(uint256(orig) | (uint256(1) << b)));
+                (bool okCall, bytes memory ret) =
+                    address(ctl).staticcall(abi.encodeCall(ctl.sendRecord, (pkt.sourceClient, pkt.sequence)));
+                if (
+                    okCall && ret.length == 32 * 18 && abi.decode(ret, (T.SendRecord)).burned
+                        && uint256(orig) & (uint256(1) << b) == 0
+                ) {
+                    // corrupted: the oracle must refuse it now
+                    vm.expectRevert(bytes("burned iff the ghost's token is a voucher: true != false"));
+                    this.checkpoint();
+                    return;
+                }
+                vm.store(address(ics20), reads[k], orig);
+            }
+        }
+        revert("the burned bit not found");
+    }
+
     function test_handlerSeedBoundaries() public {
         uint256 max = type(uint256).max;
         h.send(max, max, true);
@@ -2454,7 +2535,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
                 "settled iff governance settled it"
             );
             uint256 t = _tokenIndex(gtoken, tn);
-            uint256 r = _reserveOf(rec, amount);
+            uint256 r = _reserveOf(rec, i);
+            assertEq(rec.burned, _burnedOf(i), "burned iff the ghost's token is a voucher");
             f.reserve[t] += r;
             if (h.eligible(i)) f.eligibleUnpaid[t] += r;
             f.refundedAll[t] += rec.refunded;
@@ -2468,7 +2550,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
             if (rec.settlement >= 2) assertTrue(delivered, "a delivered settlement for an undelivered packet");
             // an undelivered record ends refunded in full or still reserved, unless a forged success ack hides it
             // until its incident's reconciliation (the refunds are real: the senders' balances are checked below)
-            if (!delivered && rec.refunded != amount && _entitlement(rec, amount) != amount - rec.refunded) {
+            if (!delivered && rec.refunded != amount && _entitlement(rec, i) != amount - rec.refunded) {
                 assertTrue(
                     rec.outcome == T.Outcome.Success && rec.settlement == 0
                         && (!_resolved(pkt.sourceClient) || h.leftOutSend(i + 1)),
@@ -2521,9 +2603,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
         for (uint256 i = 0; i < n; i++) {
             IICS26RouterMsgs.Packet memory pkt = h.packet(i);
             T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
-            if (rec.burned || rec.refunded <= h.refundedAt(i)) continue;
+            if (_burnedOf(i) || rec.refunded <= h.refundedAt(i)) continue;
             if (_tokenIndex(rec.token, tn) == tn) continue;
-            uint256 own = _reserveOf(rec, rec.amount);
+            uint256 own = _reserveOf(rec, i);
             assertGe(
                 IERC20(rec.token).balanceOf(escrow) + own,
                 ctl.reserved(clientId, rec.token),
@@ -2630,7 +2712,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[66] memory names = [
+        string[67] memory names = [
+            "twinInitialHeldSeparate",
             "tightenDelivery",
             "tightenDrain",
             "tightenInHookRefused",
@@ -2703,7 +2786,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[49] memory required = [
+        string[50] memory required = [
+            "twinInitialHeldSeparate",
             "tightenDelivery",
             "tightenDrain",
             "tightenInHookRefused",

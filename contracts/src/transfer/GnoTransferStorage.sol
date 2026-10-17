@@ -337,6 +337,14 @@ library GnoTransferStorage {
         if (pay == IGnoICS20ControlsTypes.Payment.Queued || pay == IGnoICS20ControlsTypes.Payment.Parked) {
             return rec.amount - rec.refunded;
         }
+        // a refund a forged success ack hid, once proven owed (refundable, or another packet at its sequence) and
+        // until settled: the proof establishes the liability, so its backing is held from then on, whatever decision
+        // later settles it (ADR §7.12)
+        IGnoICS20ControlsTypes.Proven pr = rec.proven;
+        if (
+            rec.settlement == 0 && rec.outcome == IGnoICS20ControlsTypes.Outcome.Success
+                && (pr == IGnoICS20ControlsTypes.Proven.Refundable || pr == IGnoICS20ControlsTypes.Proven.Collision)
+        ) return rec.amount - rec.refunded;
         bool outstanding = rec.outcome == IGnoICS20ControlsTypes.Outcome.Pending && rec.settlement == 0;
         return outstanding ? rec.amount : 0;
     }

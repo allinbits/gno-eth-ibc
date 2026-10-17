@@ -219,18 +219,25 @@ bounds (constant work whatever the number of incidents).
     ends refunded its packet's full amount, or the remainder stays reserved.
 4c. Kind 12's actions agree with the proven outcomes (a refund only for a packet not delivered, a delivered
     settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
-5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12). The only
+5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12). A refund a
+   forged success ack hid is reserved from the moment `proveOutcome` proves it owed (refundable or a collision),
+   not from its settlement. Its backing is therefore held however the settlements are split across decisions. If
+   the verifier that proved it stops vouching for it, anyone may call `voidOutcome`, which releases that
+   reservation; a new proof sets it again. The only
    permitted shortfall is the one reconciliation recognizes: the refunds kind 12 owes again for packets a forged
    success ack released, whose backing the compromise consumed. That allowance belongs to those very refunds and
    only while they are unpaid. Every other record's reservation is backed in full at all times, so a payment of one
    refund never takes another's backing, and no receive or payment ever increases the shortfall.
-   The invariant campaign checks this from its own ghost. It marks the eligible refunds when kind 12 owes them
-   again, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
+   The invariant campaign checks this from its own ghost. It marks the eligible refunds when it proves them owed, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
    every step, never raised but by kind 12). It asserts that the escrow covers every reservation but the eligible
    refunds' unpaid part. It also checks every payment's own postcondition: a record paid since the previous step
    left every other record's reservation backed, other refunds owed again included. Only the paid record may stay
    short. `twinEligibleRefunds` drives that: two such refunds unpaid against 150 of backing, one retried.
-   `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
+   The ghost classifies each send as a voucher burn or a native escrow from its own token origin and the
+   authenticated packet's denom. It requires the record's `burned` flag to match, and computes reservations from
+   that classification. A corruption probe that flips one record's flag fails at once
+   (`test_r18_2_burnedFlagCorruption_failsAtOnce`). `twinHiddenInitial` settles two hidden refunds together, in
+   either order, and in separate decisions. `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
    receives on the new live client, which must be refused. A new outstanding send of 100 follows, then a retry of
    the older refund, which must not take the new send's backing. Removing either the receive path's or the payment's
    reservation guard fails the campaign.

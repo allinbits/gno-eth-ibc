@@ -2465,4 +2465,83 @@ contract ReviewRegressionsTest is ControlsFixture {
         _adminWith(30 days - 1, 3, 3);
         _adminWith(30 days, 3, 3);
     }
+
+    // ============================================================================================= round 18 ==
+
+    /// @notice `n` undelivered sends of `each` with forged success acks (reservations released), then a forged receive
+    /// leaving `left` in escrow; retired and each proven refundable. Returns the packets.
+    function _hiddenRefunds(
+        uint256 n,
+        uint256 each,
+        uint256 left
+    )
+        internal
+        returns (IICS26RouterMsgs.Packet[] memory pkts)
+    {
+        _setLimits(address(usdc), 1e9, 1e9, 1e9);
+        pkts = new IICS26RouterMsgs.Packet[](n);
+        for (uint256 i = 0; i < n; i++) {
+            pkts[i] = _send(alice, address(usdc), each, clientId);
+            _ack(pkts[i], bytes("{\"result\":\"AQ==\"}"));
+        }
+        assertEq(ctl.reserved(clientId, address(usdc)), 0);
+        _transferIn(
+            clientId, string.concat("transfer/", CP, "/", Strings.toHexString(address(usdc))), n * each - left, bob
+        );
+        _retire();
+        for (uint256 i = 0; i < n; i++) {
+            _proveRefundable(pkts[i]);
+        }
+    }
+
+    /// @notice r18 #1: a proven refundable outcome of a hidden refund reserves it at once, so settling the refunds in
+    /// SEPARATE decisions still never lets one take the other's backing: 150 against 200, the first decision pays
+    /// nothing, nor does the second.
+    function test_r18_1_hiddenRefunds_separateDecisions() public {
+        IICS26RouterMsgs.Packet[] memory p = _hiddenRefunds(2, 100, 150);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200, "reserved from the proof");
+        address escrow = ics20.getEscrow(clientId);
+        _settle(_item(p[0].sequence, 1, 100));
+        assertEq(ctl.sendRecord(clientId, p[0].sequence).refunded, 0, "the first decision pays nothing");
+        _settle(_item(p[1].sequence, 1, 100));
+        assertEq(ctl.sendRecord(clientId, p[1].sequence).refunded, 0);
+        assertEq(usdc.balanceOf(escrow), 150);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
+    }
+
+    /// @notice r18 #1, the eight-item boundary: nine hidden refunds of 10 against 80. The first decision settles the
+    /// most a kind 12 takes, eight: with the ninth reserved since its proof, none of the eight may pay (each would
+    /// leave the others short). The ninth, settled alone, parks too.
+    function test_r18_1_hiddenRefunds_eightItemBoundary() public {
+        IICS26RouterMsgs.Packet[] memory p = _hiddenRefunds(9, 10, 80);
+        assertEq(ctl.reserved(clientId, address(usdc)), 90);
+        T.SettleItem[] memory items = new T.SettleItem[](8);
+        for (uint256 i = 0; i < 8; i++) {
+            items[i] = T.SettleItem(p[i].sequence, 1, 10);
+        }
+        _settle(items);
+        for (uint256 i = 0; i < 8; i++) {
+            assertEq(ctl.sendRecord(clientId, p[i].sequence).refunded, 0);
+        }
+        _settle(_item(p[8].sequence, 1, 10));
+        assertEq(ctl.sendRecord(clientId, p[8].sequence).refunded, 0);
+        assertEq(usdc.balanceOf(ics20.getEscrow(clientId)), 80);
+        assertEq(ctl.reserved(clientId, address(usdc)), 90);
+    }
+
+    /// @notice r18 #1: an outcome its verifier no longer vouches for (the route's verifier migrated) is voided by
+    /// anyone, releasing the reservation its proof had set; a new proof sets it again.
+    function test_r18_1_voidedOutcome_releasesTheReservation() public {
+        IICS26RouterMsgs.Packet[] memory p = _hiddenRefunds(1, 100, 100);
+        assertEq(ctl.reserved(clientId, address(usdc)), 100);
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.voidOutcome(clientId, p[0].sequence); // still vouched for
+        MockLightClient next = new MockLightClient();
+        vm.prank(address(admin));
+        router.migrateClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), address(next));
+        ctl.voidOutcome(clientId, p[0].sequence);
+        assertEq(ctl.reserved(clientId, address(usdc)), 0, "released");
+        _proveRefundable(p[0]);
+        assertEq(ctl.reserved(clientId, address(usdc)), 100, "reserved again");
+    }
 }
