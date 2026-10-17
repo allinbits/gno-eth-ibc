@@ -29,9 +29,9 @@ import { GnoDenoms } from "./GnoDenoms.sol";
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 
 /// @title Deploy IBC v2 on an EVM chain with a GnoLightClient tracking a gno.land chain, and its controls
-/// @notice Deploys AccessManager, ICS26Router and eureka's ICS20Transfer behind ERC1967 proxies (as
-/// solidity-ibc-eureka v3.0.2's E2ETestDeploy), then upgrades the ICS20 proxy to GnoICS20Transfer by its UUPS upgrade
-/// (initializing the fork's controls in the same call), registers it on port "transfer", deploys the GnoLightClient
+/// @notice Deploys AccessManager, ICS26Router and GnoICS20Transfer (as the ICS20 proxy's first implementation: the
+/// deployment is fresh, no packet predates the fork) behind ERC1967 proxies (as solidity-ibc-eureka v3.0.2's
+/// E2ETestDeploy), initializes the fork's controls, registers it on port "transfer", deploys the GnoLightClient
 /// from a trusted gno header and adds it with the gno side as counterparty, registers the ugnot voucher (6 decimals,
 /// GnoVoucher) with its launch limits and the route's quarantine, deploys IBCAdmin (with its executor) on port "ibcgov"
 /// over the same client, and hands it every authority: ADMIN_ROLE to IBCAdmin, the deployer's renounced. Last,
@@ -218,10 +218,12 @@ contract DeployGnoIBC is Script {
         d.ics26Router = address(
             new ERC1967Proxy(address(new ICS26Router()), abi.encodeCall(ICS26Router.initialize, (address(am))))
         );
-        // eureka's ICS20Transfer first, then the fork by the proxy's own UUPS upgrade: the path a deployed proxy takes
+        // a fresh deployment: the fork is the proxy's first implementation (no packet predates it)
+        d.ics20Controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))));
+        d.ics20Implementation = address(new GnoICS20Transfer(d.ics20Controls));
         d.ics20Transfer = address(
             new ERC1967Proxy(
-                address(new ICS20Transfer()),
+                d.ics20Implementation,
                 abi.encodeCall(
                     ICS20Transfer.initialize,
                     (d.ics26Router, address(new Escrow()), address(new IBCERC20()), p.permit2, address(am))
@@ -229,13 +231,9 @@ contract DeployGnoIBC is Script {
             )
         );
         _setRoles(am, d, p.relayer);
-
-        d.ics20Controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))));
-        d.ics20Implementation = address(new GnoICS20Transfer(d.ics20Controls));
         address[6] memory keys =
             [p.guardians[0], p.guardians[1], p.guardians[2], p.guardians[3], p.watch[0], p.watch[1]];
-        UUPSUpgradeable(d.ics20Transfer)
-            .upgradeToAndCall(d.ics20Implementation, abi.encodeCall(IGnoICS20Controls.initializeGno, (keys)));
+        IGnoICS20Controls(d.ics20Transfer).initializeGno(keys);
         ICS26Router(d.ics26Router).addIBCApp(ICS20Lib.DEFAULT_PORT_ID, d.ics20Transfer);
 
         d.gnoLightClient =

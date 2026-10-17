@@ -23,11 +23,11 @@ import { GnoTransferStorage } from "./GnoTransferStorage.sol";
 /// @title The reconciliation functions of GnoICS20Transfer's controls (ADR pr6375 §5.4 kinds 12 and 13, §7.12,
 /// §7.13)
 /// @notice Runs only by delegatecall, from GnoICS20Controls' fallback (itself delegatecalled by the transfer
-/// proxy), in the proxy's storage and under its AccessManager: parked refunds, settlement by decision, reopening,
-/// and the backfill of records for packets sent before the fork was installed.
+/// proxy), in the proxy's storage and under its AccessManager: parked refunds, settlement by decision and
+/// reopening.
 contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, AccessManagedUpgradeable {
     address private immutable _self;
-    /// @notice GnoICS20Evidence: the proofs, backfills and notifications, served by this contract's fallback.
+    /// @notice GnoICS20Evidence: the proofs, views and notifications, served by this contract's fallback.
     address public immutable EVIDENCE;
 
     error NotDelegated();
@@ -166,7 +166,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         private
     {
         SendRecord storage rec = g.records[clientHash][it.sequence];
-        // a record (authenticated: written by the send or backfilled), settled at most once
+        // a record (written by the send), settled at most once
         require(
             rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active
                 && rec.provenGen == gen && GnoTransferStorage.activeClient(clientId) == active

@@ -71,10 +71,10 @@ interface IGnoICS20ControlsTypes {
     }
 
     /// @notice The per-packet send record (§7.13), keyed by (source client id, sequence). Written by every send
-    /// variant after the router returned the sequence (or by `backfill` for a packet sent before the fork, while the
-    /// router still holds its commitment); the ack and timeout callbacks only attach the outcome, the local
-    /// processing block and the payment state, and refuse a packet without a record. `commitment` is the router's
-    /// packet commitment, which binds the full packet (timeout and payload; the packet itself is in the router's
+    /// variant after the router returned the sequence (the deployment is fresh: every packet has one); the ack and
+    /// timeout callbacks only attach the outcome, the local processing block and the payment state, and refuse a packet
+    /// without a record. `commitment` is the router's packet commitment, which binds the full packet (timeout and
+    /// payload; the packet itself is in the router's
     /// SendPacket event and is authenticated against it).
     struct SendRecord {
         bytes32 commitment;
@@ -91,9 +91,6 @@ interface IGnoICS20ControlsTypes {
         Payment payment;
         uint256 amount;
         uint256 refunded;
-        /// Backfilled for a packet sent before the fork was installed (authenticated against the router's
-        /// commitment; `sendBlock` is the backfill's block).
-        bool legacy;
         /// The reconciliation outcome kind 12 applied (0: none; 1 refund, 2 rejected, 3 delivered, 4 forged
         /// refund).
         uint8 settlement;
@@ -134,7 +131,6 @@ interface IGnoICS20ControlsTypes {
     error GnoRouteRecovering(string clientId);
     error GnoRouteClosed(string clientId);
     error GnoNoSendRecord(string clientId, uint64 sequence);
-    error GnoBadBackfill();
     error GnoBadSettlement(uint256 item);
     error GnoNotClosed(string clientId);
     error GnoNoNotification(string clientId, uint64 sequence);
@@ -189,7 +185,6 @@ interface IGnoICS20ControlsTypes {
     event GnoRouteReopened(string routeKey);
     /// @notice Kind 13 accepted a recorded loss not recapitalized as a deficit of the route (ADR §7.9).
     event GnoDeficitAccepted(string routeKey, address indexed token, uint256 amount);
-    event GnoBackfilled(string clientId, uint64 indexed sequence, bytes32 commitment);
     /// @notice A reopening found a prerequisite broken at its last batch (a record opened meanwhile): the route
     /// stays closed, for kind 12 and a new kind 13.
     event GnoReopenAborted(string routeKey);
@@ -271,9 +266,6 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     )
         external
         returns (bool);
-    /// @notice Makes the send record of a packet sent before the fork was installed, while the router still holds
-    /// its commitment (which authenticates the packet). Permissionless.
-    function backfill(IICS26RouterMsgs.Packet calldata packet) external;
 
     /// @notice Permissionless: proves a send record's destination outcome through its route's replacement client
     /// (the route's current client id; the record's client id must be retired). The packet is authenticated against

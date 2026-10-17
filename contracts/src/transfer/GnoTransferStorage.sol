@@ -274,7 +274,7 @@ library GnoTransferStorage {
 
     // ------------------------------------------------------------------------------------------ open records --
 
-    /// @notice A record of client `clientHash` now open (written by a send or a backfill).
+    /// @notice A record of client `clientHash` now open (written by a send).
     function openRecord(IGnoICS20ControlsTypes.SendRecord storage rec, bytes32 clientHash) internal {
         rec.open = true;
         ClientRecon storage c = layout().clients[clientHash];

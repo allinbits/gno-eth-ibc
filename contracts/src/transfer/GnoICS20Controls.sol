@@ -45,7 +45,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         return 1;
     }
 
-    /// @notice Serves the reconciliation functions (claimParked, settleRecords, reopenRoute, backfill) from
+    /// @notice Serves the reconciliation functions (claimParked, settleRecords, reopenRoute, continueReopen) from
     /// GnoICS20Reconcile, in the transfer proxy's storage (EIP-170 keeps them apart).
     // solhint-disable-next-line no-complex-fallback
     fallback() external {
@@ -173,8 +173,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     {
         GnoTransferStorage.Layout storage g = _g();
         SendRecord storage rec = g.records[keccak256(bytes(clientId))][sequence];
-        // a packet sent before the fork is processed only once `backfill` authenticated its record against the
-        // router's commitment, which stays until this callback succeeds
+        // every packet the transfer app sent has a record (the deployment is fresh)
         require(rec.commitment != bytes32(0), GnoNoSendRecord(clientId, sequence));
         // a record reconciliation settled is final: a later ack or timeout pays nothing and notifies nobody (the
         // router's commitment is consumed as usual)
@@ -206,7 +205,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             GnoTransferStorage.notify(refundee, notice, clientId, sequence);
             return;
         }
-        // the record is the send's (or the backfill's, authenticated): it must name this refund
+        // the record is the send's: it must name this refund
         require(
             rec.token == token && rec.sender == refundee && rec.amount == amount, GnoNoSendRecord(clientId, sequence)
         );

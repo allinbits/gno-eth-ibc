@@ -1229,57 +1229,6 @@ contract ReviewRegressionsTest is ControlsFixture {
         }
     }
 
-    /// @notice Round 5 #4: a prerequisite broken during the reopening (a legacy packet backfilled on the retired id
-    /// opens a record) is found again before the route opens: it stays closed, for kind 12 and a new kind 13.
-    function test_r5_4_reopeningRechecksBeforeOpening() public {
-        uint256 n = 17;
-        T.SettleItem[] memory items = new T.SettleItem[](n);
-        for (uint256 i = 0; i < n; i++) {
-            ERC20Mock t = new ERC20Mock();
-            t.mint(alice, 10);
-            vm.prank(alice);
-            t.approve(address(ics20), type(uint256).max);
-            _setLimits(address(t), 100, 100, 100);
-            IICS26RouterMsgs.Packet memory pkt = _send(alice, address(t), 10, clientId);
-            _errorAck(pkt);
-            items[i] = T.SettleItem(pkt.sequence, 4, 10);
-            _retireLater(pkt);
-        }
-        _retire();
-        for (uint256 i = 0; i < n; i++) {
-            _proveDelivered(_later[i]);
-        }
-        _settle(items);
-        vm.prank(address(admin));
-        ctl.reopenRoute("gnoland-9");
-        assertTrue(ctl.routeReopening(clientId));
-        // a packet the router holds without a record (sent before the fork) is backfilled on the retired id
-        IICS20TransferMsgs.FungibleTokenPacketData memory data = IICS20TransferMsgs.FungibleTokenPacketData({
-            denom: Strings.toHexString(address(usdc)),
-            sender: Strings.toHexString(alice),
-            receiver: GNO_SENDER,
-            amount: 5,
-            memo: ""
-        });
-        IICS26RouterMsgs.Payload memory pl = IICS26RouterMsgs.Payload(
-            ICS20Lib.DEFAULT_PORT_ID,
-            ICS20Lib.DEFAULT_PORT_ID,
-            ICS20Lib.ICS20_VERSION,
-            ICS20Lib.ICS20_ENCODING,
-            abi.encode(data)
-        );
-        uint64 timeout = uint64(_now() + 600);
-        vm.prank(address(ics20));
-        uint64 seq = router.sendPacket(IICS26RouterMsgs.MsgSendPacket(clientId, timeout, pl));
-        IICS26RouterMsgs.Payload[] memory pls = new IICS26RouterMsgs.Payload[](1);
-        pls[0] = pl;
-        ctl.backfill(IICS26RouterMsgs.Packet(seq, clientId, CP, timeout, pls));
-        assertEq(ctl.openRecords(clientId), 1);
-        ctl.continueReopen(clientId, 16);
-        assertFalse(ctl.routeReopening(clientId));
-        assertTrue(ctl.routeClosed(clientId), "stays closed");
-    }
-
     /// @notice Round 5 #5: the first refund's token freezes the verifier from its transfer hook; the batch, whose
     /// second outcome was proven by that verifier, rolls back whole. A lone item whose own payment freezes it
     /// rolls back too (checked after the last payment).

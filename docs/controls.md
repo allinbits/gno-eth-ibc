@@ -11,7 +11,7 @@ built, where each rule lives, and where the implementation departs from the ADR.
 | `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); every change is marked `GNO:`. Installed by the ICS20 proxy's own UUPS upgrade. Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
 | `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim`, views, and `ackHook` (the fork's ack/timeout settlement, reachable only through the fork's own call: a consume-once transient flag). Runs only by delegatecall from `GnoICS20Transfer`'s `fallback` (EIP-170 keeps them apart); its address is an immutable of the fork's implementation. |
 | `GnoICS20Reconcile` | `contracts/src/transfer/GnoICS20Reconcile.sol` | Reconciliation: `claimParked`, `settleRecords` (kind 12), `reopenRoute` and `continueReopen` (kind 13). Reached through `GnoICS20Controls`' fallback; its address is an immutable of the controls. |
-| `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `backfill`, `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
+| `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
 | `GnoTransferStorage` | `contracts/src/transfer/GnoTransferStorage.sol` | The fork's ERC-7201 layout (`gno.storage.GnoICS20Transfer`) and the route-key helpers both halves use. |
 | `IBCAdmin` | `contracts/src/admin/IBCAdmin.sol` | Permanent, immutable IBC app on port `ibcgov`: the §5.4 delivery protocol, the decision ledger, flags on itself, execution scheduling, recovery entry points, `finishSetup`. Holds `ADMIN_ROLE`. |
 | `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: every kind at recording and at execution. Delegatecalled at a pinned code hash; replaced only by kind 9. |
@@ -31,8 +31,9 @@ attribution terms extend to works that use those files.
 ## Storage
 
 - **eureka's ICS20Transfer namespace** (`ibc.storage.ICS20Transfer`) is unchanged. `_escrows` and the denom paths
-  of the custom-ERC20 registry are keyed by **route key**, which equals the client id until a route is migrated, so
-  a deployed proxy upgrades in place (`test/controls/UpgradeCompat.t.sol`).
+  of the custom-ERC20 registry are keyed by **route key**, which equals the client id until a route is migrated.
+  The deployment is fresh on both chains: `GnoICS20Transfer` is the ICS20 proxy's first implementation, so no
+  packet predates the controls and every packet has a send record (there is no backfill and no legacy record).
 - **`gno.storage.GnoICS20Transfer`** (`GnoTransferStorage.Layout`): guardian keys (IBCAdmin's copy), `routeOf`
   (client id → route key), `currentOf` (route key → current client id), `retired`, per route: pause flags, refunds
   flags, quarantine seconds and the deadline of transitions already seen, recovery block, `closed`; per (route,
@@ -92,7 +93,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | E6 expected refusals revert with non-empty custom errors (router → error ack) | `IGnoICS20ControlsTypes` errors |
 | E6 send limits for escrowed (Ethereum-native) tokens only (`sendMax`/`sendMin`, 0 = unset); returning vouchers never limited or paused | `_checkEscrowedSend`, skipped when `burned` |
 | E6/§7.13 send record in every send variant after `sendPacket` returns the sequence (`sendTransfer`, `…WithPermit2`, `…WithSender`) | `_recordSend` (all three go through `_sendTransferFromEscrowWithSender`) |
-| §7.13 records hold the router's commitment, not the packet bytes (bytes in `SendPacket`, authenticated against it); a packet sent before the fork is processed only after a permissionless `backfill(packet)` authenticated its record | `_recordSend`; `GnoICS20Controls.backfill`; `_processed` (`GnoNoSendRecord`) |
+| §7.13 records hold the router's commitment, not the packet bytes (bytes in `SendPacket`, authenticated against it); an ack or timeout without a record is refused (`GnoNoSendRecord`; none can exist on a fresh deployment) | `_recordSend`; `GnoICS20Controls.ackHook` |
 | §7.13 ack/timeout attach outcome, local processing block and payment state | `GnoICS20Controls.ackHook` |
 | §7.13 refund meter per (route, token), queue beyond it, permissionless `claim` (installments); the meter is charged before the token moves (given back if the payment fails), and its limits cannot change mid-payment (shared lock; IBCAdmin refuses while busy) | `GnoICS20Controls.ackHook`, `claim` |
 | §7.12 escrow per route and token never falls below the reservation: owed refunds (queued, parked, decided but unpaid) and outstanding escrowed sends (no ack or timeout yet, not settled), whose refund could still be owed. A receive below it is an error ack (`GnoEscrowReserved`); a refund (at once, claim, `claimParked`, kind 12) that would take another record's backing is parked; vouchers reserve nothing | `GnoTransferStorage.reservation/syncReserve/tryPayRefund`; `GnoICS20Transfer.onRecvPacket`, `_recordSend` |
@@ -125,7 +126,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | kind 11 route quarantine setting | `IBCAdminExec.atRecording`/`run`; `GnoICS20Controls.setQuarantine` |
 | §7.12 proven outcomes: anyone proves a send record's destination outcome through the route's replacement client (`proveOutcome`): the packet authenticated against the record's commitment, gno.land's receipt recomputed (R19: `sha256(0x03 ‖ uint64be(sequence) ‖ sha256(sourceClient) ‖ packet commitment)`, the gno-realms vectors) and compared with the proven one, the ack commitment proven with it; delivered (its receipt, a success ack), refundable (an error ack, or no receipt once the proven time reaches the packet's timeout), or a collision (another receipt at the sequence); final once proven; the replacement client must be active (the route's current client, neither frozen nor expired) when the outcome is proven and when kind 12 uses it: the outcome stores its verifier and the route's verifier generation, and one whose verifier has since frozen, expired or been replaced, or whose route was re-pointed since (even back to the same client), is void (kind 12 refuses it, all or nothing, and a new proof through the active client may replace it); kind 12 checks the verifier again for every outcome it consumes and after its last payment, so a token hook that freezes or swaps it mid-batch rolls the batch back. GnoLightClient has no path that unfreezes it or restores trust in earlier roots | `GnoICS20Reconcile.proveOutcome`, `gnoReceipt`, `_activeClient` |
 | kind 12 settle: per send record of a retired client id, at most once, all or nothing, with a fixed 6M gas budget and at most eight records (more is spent at recording), each action matching the proven outcome (else the decision is spent): 1 a genuine refund (refundable or collision), `amount` equal to its whole remainder (parked if refused), zero for a refund already paid in full (which only settles the record), 2 reject a queued refund, 3 settled as delivered (2 and 3 delivered, refused once any of the refund was paid), 4 forged refund (delivered: reject the unpaid remainder, book what was paid as the loss); 5 a forged receive at an inbound sequence of the retired client, booked as a loss once for exactly the amount the receive recorded; an ack or timeout of a settled record pays nothing and notifies nobody | `IBCAdminExec.run`; `GnoICS20Reconcile.settleRecords`; `GnoICS20Controls.ackHook` |
-| kind 13 reopen a closed route only when none of its send records is open (an O(1) count: opened by a send or backfill, closed by a success ack, a refund paid in full or a settlement); and none of its suspected-interval records is unsettled; every loss not recapitalized becomes an accepted deficit (`GnoDeficitAccepted`, `acceptedDeficit`), 16 tokens in kind 13 and the rest in bounded batches by a permissionless `continueReopen` (the route stays closed, `routeReopening`, until the last); reconciliation is sealed while the route reopens (kind 12 refused, `GnoRouteReopening`), and the last batch checks the prerequisites again before the route opens (a record opened meanwhile keeps it closed, `GnoReopenAborted`); a closed route refuses receives, sends and claims | `GnoICS20Reconcile.reopenRoute`, `continueReopen`; `GnoTransferStorage.openRecord/closeRecord`; `_checkReceiveRoute`, `_sendTransferFromEscrowWithSender`, `_openRoute` |
+| kind 13 reopen a closed route only when none of its send records is open (an O(1) count: opened by a send, closed by a success ack, a refund paid in full or a settlement); and none of its suspected-interval records is unsettled; every loss not recapitalized becomes an accepted deficit (`GnoDeficitAccepted`, `acceptedDeficit`), 16 tokens in kind 13 and the rest in bounded batches by a permissionless `continueReopen` (the route stays closed, `routeReopening`, until the last); reconciliation is sealed while the route reopens (kind 12 refused, `GnoRouteReopening`), and the last batch checks the prerequisites again before the route opens (a record opened meanwhile keeps it closed, `GnoReopenAborted`); a closed route refuses receives, sends and claims | `GnoICS20Reconcile.reopenRoute`, `continueReopen`; `GnoTransferStorage.openRecord/closeRecord`; `_checkReceiveRoute`, `_sendTransferFromEscrowWithSender`, `_openRoute` |
 | E12 route keys, constant-work migration, wire translation | `GnoTransferStorage.routeKey/toRouteDenom/toWireDenom`; `migrateRoute` |
 | §7.12 emergency recovery, off unless enabled at deployment; approval ≥ 3 of 4 guardians, cancellation ≥ 2 of 4; eligibility; an attested client of gno.land's chain id, neither frozen nor expired at approval and at execution; long delay; suspends kinds 3, 6–10 at recording and at execution; blocks receives while open; the route stays closed after it | `IBCAdmin` constructor, `approveRecovery/cancelRecovery/executeRecovery`; `IBCAdminRecovery` |
 | E4/E11 hand-over of every authority, deployer roles removed, check list read back | `script/DeployGnoIBC.s.sol`; `IBCAdmin.finishSetup`; `IBCAdminSetupCheck` |
@@ -135,14 +136,14 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 
 This is the specification the controls implement for route closure, reconciliation (kind 12) and reopening
 (kind 13), across any number of incidents. `GnoTransferStorage` holds the state; `GnoICS20Controls.migrateRoute`,
-`ackHook`, `GnoICS20Reconcile.settleRecords`, `reopenRoute`, `continueReopen` and `GnoICS20Evidence.backfill` are
+`ackHook`, `GnoICS20Reconcile.settleRecords`, `reopenRoute` and `continueReopen` are
 the transitions.
 
 ### State
 
 - **Client generation.** Every client id a route has had is one generation: the route's current (live) client, or
   a retired one. Per client id: the list of the blocks at which its acks and timeouts were processed (append-only,
-  in order; a send record keeps its index in it), its **open-record count** (records opened by a send or backfill
+  in order; a send record keeps its index in it), its **open-record count** (records opened by a send
   and not yet closed by a success ack, a refund paid in full or a settlement), and, once retired, the **incident**
   covering it, the first suspect index `suspectStart` and its **suspect count**.
 - **Incident.** A closure of the route: `{kind, status, client, suspectFrom}`.
@@ -183,9 +184,8 @@ bounds (constant work whatever the number of incidents).
 | delivery or drain of a governance decision | the transfer app not busy (a delivery from inside a hook reverts `Busy`, an error ack ibcgov re-sends; `drain()` records nothing) | the decision recorded; one acting at recording (kind 4 or 11 tightening) applies |
 | kind 12 on a retired client's records | its incident not *reopening*; the outcome proven by the active verifier | the record settled once; its client's open and suspect counts follow |
 | kind 12 booking a loss | the route not reopening | the loss recorded; if the route was open, a *late-loss* incident opens and the route closes |
-| backfill | the router still holds the packet | a record opened for its client |
 | kind 13 | the route closed and not reopening; `pendingIncidents` zero (every replacement's client with no open and no suspect record; a late loss needs none) | `reopenUpTo` moves to the end: unresolved incidents become *reopening*; deficits accepted in batches (`continueReopen`) |
-| last deficit batch | — | `pendingIncidents` checked again: zero → `resolvedUpTo` moves to `reopenUpTo` (*resolved*), the route opens; otherwise the reopening aborts (`reopenUpTo` back: incidents *open*, the route stays closed) |
+| last deficit batch | — | `pendingIncidents` checked again (defensive: with the reopening incidents sealed, their clients frozen and no backfill, no record can open meanwhile): zero → `resolvedUpTo` moves to `reopenUpTo` (*resolved*), the route opens; otherwise the reopening aborts (`reopenUpTo` back: incidents *open*, the route stays closed) |
 
 Each client id is retired once, so its suspect range never overlaps another incident's and a record reconciled by
 one incident is never counted by another; nothing is counted on the live client.
@@ -218,7 +218,7 @@ refused, or anything reverting inside it (its own gas included) **spends** the d
 ## Divergences from the ADR
 
 The amended ADR (2026-10-16) now specifies the port `ibcgov`, the 1024-byte envelope, custom client ids, the ack of
-a cancel beyond the window, commitment-only send records with `backfill`, and kinds 12 and 13. What remains:
+a cancel beyond the window, commitment-only send records, and kinds 12 and 13. What remains:
 
 1. **The router has no freeze**: the old client id of a route replacement is `migrateClient`ed to
    `FrozenLightClient`, which proves nothing.
@@ -239,8 +239,7 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
    selector (never an upgrade-setting one). Beacons are checked exactly, the ones not named included.
 9. **Kind 12 pays refunds outside the refund meter** (a governed decision) and only for records of a retired client
    id.
-10. **No recapitalization decision exists yet** on Ethereum: kind 13 accepts every recorded loss as a deficit. A
-    packet sent before the fork that was never backfilled is not counted among a route's open records.
+10. **No recapitalization decision exists yet** on Ethereum: kind 13 accepts every recorded loss as a deficit.
 11. **Incidents per client generation**: each route closure is an incident (the reconciliation state machine above);
     a replacement may follow another before its reconciliation completes, and each suspect range is its retired
     client's own processed list, so it never overlaps another incident's. A `suspectFrom` in the future counts
@@ -263,25 +262,18 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
 18. **Kind 7 on the transfer proxy checks the fork's modules**: its controls and reconciliation modules must be code
     answering its controls version, and all three answer through the proxy after the upgrade.
 
-## Upgrade runbook (installing the fork on a live ICS20 proxy)
+## Deployment
 
-1. Stop relaying acknowledgements and timeouts to Ethereum.
-2. Execute the upgrade: `upgradeToAndCall(fork, initializeGno(keys))` before the hand-over. On a governed deployment
-   kind 7 carries no migration call, so an upgrade that needs one first takes a kind 9 hand-over to an executor
-   whose allow-list admits it.
-3. For every packet the router still holds a commitment for (`SendPacket` events without a matching ack or
-   timeout), call `backfill(packet)` with the event's packet bytes; anyone may. A callback for a packet without a
-   record reverts (`GnoNoSendRecord`) and leaves the commitment in place, so nothing is lost if one is missed: backfill
-   it and relay again.
-4. Set limits (kind 4) for every token with outstanding packets, or their refunds queue with no budget.
-5. Resume relaying.
+`DeployGnoIBC` deploys the fork as the ICS20 proxy's first implementation and initializes its controls
+(`initializeGno`) before the hand-over: there is no upgrade from eureka's stock ICS20Transfer and no legacy packet.
+A later upgrade of the transfer app is kind 7, which installs only code that keeps the controls (the controls
+version probe on the fork and its three modules, before and after the upgrade); its migration call is empty unless
+a kind 9 hand-over installed an executor whose allow-list admits it.
 
 ## Open issues
 
 - **A newly added client starts unquarantined.** A client installed by kind 6, kind 10 or the emergency recovery
   has no transition until its first one. Marking construction as a transition would also quarantine the launch client.
-- **Unbackfilled legacy packets.** The open-record count only knows recorded packets; the upgrade runbook
-  backfills every outstanding one before relaying resumes.
 - **Expensive tokens are parked.** A refund paid by an ack, a claim or kind 12 gives the token 200,000 gas per call;
   a token needing more (for its transfer or its `balanceOf`, which gets 30,000) is parked, and `claimParked` pays it
   with a gas budget its caller chooses (at least the automatic one, for the balance read and each call). A caller
@@ -295,13 +287,13 @@ a cancel beyond the window, commitment-only send records with `backfill`, and ki
 ## Tests
 
 `contracts/test/controls/` drives the real `ICS26Router` (mock light client) through the full deployment of
-`DeployGnoIBC`: `GnoICS20Transfer.t.sol`, `UpgradeCompat.t.sol`, `IBCAdminDelivery.t.sol`, `IBCAdminKinds.t.sol`,
+`DeployGnoIBC`: `GnoICS20Transfer.t.sol`, `IBCAdminDelivery.t.sol`, `IBCAdminKinds.t.sol`,
 `IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (the eight
 review rounds' regressions, `test_r…` to `test_r8_…`), `ReconcileInvariants.t.sol` (invariant tests of the
 reconciliation state machine against a ghost entitlement model: every packet's truth chosen when sent, relays honest
 or forged against it, honest proofs, governance through IBCAdmin.execute; replacements also while closed or
 reopening, emergency recovery, verifier freeze, expiry and migration, kind 12 batches, kind 13 and its continuation
-over seventeen loss tokens, backfill and the abort after it, busy delivery and drain, contract senders and their
+over seventeen loss tokens, busy delivery and drain, contract senders and their
 notification retries, refunds flags, claims; every required transition covered in each run; 24 runs of depth 40 in
 the suite). Its invariants assume governance reconciles completely before kind 13, as §7.12 asks: the controls
 themselves enforce the suspected interval and the open records, not the identification of every forged payout. Also `ProvenOutcomes.t.sol` (a strict

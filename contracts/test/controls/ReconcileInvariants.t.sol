@@ -734,55 +734,6 @@ contract ReconcileHandler is Test {
         if (_replace(true) && !ctl.routeReopening(_live())) ok["replaceDuringReopening"]++;
     }
 
-    /// @notice A packet sent before the fork (the router holds it, no record) backfilled on a retired id during a
-    /// reopening: the last batch finds it open and aborts the reopening.
-    function backfillDuringReopening(uint256 amount) external {
-        calls++;
-        if (!_startLongReopening()) return;
-        amount = bound(amount, 1, 10);
-        string memory retired = clients[clients.length - 2];
-        IICS26RouterMsgs.Payload memory pl = IICS26RouterMsgs.Payload(
-            ICS20Lib.DEFAULT_PORT_ID,
-            ICS20Lib.DEFAULT_PORT_ID,
-            ICS20Lib.ICS20_VERSION,
-            ICS20Lib.ICS20_ENCODING,
-            abi.encode(
-                IICS20TransferMsgs.FungibleTokenPacketData({
-                    denom: Strings.toHexString(tokens[0]),
-                    sender: Strings.toHexString(alice),
-                    receiver: "g1receiver",
-                    amount: amount,
-                    memo: ""
-                })
-            )
-        );
-        uint64 timeout = uint64(_now() + 600);
-        uint64 seq;
-        // a send made before the fork: its tokens are in the route's escrow, the router holds its commitment
-        ERC20Mock(tokens[0]).mint(ics20.getEscrow(clients[0]), amount);
-        vm.prank(address(ics20));
-        try router.sendPacket(IICS26RouterMsgs.MsgSendPacket(retired, timeout, pl)) returns (uint64 s) {
-            seq = s;
-        } catch {
-            return;
-        }
-        IICS26RouterMsgs.Payload[] memory pls = new IICS26RouterMsgs.Payload[](1);
-        pls[0] = pl;
-        IICS26RouterMsgs.Packet memory pkt =
-            IICS26RouterMsgs.Packet(seq, retired, router.getCounterparty(retired).clientId, timeout, pls);
-        try ctl.backfill(pkt) {
-            packets.push(pkt);
-            ghost[packets.length - 1] = Ghost(false, false, false, true, alice); // never received: refundable
-            ok["backfill"]++;
-        } catch {
-            return;
-        }
-        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
-            try ctl.continueReopen(_live(), 16) { } catch { }
-        }
-        if (!ctl.routeReopening(_live()) && ctl.routeClosed(_live())) ok["abortAfterBackfill"]++;
-    }
-
     /// @notice A loss found after the route reopened: kind 12 on a remaining record of a resolved incident (or a
     /// forged receive) closes the route again; a new kind 13 accepts it.
     function lateLoss(uint256 how) external {
@@ -874,7 +825,6 @@ contract ReconcileHandler is Test {
         if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) _reopen();
         if (ok["busyGovernance"] == 0 && !ctl.routeClosed(_live())) this.busyGovernance(3);
         if (ok["replaceDuringReopening"] == 0) this.replaceDuringReopening();
-        if (ok["abortAfterBackfill"] == 0) this.backfillDuringReopening(5);
         // the aborted reopening reconciled and reopened again: its deficits need the continuation
         if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
             _reconcile(0, true);
@@ -1021,7 +971,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[28] memory names = [
+        string[26] memory names = [
             "send",
             "sendFromAdapter",
             "relayHonest",
@@ -1046,8 +996,6 @@ contract ReconcileInvariantsTest is ControlsFixture {
             "reopen",
             "continueReopen",
             "replaceDuringReopening",
-            "backfill",
-            "abortAfterBackfill",
             "lateLoss",
             "transportRound"
         ];
@@ -1056,13 +1004,11 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[13] memory required = [
+        string[11] memory required = [
             "reconcile",
             "reopen",
             "continueReopen",
             "replaceDuringReopening",
-            "backfill",
-            "abortAfterBackfill",
             "lateLoss",
             "transportRound",
             "relayHonest",

@@ -22,8 +22,8 @@ import { GnoTransferStorage } from "./GnoTransferStorage.sol";
 
 /// @title The evidence functions of GnoICS20Transfer's controls (ADR pr6375 §7.12, §7.13)
 /// @notice Runs only by delegatecall, from GnoICS20Reconcile's fallback (itself reached through the controls), in the
-/// transfer proxy's storage and under its AccessManager: backfilled records, proven destination outcomes, receive
-/// records and sender notifications.
+/// transfer proxy's storage and under its AccessManager: proven destination outcomes, receive records, incident
+/// views and sender notifications.
 contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, AccessManagedUpgradeable {
     address private immutable _self;
 
@@ -45,47 +45,6 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     function _g() private pure returns (GnoTransferStorage.Layout storage) {
         return GnoTransferStorage.layout();
-    }
-
-    /// @notice See IGnoICS20Controls.
-    function backfill(IICS26RouterMsgs.Packet calldata packet) external delegated nonReentrant {
-        require(
-            packet.payloads.length == 1
-                && keccak256(bytes(packet.payloads[0].sourcePort)) == ICS20Lib.KECCAK256_DEFAULT_PORT_ID,
-            GnoBadBackfill()
-        );
-        bytes32 commitment = ICS24Host.packetCommitmentBytes32(packet);
-        address router = GnoTransferStorage.ics20Router();
-        require(
-            IIBCStore(router).getCommitment(ICS24Host.packetCommitmentKeyCalldata(packet.sourceClient, packet.sequence))
-                == commitment,
-            GnoBadBackfill()
-        );
-        SendRecord storage rec = _g().records[keccak256(bytes(packet.sourceClient))][packet.sequence];
-        require(rec.commitment == bytes32(0), GnoBadBackfill());
-        IICS20TransferMsgs.FungibleTokenPacketData memory data =
-            abi.decode(packet.payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
-        // the refund target, derived as the refund path derives it
-        bool burned = ICS20Lib.hasPrefix(
-            bytes(data.denom), abi.encodePacked(ICS20Lib.DEFAULT_PORT_ID, "/", packet.sourceClient, "/")
-        );
-        address token = GnoTransferStorage.ics20Registered(string(GnoTransferStorage.toRouteDenom(bytes(data.denom))));
-        if (token == address(0)) {
-            require(!burned, GnoBadBackfill());
-            token = ICS20Lib.mustHexStringToAddress(data.denom);
-        }
-        rec.commitment = commitment;
-        rec.sender = ICS20Lib.mustHexStringToAddress(data.sender);
-        rec.token = token;
-        rec.escrow = GnoTransferStorage.ics20Escrow(GnoTransferStorage.routeKey(packet.sourceClient));
-        rec.timeoutTimestamp = packet.timeoutTimestamp;
-        rec.sendBlock = uint64(block.number);
-        rec.burned = burned;
-        rec.amount = data.amount;
-        rec.legacy = true;
-        GnoTransferStorage.openRecord(rec, keccak256(bytes(packet.sourceClient)));
-        GnoTransferStorage.syncReserve(GnoTransferStorage.routeHash(packet.sourceClient), rec, 0);
-        emit GnoBackfilled(packet.sourceClient, packet.sequence, commitment);
     }
 
     /// @notice See IGnoICS20Controls.
