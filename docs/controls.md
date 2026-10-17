@@ -306,6 +306,26 @@ as soon as it is recorded, within its seven-day delay. A failure is the signal t
 chain, a hand-over to an executor behind a proxy would pass, since its bindings answer through the proxy and its hash
 is the one governance pinned; only this step refuses it (`test_r11_3_pendingProxyBackedExecutor_refused`).
 
+### Calls to candidate code before installation
+
+Every call to candidate code before it is installed is a STATICCALL, so a probe cannot write state or act with the
+caller's authority (`CandidateStatic.t.sol`: a candidate whose every answer first writes is refused, and its writes
+never happen):
+
+| Candidate | Call | Type |
+|---|---|---|
+| kind 6 verifier (add or migrate) | `IBCAdminChecks.usableClient` (a view, from the executor) → `getClientState`, `isFrozen`, `isExpired`, `lastTransition` | STATICCALL |
+| recovery proposal's client | `IBCAdminRecovery._usableClient` → `IBCAdminChecks.usableClient` (as above) | STATICCALL |
+| kind 9 executor | `bindings()` | STATICCALL |
+| kind 7 implementation of the transfer app | `IBCAdminChecks.modulesVersion` → `CONTROLS()`, `RECONCILE()`, `EVIDENCE()`, `gnoControlsVersion()` on the implementation and its modules | STATICCALL |
+| kind 7, any UUPS proxy | OpenZeppelin's `proxiableUUID()` (`view` in `IERC1822Proxiable`), during the upgrade itself | STATICCALL |
+| every candidate | `extcodehash`, `extcodesize` | no call |
+
+Code is run with authority only as installation, after the decision's pin matched: a kind 7 migration call (refused
+unless the executor's allow-list names it), a kind 9 migration call (delegatecalled in the new executor), and the
+router's or a beacon's switch to the new implementation. The router's `addClient` and `migrateClient` store the
+client and call nothing.
+
 ## Deployment
 
 `DeployGnoIBC` deploys the fork as the ICS20 proxy's first implementation and initializes its controls
