@@ -262,8 +262,14 @@ bounds (constant work whatever the number of incidents).
    success ack released, whose backing the compromise consumed. That allowance belongs to those very refunds and
    only while they are unpaid. Every other record's reservation is backed in full at all times, so a payment of one
    refund never takes another's backing, and no receive or payment ever increases the shortfall.
-   The invariant campaign checks this from its own ghost. It holds a success when the ghost prepared its incident,
-   processed it while retired or proved it owed, and releases it only at settlement. It asserts that no kind 12
+   The invariant campaign checks this from its own ghost. The ghost keeps its own processed list per client and its
+   own preparation cursor, so every partial batch's holds are expected as they happen (and the records left are
+   checked against the cursor). It holds a success when a batch visited it, when it was processed while retired, or
+   when the ghost proved it owed, and releases it only at settlement. Expected reservations come from the ghost's
+   transport history and governance's settlements, never from the record's outcome or payment state. The record's
+   outcome must agree with that history: pending exactly when never processed, a success exactly when the relay was
+   one. A corruption probe that sets an outstanding record to `Success` and drops its reservation fails at once
+   (`test_r21_2_outcomeCorruption_failsAtOnce`). It asserts that no kind 12
    refund is paid before every incident of the route is prepared. It marks a held success eligible for the
    shortfall allowance when it becomes held, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
    every step, never raised but by a new hold). It asserts that the escrow covers every reservation but the eligible
