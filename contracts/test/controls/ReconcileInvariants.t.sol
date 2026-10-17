@@ -103,6 +103,14 @@ contract ReconcileHandler is Test {
     GnoVoucher public ugnot;
     uint256 public ugnotSupply0;
 
+    // invariant 7: the losses when the current reopening started (they never change while it runs)
+    mapping(address => uint256) public lossSnapshot;
+    string public snapshotClient; // the route whose reopening the snapshot belongs to
+    uint256 internal nonce;
+    uint256 internal heldBack; // 1 + the index of a forged receive governance leaves out of its reconciliation //
+    // unique client ids for the split steps and the recovery attempts
+    uint64[] internal pending; // decisions recorded by the split actions, executed by executePending
+
     string[] public clients; // every client id of the route, in order; the last is the live one
     uint256 public calls;
     mapping(string => uint256) public ok;
@@ -151,6 +159,18 @@ contract ReconcileHandler is Test {
     function setVoucher(GnoVoucher v) external {
         ugnot = v;
         ugnotSupply0 = v.totalSupply();
+        vm.prank(bob);
+        v.approve(address(ics20), type(uint256).max);
+    }
+
+    /// @notice After a kind 13: the losses at the start of the reopening (invariant 7 compares them while it runs).
+    function _snapshotIfReopening() internal {
+        if (!ctl.routeReopening(_live())) return;
+        for (uint256 t = 0; t < tokens.length; t++) {
+            lossSnapshot[tokens[t]] = ctl.losses(_live(), tokens[t]);
+        }
+        lossSnapshot[address(ugnot)] = ctl.losses(_live(), address(ugnot));
+        snapshotClient = _live();
     }
 
     function packetCount() external view returns (uint256) {
@@ -175,6 +195,10 @@ contract ReconcileHandler is Test {
 
     function tokenCount() external view returns (uint256) {
         return tokens.length;
+    }
+
+    function liveClientId() external view returns (string memory) {
+        return _live();
     }
 
     function _live() internal view returns (string memory) {
@@ -791,7 +815,7 @@ contract ReconcileHandler is Test {
             for (uint256 j = 0; all && j < receives.length; j++) {
                 Receive memory r = receives[j];
                 if (!r.forged || keccak256(bytes(r.client)) != keccak256(bytes(c))) continue;
-                if (ctl.lossBooked(c, r.sequence, 2)) continue;
+                if (ctl.lossBooked(c, r.sequence, 2) || (heldBack == j + 1)) continue;
                 items[n++] = T.SettleItem(r.sequence, 5, r.amount);
                 if (n == 8) {
                     done = _settleBatch(c, items, n) && done;
@@ -832,6 +856,7 @@ contract ReconcileHandler is Test {
     function _reopenOnly() internal returns (bool) {
         if (!_executeAll(_one(_decide(S.KIND_REOPEN, P.reopen(_live()))))) return false;
         ok["reopen"]++;
+        _snapshotIfReopening();
         for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
             try ctl.continueReopen(_live(), 16) {
                 ok["continueReopen"]++;
@@ -882,6 +907,7 @@ contract ReconcileHandler is Test {
         if (!_reconcile(0, true)) return false;
         if (!_executeAll(_one(_decide(S.KIND_REOPEN, P.reopen(_live()))))) return false;
         ok["reopen"]++;
+        _snapshotIfReopening();
         return ctl.routeReopening(_live());
     }
 
@@ -1062,10 +1088,351 @@ contract ReconcileHandler is Test {
         _reopen();
     }
 
+    // ------------------------------------------------------------------------------ split governance steps --
+
+    /// @notice Records a replacement (kind 6 adding a client, kind 10) without executing it.
+    function startReplacement(bool fromZero) external {
+        calls++;
+        if (clients.length >= 40) return;
+        string memory next = string.concat("gnoland-s", vm.toString(++nonce));
+        MockLightClient fresh = new MockLightClient();
+        uint64 a = _decide(
+            S.KIND_CLIENT,
+            P.client(
+                1,
+                next,
+                string.concat("ethereum-s", vm.toString(nonce)),
+                _prefix(),
+                address(fresh),
+                address(fresh).codehash
+            )
+        );
+        uint64 b = _decide(S.KIND_ROUTE, P.route(_live(), next, fromZero ? 0 : uint64(vm.getBlockNumber())));
+        if (a == 0 || b == 0) return;
+        pending.push(a);
+        pending.push(b);
+        replacing[b] = next;
+        ok["startReplacement"]++;
+    }
+
+    mapping(uint64 => string) internal replacing;
+
+    /// @notice Records a kind 12 for a retired record (the action its truth calls for), without executing it.
+    function decideSettle(uint256 i) external {
+        calls++;
+        if (packets.length == 0) return;
+        i = i % packets.length;
+        if (!ctl.isRetired(packets[i].sourceClient)) return;
+        T.SettleItem memory it = _action(i);
+        uint64 s = _decide(S.KIND_SETTLE, P.settle1(packets[i].sourceClient, it.sequence, it.action, it.amount));
+        if (s == 0) return;
+        pending.push(s);
+        ok["decideSettle"]++;
+    }
+
+    /// @notice Records a kind 13 without executing it.
+    function startReopen() external {
+        calls++;
+        uint64 s = _decide(S.KIND_REOPEN, P.reopen(_live()));
+        if (s == 0) return;
+        pending.push(s);
+        ok["startReopen"]++;
+    }
+
+    /// @notice Proves a retired record's outcome through the live client, whatever its health.
+    function proveOne(uint256 i, uint256 how) external {
+        calls++;
+        if (packets.length == 0) return;
+        i = i % packets.length;
+        if (!ctl.isRetired(packets[i].sourceClient)) return;
+        T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
+        if (rec.settlement != 0) return;
+        if (_prove(i, how % 3)) ok["proveOne"]++;
+    }
+
+    /// @notice Matures and executes the recorded decisions, in order (a decision of another epoch is gone).
+    function executePending() external {
+        calls++;
+        if (pending.length == 0) return;
+        _skip(7 days + 1);
+        uint32 ep = admin.epoch();
+        uint256 n;
+        for (uint256 k = 0; k < pending.length; k++) {
+            uint64 s = pending[k];
+            if (admin.decision(ep, s).state != S.PENDING) continue;
+            string memory live = _live();
+            try admin.execute(s) { } catch { }
+            if (admin.decision(ep, s).state == S.EXECUTED) {
+                n++;
+                if (bytes(replacing[s]).length != 0 && ctl.isRetired(live)) clients.push(replacing[s]);
+            }
+        }
+        delete pending;
+        _snapshotIfReopening();
+        if (n != 0) ok["executePending"]++;
+    }
+
+    // ---------------------------------------------------------------------------------- more adversaries --
+
+    /// @notice bob returns vouchers to gno.land (a burn); its outcome is relayed honestly or forged later.
+    function sendVoucher(uint256 amount, bool delivered) external {
+        calls++;
+        uint256 bal = ugnot.balanceOf(bob);
+        if (bal == 0) return;
+        if (_send(bob, address(ugnot), (amount % bal) + 1, delivered)) ok["sendVoucher"]++;
+    }
+
+    /// @notice A contract sender refuses its refund notification: the refund stands, the notification is kept.
+    function adapterRefuses(uint256 amount) external {
+        calls++;
+        if (ctl.routeClosed(_live())) return;
+        amount = amount % 50 + 1;
+        ERC20Mock(tokens[0]).mint(address(adapter), amount);
+        mintedToSenders[tokens[0]] += amount;
+        _limits(tokens[0]);
+        try ctl.claim(_live(), tokens[0], 20) { } catch { }
+        vm.recordLogs();
+        try adapter.send(amount, _live()) { }
+        catch {
+            return;
+        }
+        if (!_record(false, address(adapter), tokens[0], amount)) return;
+        uint256 i = packets.length - 1;
+        adapter.setRefuse(true);
+        vm.recordLogs();
+        try router.ackPacket(
+            IICS26RouterMsgs.MsgAckPacket(packets[i], ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1))
+        ) {
+            ghost[i].relayed = true;
+        } catch {
+            adapter.setRefuse(false);
+            return;
+        }
+        adapter.setRefuse(false);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 k = 0; k < logs.length; k++) {
+            if (
+                logs[k].topics[0] == T.GnoSenderNotified.selector
+                    && logs[k].topics[1] == bytes32(uint256(packets[i].sequence))
+            ) {
+                (, bool delivered) = abi.decode(logs[k].data, (string, bool));
+                T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
+                if (!delivered && rec.refunded == amount) ok["adapterRefused"]++;
+            }
+        }
+    }
+
+    /// @notice Settlement against an expired verifier, and against a proof a verifier migration (a new
+    /// generation) made stale: both spent, the record unchanged.
+    function staleSettlements(uint256 seed) public {
+        calls++;
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        if (!_send(alice, tokens[0], 10, false)) return;
+        uint256 i = packets.length - 1;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        if (!_replace(true)) return;
+        string memory c = pkt.sourceClient;
+        if (!_prove(i, seed)) return;
+        _liveClient().setStatus(false, true); // expired after the proof
+        uint64 s1 = _decide(S.KIND_SETTLE, P.settle1(c, pkt.sequence, 1, 10));
+        _executeAll(_one(s1));
+        if (
+            s1 != 0 && admin.decision(admin.epoch(), s1).state == S.SPENT
+                && ctl.sendRecord(c, pkt.sequence).settlement == 0
+        ) {
+            ok["settleExpiredRefused"]++;
+        }
+        _liveClient().setStatus(false, false);
+        // a kind 6 migration of the live client to another verifier: a new generation, the proof stale
+        MockLightClient fresh = new MockLightClient();
+        string memory live = _live();
+        uint64 m = _decide(
+            S.KIND_CLIENT,
+            P.client(2, live, router.getCounterparty(live).clientId, _prefix(), address(fresh), address(fresh).codehash)
+        );
+        if (!_executeAll(_one(m))) return;
+        uint64 s2 = _decide(S.KIND_SETTLE, P.settle1(c, pkt.sequence, 1, 10));
+        _executeAll(_one(s2));
+        if (
+            s2 != 0 && admin.decision(admin.epoch(), s2).state == S.SPENT
+                && ctl.sendRecord(c, pkt.sequence).settlement == 0
+        ) {
+            ok["settleStaleGenRefused"]++;
+        }
+        _reopen();
+    }
+
+    /// @notice A loss booked between deficit batches is refused (the reopening seals the losses, invariant 7): a
+    /// forged receive governance left out of its reconciliation, booked by kind 12 action 5 while the deficit
+    /// batches run, is spent with every loss unchanged; booked after the route opened, it is a late loss.
+    function lossDuringReopening(uint256 amount) external {
+        calls++;
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        // a delivered send first: the escrow then holds what the forged receive releases
+        if (!_send(alice, tokens[0], 60, true)) return;
+        this.relay(packets.length - 1, false, false); // its success ack releases the reservation
+        uint256 before = receives.length;
+        this.receive_(0, amount % 50 + 1, true);
+        if (receives.length == before) return;
+        Receive memory r = receives[before];
+        heldBack = before + 1;
+        bool started = _startLongReopening();
+        heldBack = 0;
+        if (!started || !ctl.isRetired(r.client)) return;
+        uint256 l = ctl.losses(_live(), r.token);
+        uint64 s = _decide(S.KIND_SETTLE, P.settle1(r.client, r.sequence, 5, r.amount));
+        _executeAll(_one(s));
+        if (
+            s != 0 && admin.decision(admin.epoch(), s).state == S.SPENT && ctl.losses(_live(), r.token) == l
+                && !ctl.lossBooked(r.client, r.sequence, 2) && ctl.routeReopening(_live())
+        ) ok["lossDuringReopeningRefused"]++;
+        // the reopening finishes; the left-out receive is then booked as a late loss and accepted again
+        _ensureOpen();
+        if (_reconcile(0, true) && ctl.routeClosed(_live())) _reopen();
+    }
+
+    /// @notice Authority changes between an emergency recovery's approval and its execution are suspended.
+    function recoverWithAuthorityAttempts() external {
+        calls++;
+        if (clients.length >= 40) return;
+        _ensureOpen();
+        string memory next = string.concat("gnoland-r", vm.toString(++nonce));
+        MockLightClient fresh = new MockLightClient();
+        // decisions recorded before the recovery opens
+        MockLightClient other = new MockLightClient();
+        uint64 add = _decide(
+            S.KIND_CLIENT,
+            P.client(
+                1,
+                string.concat(next, "x"),
+                string.concat("ethereum-x", vm.toString(nonce)),
+                _prefix(),
+                address(other),
+                address(other).codehash
+            )
+        );
+        _liveClient().setStatus(true, false);
+        IIBCAdmin.RecoveryProposal memory p = IIBCAdmin.RecoveryProposal({
+            newClientId: next,
+            counterpartyClientId: string.concat("ethereum-r", vm.toString(nonce)),
+            merklePrefix: _prefix(),
+            lightClient: address(fresh),
+            codeHash: address(fresh).codehash,
+            suspectFrom: 0
+        });
+        for (uint256 g = 0; g < 3; g++) {
+            vm.prank(G[g]);
+            try admin.approveRecovery(p) { }
+            catch {
+                _liveClient().setStatus(false, false);
+                return;
+            }
+        }
+        _skip(7 days + 1);
+        bool suspended;
+        if (add != 0) {
+            try admin.execute(add) { }
+            catch (bytes memory r) {
+                suspended = r.length >= 4 && bytes4(r) == IIBCAdmin.Suspended.selector;
+            }
+        }
+        _skip(30 days);
+        try admin.executeRecovery() {
+            clients.push(next);
+            ok["recover"]++;
+            if (suspended) ok["authoritySuspended"]++;
+        } catch { }
+    }
+
+    /// @notice The defensive re-check at the last deficit batch, driven by fault injection (test only): the
+    /// pending-incident count raised between batches makes the last batch abort the reopening instead of opening
+    /// the route; restored, the route reopens.
+    function faultInjectedAbort() external {
+        calls++;
+        if (!_startLongReopening()) return;
+        (bytes32 slot, uint256 shift) = _pendingSlot();
+        if (slot == bytes32(0)) return;
+        bytes32 orig = vm.load(address(ics20), slot);
+        vm.store(address(ics20), slot, bytes32(uint256(orig) + (uint256(1) << shift)));
+        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
+            try ctl.continueReopen(_live(), 16) { } catch { }
+        }
+        bool aborted = !ctl.routeReopening(_live()) && ctl.routeClosed(_live());
+        vm.store(address(ics20), slot, orig); // the fault removed
+        if (aborted) ok["abortInjected"]++;
+        _reopen();
+    }
+
+    /// @notice The storage word holding the route's pending-incident count, found by recording the view's reads and
+    /// probing them (test-only fault injection).
+    function _pendingSlot() internal returns (bytes32, uint256) {
+        (,, uint64 before) = ctl.incidents(_live());
+        vm.record();
+        ctl.incidents(_live());
+        (bytes32[] memory reads,) = vm.accesses(address(ics20));
+        for (uint256 k = 0; k < reads.length; k++) {
+            bytes32 orig = vm.load(address(ics20), reads[k]);
+            for (uint256 shift = 0; shift < 256; shift += 64) {
+                vm.store(address(ics20), reads[k], bytes32(uint256(orig) ^ (uint256(1) << shift)));
+                // a staticcall: a probed word may be one the call cannot survive (the implementation slot)
+                // and bounded: a flipped array length would otherwise burn the run's gas
+                (bool okCall, bytes memory ret) =
+                    address(ctl).staticcall{ gas: 1_000_000 }(abi.encodeCall(IGnoICS20Controls.incidents, (_live())));
+                vm.store(address(ics20), reads[k], orig);
+                if (!okCall || ret.length < 96) break;
+                (,, uint64 now_) = abi.decode(ret, (T.Incident[], uint64, uint64));
+                if (now_ == (before ^ 1)) return (reads[k], shift);
+            }
+        }
+        return (bytes32(0), 0);
+    }
+
     // ----------------------------------------------------------------------------------- coverage sweep --
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["settleExpiredRefused"] == 0 || ok["settleStaleGenRefused"] == 0) staleSettlements(0x1);
+        if (ok["adapterRefused"] == 0) {
+            _ensureOpen();
+            this.adapterRefuses(7);
+        }
+        if (ok["sendVoucher"] == 0) {
+            _ensureOpen();
+            if (ugnot.balanceOf(bob) == 0) this.receiveVoucher(50, false);
+            this.sendVoucher(3, true);
+        }
+        if (ok["authoritySuspended"] == 0) this.recoverWithAuthorityAttempts();
+        if (ok["lossDuringReopeningRefused"] == 0) {
+            _ensureOpen();
+            this.lossDuringReopening(3);
+            _ensureOpen();
+        }
+        if (ok["abortInjected"] == 0) {
+            this.faultInjectedAbort();
+            _ensureOpen();
+        }
+        if (ok["startReplacement"] == 0 || ok["executePending"] == 0) {
+            _ensureOpen();
+            this.startReplacement(true);
+            this.executePending();
+        }
+        if (ok["proveOne"] == 0 || ok["decideSettle"] == 0 || ok["startReopen"] == 0) {
+            _ensureOpen();
+            if (!ctl.routeClosed(_live()) && clients.length < 40) {
+                _send(alice, tokens[0], 5, false);
+                _replace(true);
+            }
+            for (uint256 i = 0; i < packets.length && ok["proveOne"] == 0; i++) {
+                this.proveOne(i, 0);
+            }
+            for (uint256 i = 0; i < packets.length && ok["decideSettle"] == 0; i++) {
+                T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
+                if (rec.settlement == 0 && rec.proven != T.Proven.None) this.decideSettle(i);
+            }
+            this.executePending();
+            this.startReopen();
+            this.executePending();
+        }
         if (
             ok["mismatchRefused"] == 0 || ok["settleStaleRefused"] == 0 || ok["replayRefused"] == 0
                 || ok["recoveryCancelled"] == 0
@@ -1128,7 +1495,11 @@ contract ReconcileInvariantsTest is ControlsFixture {
 
     /// @notice The reservation a record's state calls for, from the packet's own amount (the ghost's).
     function _reserveOf(T.SendRecord memory rec, uint256 amount) internal pure returns (uint256) {
-        if (rec.burned) return 0;
+        return rec.burned ? 0 : _entitlement(rec, amount);
+    }
+
+    /// @notice What the record still owes its sender: escrowed tokens reserved, or vouchers to mint again (a burn).
+    function _entitlement(T.SendRecord memory rec, uint256 amount) internal pure returns (uint256) {
         if (rec.payment == T.Payment.Queued || rec.payment == T.Payment.Parked) return amount - rec.refunded;
         return rec.outcome == T.Outcome.Pending && rec.settlement == 0 ? amount : 0;
     }
@@ -1236,7 +1607,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
             if (rec.settlement >= 2) assertTrue(delivered, "a delivered settlement for an undelivered packet");
             // an undelivered record ends refunded in full or still reserved, unless a forged success ack hides it
             // until its incident's reconciliation (the refunds are real: the senders' balances are checked below)
-            if (!delivered && rec.refunded != amount && r != amount - rec.refunded) {
+            if (!delivered && rec.refunded != amount && _entitlement(rec, amount) != amount - rec.refunded) {
                 assertTrue(
                     rec.outcome == T.Outcome.Success && rec.settlement == 0 && !_resolved(pkt.sourceClient),
                     "an undelivered refund neither paid nor reserved"
@@ -1262,6 +1633,20 @@ contract ReconcileInvariantsTest is ControlsFixture {
         }
         _checkFlows(f, tn, open);
         _checkCounters(n);
+        // invariant 7: no loss changes while a reopening runs (the snapshot is taken when its kind 13 executes)
+        if (ctl.routeReopening(clientId) && keccak256(bytes(h.snapshotClient())) == keccak256(bytes(h.liveClientId())))
+        {
+            for (uint256 t = 0; t < tn; t++) {
+                assertEq(
+                    ctl.losses(clientId, h.tokens(t)), h.lossSnapshot(h.tokens(t)), "losses changed while reopening"
+                );
+            }
+            assertEq(
+                ctl.losses(clientId, address(ugnot)),
+                h.lossSnapshot(address(ugnot)),
+                "voucher losses changed while reopening"
+            );
+        }
     }
 
     function _checkFlows(Flows memory f, uint256 tn, bool open) internal view {
@@ -1302,9 +1687,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
                 "the contract senders' tokens"
             );
         }
-        // the voucher: minted only by receives, all to bob
-        assertEq(ugnot.totalSupply(), h.ugnotSupply0() + h.received(address(ugnot)), "voucher supply");
-        assertEq(ugnot.balanceOf(bob), h.received(address(ugnot)), "bob's vouchers");
+        // the voucher: minted by receives and refunds, burned by bob's sends, all held by bob
+        uint256 v = h.received(address(ugnot)) + f.refundedAll[tn] - h.sentBy(bob, address(ugnot));
+        assertEq(ugnot.totalSupply(), h.ugnotSupply0() + v, "voucher supply");
+        assertEq(ugnot.balanceOf(bob), v, "bob's vouchers");
         assertEq(ctl.losses(clientId, address(ugnot)), f.loss[tn], "voucher losses equal the forged mints");
         if (open) assertEq(ctl.acceptedDeficit(clientId, address(ugnot)), f.loss[tn], "voucher deficit exactly");
     }
@@ -1352,7 +1738,19 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[34] memory names = [
+        string[46] memory names = [
+            "startReplacement",
+            "executePending",
+            "proveOne",
+            "decideSettle",
+            "startReopen",
+            "sendVoucher",
+            "adapterRefused",
+            "settleExpiredRefused",
+            "settleStaleGenRefused",
+            "lossDuringReopeningRefused",
+            "authoritySuspended",
+            "abortInjected",
             "send",
             "sendFromAdapter",
             "relayHonest",
@@ -1393,7 +1791,19 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[18] memory required = [
+        string[30] memory required = [
+            "startReplacement",
+            "executePending",
+            "proveOne",
+            "decideSettle",
+            "startReopen",
+            "sendVoucher",
+            "adapterRefused",
+            "settleExpiredRefused",
+            "settleStaleGenRefused",
+            "lossDuringReopeningRefused",
+            "authoritySuspended",
+            "abortInjected",
             "reconcile",
             "reopen",
             "continueReopen",

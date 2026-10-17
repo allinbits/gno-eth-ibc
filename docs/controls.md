@@ -181,7 +181,8 @@ bounds (constant work whatever the number of incidents).
    by the reconciliation).
 6. When a route opens, every token's losses equal its accepted deficit.
 7. While a route is reopening, its losses do not change (reconciliation is sealed: no kind 12 on a client whose
-   incident is reopening, and no loss booked on the route).
+   incident is reopening, and no loss booked on the route). The invariant campaign snapshots every token's losses
+   when a kind 13 starts a reopening and compares them after every call while that reopening runs.
 
 ### Transitions
 
@@ -313,14 +314,26 @@ a kind 9 hand-over installed an executor whose allow-list admits it.
 
 `contracts/test/controls/` drives the real `ICS26Router` (mock light client) through the full deployment of
 `DeployGnoIBC`: `GnoICS20Transfer.t.sol`, `IBCAdminDelivery.t.sol`, `IBCAdminKinds.t.sol`,
-`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (the nine
-review rounds' regressions, `test_r…` to `test_r9_…`), `ReconcileInvariants.t.sol` (invariant tests of the
+`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (the ten
+review rounds' regressions, `test_r…` to `test_r10_…`), `CodePinning.t.sol` (the delegate codehashes and the build
+verification), `ReconcileInvariants.t.sol` (invariant tests of the
 reconciliation state machine against a ghost model: every packet's truth chosen when sent, relays honest or forged
 against it, honest proofs, governance through IBCAdmin.execute; replacements also while closed or reopening,
 emergency recovery and its cancellation, verifier freeze, expiry and migration, kind 12 batches and its refusals (a
 mismatched action, a verifier frozen after the proof, a replay), kind 13 and its continuation over seventeen loss
 tokens, busy delivery and drain from a send hook (IBCAdmin's Busy, a buffered decision left unrecorded), contract
-senders, their notification retries and a re-entering callback, refunds flags, claims, voucher receives. Payment
+senders, their notification retries and a re-entering callback, refunds flags, claims, voucher receives, voucher
+sends (burns) and their refunds (mints). Governance is also driven in separate steps (`startReplacement`,
+`decideSettle`, `startReopen` record decisions that `executePending` matures and executes later, and `proveOne`
+proves outcomes on its own), so other actions interleave between a decision, its proof and its execution. Further
+adversaries: settlement against an expired verifier and against a proof made stale by a verifier migration (both
+spent, the record unchanged), a contract sender refusing its refund notification (the refund stands), a loss booked
+between deficit batches (spent, no loss changed, invariant 7), authority changes between an emergency recovery's
+approval and its execution (`Suspended`). The defensive re-check at the last deficit batch (the route aborts its
+reopening rather than open with an incident pending) cannot be reached through the public interface, since every
+path that adds a pending incident also aborts the reopening; the campaign drives it by fault injection: a test-only
+`vm.store` raises the pending-incident count between batches (the word located by probing what `incidents` reads),
+the last batch must abort, and the fault is removed before the route is reopened. Payment
 conservation is checked against the tokens themselves (the senders', the escrow's, bob's, the voucher's supply) and
 losses as per-packet amounts that the booked losses and the accepted deficit must equal; every required transition is
 covered in each run, counted only on its intended outcome; 24 runs of depth 40 in the suite). Its invariants assume governance reconciles completely before kind 13, as §7.12 asks: the controls
