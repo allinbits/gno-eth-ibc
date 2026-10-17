@@ -29,6 +29,7 @@ import { FrozenLightClient } from "./FrozenLightClient.sol";
 import { IGnoLightClientMsgs } from "../msgs/IGnoLightClientMsgs.sol";
 
 import { IBCAdminSetupCheck } from "./IBCAdminSetupCheck.sol";
+import { IBCAdminChecks } from "./IBCAdminChecks.sol";
 import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 
 /// @notice What IBCAdminExec asks of a GnoVoucher and of the transfer fork beyond their interfaces.
@@ -68,6 +69,8 @@ contract IBCAdminExec is IIBCAdmin {
     address public immutable frozenClient;
     /// @notice `finishSetup`'s check list.
     address public immutable setupCheck;
+    /// @notice The stateless checks (canonical parameters, denoms, counterparties, usable clients).
+    address public immutable checks;
     /// @notice The emergency recovery's code, which IBCAdmin delegatecalls (pinned with this executor).
     address public immutable recoveryModule;
     address private immutable _self;
@@ -79,6 +82,7 @@ contract IBCAdminExec is IIBCAdmin {
         ics20 = ics20_;
         frozenClient = address(new FrozenLightClient());
         setupCheck = address(new IBCAdminSetupCheck());
+        checks = address(new IBCAdminChecks());
         recoveryModule = address(new IBCAdminRecovery(router_, ics20_, frozenClient));
         _self = address(this);
     }
@@ -107,6 +111,8 @@ contract IBCAdminExec is IIBCAdmin {
         delegated
         returns (uint8, string memory)
     {
+        // the parameters exactly the canonical encoding of the kind's tuple (§5.4): anything else is spent
+        if (!IBCAdminChecks(checks).canonicalParams(kind, p)) return (S.SPEND, "params");
         if (kind == S.KIND_UNPAUSE) {
             (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));
             bool ok = (object == 1 && bytes(clientId).length != 0) || (object == 2 && bytes(clientId).length == 0);
@@ -127,14 +133,15 @@ contract IBCAdminExec is IIBCAdmin {
         if (kind == S.KIND_VOUCHER) {
             (string memory clientId, string memory baseDenom, address voucher,) =
                 abi.decode(p, (string, string, address, bytes32));
-            bool ok = bytes(clientId).length != 0 && S.canonicalGnoDenom(baseDenom) && voucher != address(0);
+            bool ok = bytes(clientId).length != 0 && IBCAdminChecks(checks).canonicalGnoDenom(baseDenom)
+                && voucher != address(0);
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_CLIENT) {
             (uint8 op, string memory clientId, string memory cp, bytes[] memory prefix, address lc,) =
                 abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
             bool ok = (op == 1 || op == 2) && bytes(clientId).length != 0 && lc != address(0)
-                && S.canonicalCounterparty(cp, prefix);
+                && IBCAdminChecks(checks).canonicalCounterparty(cp, prefix);
             return ok ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_UPGRADE) {
@@ -336,7 +343,7 @@ contract IBCAdminExec is IIBCAdmin {
         (string memory clientId, string memory baseDenom, address voucher, bytes32 codeHash) =
             abi.decode(p, (string, string, address, bytes32));
         if (!_codeIs(voucher, codeHash)) return "codehash";
-        if (!S.canonicalGnoDenom(baseDenom)) return "denom";
+        if (!IBCAdminChecks(checks).canonicalGnoDenom(baseDenom)) return "denom";
         (bool ok, bytes memory ret) = voucher.staticcall(abi.encodeCall(IVoucherLike.ics20, ()));
         if (!ok || ret.length != 32 || abi.decode(ret, (address)) != ics20) return "voucher";
         string memory denom = string.concat(ICS20Lib.DEFAULT_PORT_ID, "/", clientId, "/", baseDenom);
@@ -358,8 +365,10 @@ contract IBCAdminExec is IIBCAdmin {
             bytes32 codeHash
         ) = abi.decode(p, (uint8, string, string, bytes[], address, bytes32));
         if (!_codeIs(lc, codeHash)) return "codehash";
+        // a verifier for gno.land's chain, neither frozen nor expired, whichever way it is installed
+        if (!IBCAdminChecks(checks).usableClient(lc, S.layout().gnoChainId)) return "client";
         // gno.land's exact prefix; a verifier swap keeps the client's counterparty
-        if (!S.canonicalCounterparty(counterpartyClientId, merklePrefix)) return "counterparty";
+        if (!IBCAdminChecks(checks).canonicalCounterparty(counterpartyClientId, merklePrefix)) return "counterparty";
         if (
             op == 2
                 && keccak256(bytes(IICS02Client(router).getCounterparty(clientId).clientId))
@@ -551,6 +560,10 @@ contract IBCAdminExec is IIBCAdmin {
         if (keccak256(bytes(oldId)) != keccak256(bytes(l.govClient))) return "client";
         // only a custom id a kind 6 enrolled (its verifier code-hash pinned), never one the router generated
         if (!l.enrolled[keccak256(bytes(newId))]) return "client";
+        // its verifier still usable now, immediately before the old route is retired and the epoch switches
+        if (!IBCAdminChecks(checks).usableClient(address(IICS02Client(router).getClient(newId)), l.gnoChainId)) {
+            return "client";
+        }
         IGnoICS20Controls(ics20).checkpointQuarantine(oldId);
         if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId, suspectFrom)))) return "route";
         S.replaceRoute(l, router, frozenClient, oldId, newId);

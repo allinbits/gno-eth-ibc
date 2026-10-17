@@ -556,16 +556,51 @@ contract ReviewRegressionsTest is ControlsFixture {
     // ================================================================ #16, #18 port and envelope boundary ==
 
     function test_r18_envelope1024Recorded_1025Spent() public {
-        bytes memory params = P.settings(clientId, 1 days);
-        bytes memory at = _env(1, S.KIND_SETTINGS, bytes.concat(params, new bytes(1024 - 14 - params.length)));
-        assertEq(at.length, 1024);
+        // canonical parameters are a multiple of 32 bytes: the largest envelope within 1024 is 14 + 992 = 1006
+        bytes memory params = P.settings(string(_repeat("a", 32 * 28)), 1 days);
+        bytes memory at = _env(1, S.KIND_SETTINGS, params);
+        assertEq(at.length, 1006);
         assertEq(_status(_recvGov(at)), S.STATUS_RECORDED);
-        assertEq(_state(1), S.PENDING);
-        bytes memory over = _env(2, S.KIND_SETTINGS, bytes.concat(params, new bytes(1025 - 14 - params.length)));
-        assertEq(over.length, 1025);
+        bytes memory over = _env(2, S.KIND_SETTINGS, P.settings(string(_repeat("a", 32 * 29)), 1 days));
+        assertEq(over.length, 1038);
         assertEq(_status(_recvGov(over)), S.STATUS_SPENT);
         assertEq(admin.PORT(), "ibcgov");
         assertEq(admin.COUNTERPARTY_PORT(), "gov");
+    }
+
+    function _repeat(bytes1 c, uint256 n) internal pure returns (bytes memory b) {
+        b = new bytes(n);
+        for (uint256 i = 0; i < n; i++) {
+            b[i] = c;
+        }
+    }
+
+    /// @notice Round 8 #5: a decision's parameters must be exactly the canonical encoding of its tuple: trailing
+    /// data, a non-canonical offset or dirty padding is spent at recording, never applied.
+    function test_r8_5_nonCanonicalParams_spentAtRecording() public {
+        bytes memory good = P.settings(clientId, 30 days); // a lengthening: applied at recording
+        bytes memory trailing = bytes.concat(good, bytes32(0));
+        bytes memory offset = bytes.concat(bytes32(uint256(0x60)), _slice(good, 32), bytes32(0)); // the string 32 later
+        bytes memory padding = bytes.concat(good);
+        padding[padding.length - 1] = 0x01; // a byte after the string's end
+        bytes memory dirtyUint = bytes.concat(good);
+        dirtyUint[32] = 0x01; // the uint64's high bytes
+        bytes[4] memory bad = [trailing, offset, padding, dirtyUint];
+        for (uint256 i = 0; i < 4; i++) {
+            uint64 seq = admin.lastSeq() + 1;
+            assertEq(_status(_recvGov(_env(seq, S.KIND_SETTINGS, bad[i]))), S.STATUS_SPENT, vm.toString(i));
+        }
+        assertEq(ctl.quarantineSeconds(clientId), 7 days, "none applied");
+        uint64 ok = admin.lastSeq() + 1;
+        assertEq(_status(_recvGov(_env(ok, S.KIND_SETTINGS, good))), S.STATUS_RECORDED);
+        assertEq(ctl.quarantineSeconds(clientId), 30 days);
+    }
+
+    function _slice(bytes memory b, uint256 from) internal pure returns (bytes memory out) {
+        out = new bytes(b.length - from);
+        for (uint256 i = 0; i < out.length; i++) {
+            out[i] = b[from + i];
+        }
     }
 
     // ================================================================== #17 launch caps from the lock ==
@@ -1976,6 +2011,71 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.settleRecords(clientId, _item(inbound, 5, 20));
         vm.stopPrank();
         assertEq(ctl.losses(clientId, address(usdc)), 50);
+    }
+
+    /// @notice Round 8 #1: kind 10 checks, immediately before retiring the old route and switching the epoch, that
+    /// the replacement's verifier is for gno.land's chain and neither frozen nor expired (recovery disabled here):
+    /// a replacement whose client froze or expired during the delay is spent, the old route untouched.
+    function test_r8_1_replacementToABadVerifier_spent_frozen() public {
+        _badReplacement(1);
+    }
+
+    function test_r8_1_replacementToABadVerifier_spent_expired() public {
+        _badReplacement(2);
+    }
+
+    function test_r8_1_replacementToABadVerifier_spent_otherChain() public {
+        _badReplacement(3);
+    }
+
+    function _badReplacement(uint8 how) internal {
+        assertEq(admin.recoveryConfig().delay, 0, "recovery disabled");
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decide(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        uint64 replace = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-2", 0));
+        _skip(7 days);
+        admin.execute(add);
+        assertEq(_state(add), S.EXECUTED);
+        if (how == 1) lc2.setStatus(true, false);
+        else if (how == 2) lc2.setStatus(false, true);
+        else lc2.setChainId("other-chain");
+        admin.execute(replace);
+        assertEq(_state(replace), S.SPENT);
+        assertEq(admin.epoch(), 1);
+        assertEq(admin.govClient(), clientId);
+        assertFalse(ctl.isRetired(clientId));
+        assertFalse(ctl.routeClosed(clientId));
+        assertTrue(_isSuccessAck(_gnotIn(1, bob)), "the old route works");
+    }
+
+    /// @notice Round 8 #1 sweep: kind 6 installs no verifier that is frozen, expired or for another chain, by
+    /// addition or by migration.
+    function test_r8_1_kind6_installsOnlyUsableVerifiers() public {
+        MockLightClient frozen = new MockLightClient();
+        frozen.setStatus(true, false);
+        MockLightClient expired = new MockLightClient();
+        expired.setStatus(false, true);
+        MockLightClient other = new MockLightClient();
+        other.setChainId("other-chain");
+        MockLightClient[3] memory bad = [frozen, expired, other];
+        uint64[6] memory seqs;
+        for (uint256 i = 0; i < 3; i++) {
+            address a = address(bad[i]);
+            seqs[2 * i] = _decide(
+                S.KIND_CLIENT,
+                P.client(1, string.concat("gnoland-", vm.toString(60 + i)), "ethereum-6", _prefix(), a, a.codehash)
+            );
+            seqs[2 * i + 1] = _decide(S.KIND_CLIENT, P.client(2, clientId, CP, _prefix(), a, a.codehash));
+        }
+        _skip(7 days);
+        address before = address(router.getClient(clientId));
+        for (uint256 i = 0; i < 6; i++) {
+            admin.execute(seqs[i]);
+            assertEq(_state(seqs[i]), S.SPENT, vm.toString(i));
+        }
+        assertEq(address(router.getClient(clientId)), before);
     }
 
     IICS26RouterMsgs.Packet[] internal _later;
