@@ -25,6 +25,7 @@ import { IGnoICS20Controls, IGnoICS20ControlsTypes } from "../src/interfaces/IGn
 import { IIBCAdmin } from "../src/interfaces/IIBCAdmin.sol";
 import { IBCAdmin } from "../src/admin/IBCAdmin.sol";
 import { IBCAdminExec } from "../src/admin/IBCAdminExec.sol";
+import { RouterLauncher } from "../src/admin/RouterLauncher.sol";
 import { GnoDenoms } from "./GnoDenoms.sol";
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 
@@ -215,9 +216,17 @@ contract DeployGnoIBC is Script {
         );
         AccessManager am = new AccessManager(p.deployer);
         d.accessManager = address(am);
-        d.ics26Router = address(
-            new ERC1967Proxy(address(new ICS26Router()), abi.encodeCall(ICS26Router.initialize, (address(am))))
+        // the router and its launch client in one transaction (RouterLauncher): no registration can come between
+        // them, so the launch client is the router's first, `client-0`, which every later step names
+        d.gnoLightClient =
+            p.lightClient != address(0) ? p.lightClient : address(new GnoLightClient(p.clientState, p.consensusState));
+        bytes[] memory prefix = new bytes[](2);
+        prefix[0] = GNO_STORE;
+        prefix[1] = GNO_KEY_PREFIX;
+        (d.ics26Router, d.clientId) = _launchRouter(
+            address(am), IICS02ClientMsgs.CounterpartyInfo({ clientId: p.counterparty, merklePrefix: prefix }), d
         );
+        _afterRouter(d);
         // a fresh deployment: the fork is the proxy's first implementation (no packet predates it)
         d.ics20Controls = address(new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence())))));
         d.ics20Implementation = address(new GnoICS20Transfer(d.ics20Controls));
@@ -235,16 +244,6 @@ contract DeployGnoIBC is Script {
             [p.guardians[0], p.guardians[1], p.guardians[2], p.guardians[3], p.watch[0], p.watch[1]];
         IGnoICS20Controls(d.ics20Transfer).initializeGno(keys);
         ICS26Router(d.ics26Router).addIBCApp(ICS20Lib.DEFAULT_PORT_ID, d.ics20Transfer);
-
-        d.gnoLightClient =
-            p.lightClient != address(0) ? p.lightClient : address(new GnoLightClient(p.clientState, p.consensusState));
-        bytes[] memory prefix = new bytes[](2);
-        prefix[0] = GNO_STORE;
-        prefix[1] = GNO_KEY_PREFIX;
-        d.clientId = ICS26Router(d.ics26Router)
-            .addClient(
-                IICS02ClientMsgs.CounterpartyInfo({ clientId: p.counterparty, merklePrefix: prefix }), d.gnoLightClient
-            );
 
         d.ugnotVoucher = GnoDenoms.register(d.ics20Transfer, d.clientId, "ugnot", "Gno.land", "GNOT", 6);
         IGnoICS20Controls(d.ics20Transfer).setLimits(d.clientId, d.ugnotVoucher, p.gnotLimits);
@@ -271,7 +270,45 @@ contract DeployGnoIBC is Script {
         // the hand-over: IBCAdmin takes ADMIN_ROLE, the deployer renounces it (it holds no other role)
         am.grantRole(IBCRolesLib.ADMIN_ROLE, d.ibcAdmin, 0);
         am.renounceRole(IBCRolesLib.ADMIN_ROLE, p.deployer);
-        IBCAdmin(d.ibcAdmin).finishSetup();
+        _finish(p, d);
+    }
+
+    /// @notice `finishSetup` with this deployment's own record: any mismatch reverts it, and governance stays off.
+    function _finish(Params memory p, Deployed memory d) internal virtual {
+        IBCAdmin(d.ibcAdmin).finishSetup(_launch(p, d));
+    }
+
+    /// @notice The router proxy and its launch client, in one transaction (RouterLauncher).
+    function _launchRouter(
+        address am,
+        IICS02ClientMsgs.CounterpartyInfo memory counterparty,
+        Deployed memory d
+    )
+        internal
+        virtual
+        returns (address router, string memory clientId)
+    {
+        RouterLauncher l = new RouterLauncher(address(new ICS26Router()), am, counterparty, d.gnoLightClient);
+        return (l.router(), l.clientId());
+    }
+
+    /// @notice A hook between the router's launch and the next step (tests interleave other transactions here).
+    function _afterRouter(Deployed memory d) internal virtual { }
+
+    /// @notice What this deployment created, for `finishSetup` to check against the chain: the launch client's id,
+    /// the verifier this script deployed (or was given) with its code hash, the verifier's initial trusted state
+    /// (the inputs when this script deployed it), gno.land's client id, the ugnot voucher, the quarantine.
+    function _launch(Params memory p, Deployed memory d) internal view returns (IIBCAdmin.Launch memory l) {
+        l.clientId = d.clientId;
+        l.lightClient = d.gnoLightClient;
+        l.lightClientCodeHash = d.gnoLightClient.codehash;
+        if (p.lightClient == address(0)) {
+            l.clientStateHash = keccak256(abi.encode(p.clientState));
+            l.consensusStateHash = keccak256(abi.encode(p.consensusState));
+        }
+        l.counterpartyClientId = p.counterparty;
+        l.ugnotVoucher = d.ugnotVoucher;
+        l.quarantineSeconds = p.quarantineSeconds;
     }
 
     /// @notice The functions' roles: every governed function is ADMIN_ROLE's (IBCAdmin's after the hand-over),

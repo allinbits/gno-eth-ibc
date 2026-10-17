@@ -21,6 +21,7 @@ import { IGuardians } from "../../src/interfaces/IGuardians.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminSetupCheck } from "../../src/admin/IBCAdminSetupCheck.sol";
+import { IBCAdmin } from "../../src/admin/IBCAdmin.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
@@ -593,7 +594,8 @@ contract IBCAdminKindsTest is ControlsFixture {
 
     function test_finishSetup_once() public {
         vm.expectRevert(IIBCAdmin.SetupAlreadyDone.selector);
-        admin.finishSetup();
+        vm.prank(deployer);
+        admin.finishSetup(launch);
     }
 
     function test_setupCheck_findsLeftovers() public {
@@ -699,5 +701,66 @@ contract IBCAdminKindsTest is ControlsFixture {
         _setLimits(address(v), 1000, 1000, 1000);
         assertTrue(_isSuccessAck(_transferIn(clientId, denom, 25, bob)));
         assertEq(v.balanceOf(bob), 25);
+    }
+
+    // ============================================================================================= round 15 ==
+
+    /// @notice `finishSetup`'s launch checks (run before the role check list), on a fresh IBCAdmin over this
+    /// deployment (the fixture's is set up already).
+    function _expectSetup(IIBCAdmin.Launch memory l, uint8 n) internal {
+        IBCAdmin fresh = _freshAdmin();
+        vm.prank(deployer);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.SetupIncomplete.selector, n));
+        fresh.finishSetup(l);
+    }
+
+    function _freshAdmin() internal returns (IBCAdmin fresh) {
+        vm.startPrank(deployer);
+        fresh = new IBCAdmin(
+            IBCAdmin.Config({
+                router: address(router),
+                accessManager: d.accessManager,
+                ics20: address(ics20),
+                exec: d.ibcAdminExec,
+                govClientId: clientId,
+                gnoChainId: "gno-test",
+                seats: G,
+                watch: W,
+                recovery: IIBCAdmin.RecoveryConfig(0, 0, 0, 0, 0)
+            })
+        );
+        vm.stopPrank();
+    }
+
+    /// @notice r15 #1 (b): `finishSetup` checks the launch client and everything naming it against the deployment's
+    /// record; each mismatch fails it with its own number.
+    function test_r15_1_setupCheck_launchBindings() public {
+        IIBCAdmin.Launch memory l = launch;
+        l.clientId = "client-1";
+        _expectSetup(l, 11);
+        l = launch;
+        l.lightClient = address(new MockLightClient());
+        _expectSetup(l, 11);
+        l = launch;
+        l.lightClientCodeHash = bytes32(uint256(1));
+        _expectSetup(l, 11);
+        l = launch;
+        l.clientStateHash = bytes32(uint256(1));
+        _expectSetup(l, 12);
+        lc.setChainId("other-chain");
+        _expectSetup(launch, 12);
+        lc.setChainId("gno-test");
+        l = launch;
+        l.counterpartyClientId = "ethereum-9";
+        _expectSetup(l, 13);
+        l = launch;
+        l.ugnotVoucher = address(0x5555);
+        _expectSetup(l, 14);
+        l = launch;
+        l.quarantineSeconds = 1 days;
+        _expectSetup(l, 15);
+        // only the deployer attests its launch
+        vm.expectRevert(IIBCAdmin.SetupAlreadyDone.selector);
+        admin.finishSetup(launch);
     }
 }

@@ -10,9 +10,15 @@ pragma solidity ^0.8.28;
 import { IIBCApp } from "@eureka/interfaces/IIBCApp.sol";
 import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
+import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
+import { IICS20Transfer } from "@eureka/interfaces/IICS20Transfer.sol";
+import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
 
 import { IIBCAdmin } from "../interfaces/IIBCAdmin.sol";
 import { IGuardians } from "../interfaces/IGuardians.sol";
+import { IGnoICS20Controls } from "../interfaces/IGnoICS20Controls.sol";
+import { IGnoLightClientMsgs as Msgs } from "../msgs/IGnoLightClientMsgs.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
 import { IBCAdminExec } from "./IBCAdminExec.sol";
@@ -46,6 +52,15 @@ import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 /// replaced only by kind 9.
 
 /// @notice The transfer app's reentrancy lock, read by IBCAdmin.
+interface IGnoVerifierViews {
+    function getClientState() external view returns (bytes memory);
+    function getConsensusState(uint64 height) external view returns (Msgs.ConsensusState memory);
+}
+
+interface IVoucherBinding {
+    function ics20() external view returns (address);
+}
+
 interface IGnoICS20Busy {
     function gnoBusy() external view returns (bool);
 }
@@ -127,6 +142,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// @inheritdoc IIBCApp
     function onRecvPacket(IIBCAppCallbacks.OnRecvPacketCallback calldata m) external returns (bytes memory) {
         if (msg.sender != router) revert NotRouter(msg.sender);
+        if (!S.layout().setupDone) revert SetupPending();
         // never recorded from inside a transfer-app entry point (a token or sender hook): a decision acting at
         // recording would find the transfer app locked and be spent. No data, so the router reverts the whole
         // delivery (`IBCFailedCallback`): never an error ack, which would let a hook that relays (relaying public)
@@ -340,6 +356,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// reverts this, and the decision stays pending.
     function execute(uint64 seq) external {
         S.Layout storage l = S.layout();
+        if (!l.setupDone) revert SetupPending();
         uint32 ep = l.epoch;
         Decision storage d = l.decisions[ep][seq];
         if (d.state != S.PENDING) revert NotPending(seq);
@@ -438,6 +455,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// @notice A guardian approves an emergency route replacement (§7.12); it opens once enough guardians approve
     /// the same proposal while the route is eligible. Calling again re-checks the eligibility.
     function approveRecovery(RecoveryProposal calldata p) external {
+        if (!S.layout().setupDone) revert SetupPending();
         RecoveryConfig memory c = _recoveryConfig();
         _delegateRecovery(abi.encodeCall(IBCAdminRecovery.approveRecovery, (msg.sender, abi.encode(p), c)));
     }
@@ -450,6 +468,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Executes the open proposal after its delay. Permissionless.
     function executeRecovery() external {
+        if (!S.layout().setupDone) revert SetupPending();
         RecoveryConfig memory c = _recoveryConfig();
         _delegateRecovery(abi.encodeCall(IBCAdminRecovery.executeRecovery, (c)));
     }
@@ -466,15 +485,55 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Permissionless and self-checking: every authority is this contract's, the deployer holds no role, and
     /// the record is the launch's (IBCAdminExec.checkSetup's numbered checks; 40: this contract's own record).
-    function finishSetup() external {
+    function finishSetup(Launch calldata launch) external {
         S.Layout storage l = S.layout();
         if (l.setupDone) revert SetupAlreadyDone();
+        // the deployer's own record of what it created: nobody else can attest a launch
+        if (msg.sender != deployer) revert SetupIncomplete(0);
+        _checkLaunch(launch);
         _delegate(l, abi.encodeCall(IBCAdminExec.checkSetup, (deployer)));
         if (l.epoch != 1 || l.lastSeq != 0 || l.holds.length != 0 || l.conflictBlock != 0 || l.recovery.openedAt != 0) {
             revert SetupIncomplete(40);
         }
         l.setupDone = true;
         emit SetupDone();
+    }
+
+    /// @notice Checks 11 to 15: the launch client and every component naming it are the deployment's own.
+    function _checkLaunch(Launch calldata launch) private view {
+        string memory id = launch.clientId;
+        _check(keccak256(bytes(S.layout().govClient)) == keccak256(bytes(id)), 11);
+        address lc = address(IICS02Client(router).getClient(id));
+        _check(lc == launch.lightClient && lc.code.length != 0 && lc.codehash == launch.lightClientCodeHash, 11);
+        bytes memory cs = IGnoVerifierViews(lc).getClientState();
+        Msgs.ClientState memory state = abi.decode(cs, (Msgs.ClientState));
+        _check(keccak256(bytes(state.chainId)) == keccak256(bytes(S.layout().gnoChainId)), 12);
+        if (launch.clientStateHash != bytes32(0)) _check(keccak256(cs) == launch.clientStateHash, 12);
+        if (launch.consensusStateHash != bytes32(0)) {
+            Msgs.ConsensusState memory c = IGnoVerifierViews(lc).getConsensusState(state.latestHeight);
+            _check(keccak256(abi.encode(c)) == launch.consensusStateHash, 12);
+        }
+        IICS02ClientMsgs.CounterpartyInfo memory cp = IICS02Client(router).getCounterparty(id);
+        _check(
+            keccak256(bytes(cp.clientId)) == keccak256(bytes(launch.counterpartyClientId))
+                && S.canonicalCounterparty(cp.clientId, cp.merklePrefix),
+            13
+        );
+        address voucher = launch.ugnotVoucher;
+        _check(
+            IICS20Transfer(ics20).ibcERC20Contract(string.concat(ICS20Lib.DEFAULT_PORT_ID, "/", id, "/ugnot"))
+                    == voucher && IVoucherBinding(voucher).ics20() == ics20,
+            14
+        );
+        _check(
+            IGnoICS20Controls(ics20).limits(id, voucher).set
+                && IGnoICS20Controls(ics20).quarantineSeconds(id) == launch.quarantineSeconds,
+            15
+        );
+    }
+
+    function _check(bool ok, uint8 n) private pure {
+        if (!ok) revert SetupIncomplete(n);
     }
 
     // ============================================================================================== executor ==

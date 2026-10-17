@@ -65,7 +65,7 @@ attribution terms extend to works that use those files.
 | `sendTransferWithSender` | `DELEGATE_SENDER_ROLE` | nobody |
 
 The deployer never holds `ID_CUSTOMIZER_ROLE` or `ERC20_CUSTOMIZER_ROLE` (those functions are `ADMIN_ROLE`'s) and
-renounces `ADMIN_ROLE` at the end of `DeployGnoIBC`, which then runs `IBCAdmin.finishSetup()`.
+renounces `ADMIN_ROLE` at the end of `DeployGnoIBC`, which then runs `IBCAdmin.finishSetup(launch)`.
 
 ## The governance wire format (for `ibcgov`)
 
@@ -404,6 +404,35 @@ reaches no privileged entry point, whatever state it sees.
 A later upgrade of the transfer app is kind 7, which installs only code that keeps the controls (the controls
 version probe on the fork and its three modules, before and after the upgrade); its migration call is empty unless
 a kind 9 hand-over installed an executor whose allow-list admits it.
+
+**The launch client binding is race-free on two layers.**
+
+1. **One transaction.** `RouterLauncher` deploys the router proxy and registers the launch Gno client in its
+   constructor, so no transaction can come between them. The launch client is always the router's first, `client-0`,
+   the id that every later step and gno.land's counterparty name. eureka's generated-id `addClient` is permissionless:
+   with the router and its client in separate transactions, an attacker could take the predicted id in between, and
+   the voucher, the controls and IBCAdmin would bind to the attacker's verifier.
+   - Why this and not a custom id under the restricted overload: the launcher holds no role and needs none, so the
+     deployer's privileges do not grow, not even transiently.
+   - It also keeps `client-0`, which gno.land's counterparty registration, the relayer and the governance vectors
+     already use.
+   - A single factory for the whole deployment would exceed the contract size limit.
+2. **`finishSetup` checks the deployment's own record.** The deployer passes `IIBCAdmin.Launch` (the deployer only),
+   and IBCAdmin checks 11 to 15 against the chain (before `IBCAdminSetupCheck`'s list):
+   - the epoch's client is that id;
+   - its verifier is exactly the address the deployment created, with the recorded code hash;
+   - its initial client and consensus state are the deployment's inputs, and its chain id is IBCAdmin's;
+   - its counterparty is the named gno.land client, with the exact merkle prefix;
+   - the ugnot voucher is registered for that id and answers to the transfer app;
+   - the controls set the voucher's limits and the quarantine on that id.
+
+   Governance waits for `finishSetup`: until it passes, IBCAdmin refuses every delivery, execution and emergency
+   recovery (`SetupPending`). A mismatch therefore leaves governance off, not captured.
+
+`DeploymentRace.t.sol` shows both layers:
+- An attacker registering between the deployer's transactions gets `client-1`, which nothing names.
+- In an emulation of the old two-transaction flow, the attacker's capture of `client-0` fails `finishSetup` (check
+  11), and governance over it is refused.
 
 ## Open issues
 

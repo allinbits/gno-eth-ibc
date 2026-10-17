@@ -51,6 +51,15 @@ interface IGnoICS20Fork {
 ///  9 the transfer app answers to the AccessManager and the router, runs the fork (it serves CONTROLS), and its
 ///    beacons are its own;
 /// 10 the transfer app's guardian keys are IBCAdmin's.
+/// IBCAdmin itself checks 11 to 15 against the deployment's record (`finishSetup(launch)`):
+/// 11 the epoch's client is the launch's: its id, its verifier exactly the address the deployment created, with
+///    the code hash the deployment recorded;
+/// 12 that verifier's initial trusted state is the deployment's input (its encoded client state, and its consensus
+///    state at that state's latest height), and its chain id is IBCAdmin's gno.land chain id;
+/// 13 the client's counterparty is gno.land's client id the deployment named, with gno.land's exact merkle prefix;
+/// 14 the ugnot voucher is registered for that client id (`transfer/<id>/ugnot`) and answers to the transfer app;
+/// 15 the transfer app's controls name that client id: the voucher's limits are set on its route, with the
+///    deployment's quarantine.
 /// IBCAdmin adds 40 (its own record is the launch's). The AccessManager cannot list a role's members, so other
 /// holders of a role are the audit tool's to find (its RoleGranted log).
 contract IBCAdminSetupCheck {

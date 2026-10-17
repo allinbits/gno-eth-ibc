@@ -52,6 +52,9 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
 
     mapping(bytes32 destClient => uint64) internal nextRecvSeq;
 
+    /// @notice What the deployment created, as it passed it to `finishSetup`.
+    IIBCAdmin.Launch internal launch;
+
     function _recovery() internal virtual returns (IIBCAdmin.RecoveryConfig memory c) { }
 
     function _permit2() internal virtual returns (address) { }
@@ -79,6 +82,7 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
         vm.startPrank(deployer);
         d = _deploy(p);
         vm.stopPrank();
+        launch = _launch(p, d);
         router = ICS26Router(d.ics26Router);
         ctl = IGnoICS20Controls(d.ics20Transfer);
         ics20 = GnoICS20Transfer(d.ics20Transfer);

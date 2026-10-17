@@ -32,6 +32,22 @@ interface IIBCAdmin {
     }
 
     /// @notice The recovery's settings, fixed at deployment. `delay == 0` disables the emergency path.
+    /// @notice What the deployment created, for `finishSetup` to check against the chain (ADR E11): the launch
+    /// client's id, its verifier (address and code hash), the verifier's initial trusted state (the hashes of its
+    /// encoded client state and of its consensus state at that state's latest height; zero: not checked, for a
+    /// verifier the deployment did not create), gno.land's client id on the other side, the ugnot voucher and the
+    /// route's quarantine.
+    struct Launch {
+        string clientId;
+        address lightClient;
+        bytes32 lightClientCodeHash;
+        bytes32 clientStateHash;
+        bytes32 consensusStateHash;
+        string counterpartyClientId;
+        address ugnotVoucher;
+        uint64 quarantineSeconds;
+    }
+
     struct RecoveryConfig {
         uint64 delay;
         uint8 threshold;
@@ -66,6 +82,8 @@ interface IIBCAdmin {
     error CallStarved();
     error SetupAlreadyDone();
     error SetupIncomplete(uint8 check);
+    /// @notice Governance waits for `finishSetup`: nothing is recorded, executed or recovered before it.
+    error SetupPending();
     error RecoveryDisabled();
     error RecoveryNotEligible();
     error RecoveryState();
