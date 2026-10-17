@@ -173,8 +173,16 @@ bounds (constant work whatever the number of incidents).
 ### Invariants
 
 1. A route is open (`closed == false`) only if every incident on it is resolved.
-2. The open-record count of a client id equals the number of its records with `open` set; its suspect count
-   equals the number of its unsettled records whose processed index is at or after `suspectStart`.
+2. A send record is open exactly while its commitment is outstanding (no ack or timeout processed, not settled) or a
+   refund is owed (a refund outcome not paid in full, not settled). A client id's open-record count is the number of
+   such records, and once a replacement retires it, its suspect count is the number of its unsettled records processed
+   at or after the replacement's `suspectFrom`. An incident is resolved only once its client has neither. The invariant
+   campaign derives all of this from its own ghost, never from the records' flags or the stored counters: the
+   transport history (each packet's ack or timeout and the block it was processed in), the settlements governance
+   executed, and the incident boundaries (each replacement's retired client and `suspectFrom`). It also executes kind
+   13 while the ghost says work remains (`prematureReopen`: it must be spent and the route stay closed), and relays a
+   settled record's late ack or timeout, with the retired client's freeze defeated for that one call (`lateOnSettled`:
+   ignored, nothing paid, the record unchanged).
 3. Acks and timeouts on the live client never count against any incident.
 4. Every send record is settled at most once, and a refund is never paid twice (`refunded <= amount`).
 4a. A send record is bound to its packet: its token, sender, amount and commitment are those of the packet the

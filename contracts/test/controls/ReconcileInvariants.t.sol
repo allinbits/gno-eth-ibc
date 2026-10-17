@@ -99,6 +99,12 @@ contract ReconcileHandler is Test {
     IICS26RouterMsgs.Packet[] internal packets;
     mapping(uint256 => Ghost) public ghost;
     mapping(bytes32 => uint256) public settledCount;
+    // the ghost transport history: the block each packet's ack or timeout was processed in (0: never)
+    mapping(uint256 => uint256) public relayBlock;
+    // the ghost incident boundaries: each client id the handler's replacements retired, and the block its suspect
+    // interval starts at (the replacement's `suspectFrom`)
+    mapping(bytes32 => bool) public retiredGhost;
+    mapping(bytes32 => uint64) public suspectFromOf;
 
     struct Receive {
         string client;
@@ -172,6 +178,46 @@ contract ReconcileHandler is Test {
 
     function adapterAddress() external view returns (address) {
         return address(adapter);
+    }
+
+    /// @notice The ghost's transport history: packet `i`'s ack or timeout processed now.
+    function _relayed(uint256 i) internal {
+        ghost[i].relayed = true;
+        relayBlock[i] = vm.getBlockNumber();
+    }
+
+    /// @notice The ghost's incident boundary: the live client retired by a replacement whose suspect interval starts
+    /// at `suspectFrom`, and `next` live.
+    function _retire(string memory next, uint64 suspectFrom) internal {
+        bytes32 old = keccak256(bytes(clients[clients.length - 1]));
+        retiredGhost[old] = true;
+        suspectFromOf[old] = suspectFrom;
+        clients.push(next);
+    }
+
+    /// @notice The work a client id still has, derived from the ghost alone (never from the controls' records or
+    /// counters): its records still open (the commitment outstanding, or a refund owed and not paid in full) and,
+    /// once retired, its suspect ones (processed at or after its suspect interval's start, not settled).
+    function expectedWork(string memory c) public view returns (uint64 open, uint64 suspect) {
+        bytes32 ch = keccak256(bytes(c));
+        for (uint256 i = 0; i < packets.length; i++) {
+            if (keccak256(bytes(packets[i].sourceClient)) != ch) continue;
+            (bool o, bool sus) = expectedOf(i);
+            if (o) open++;
+            if (sus) suspect++;
+        }
+    }
+
+    /// @notice Packet `i`'s expected state from the ghost: open, and suspect.
+    function expectedOf(uint256 i) public view returns (bool open, bool suspect) {
+        Ghost memory gh = ghost[i];
+        bool settled = settledCount[keccak256(abi.encode(packets[i].sourceClient, packets[i].sequence))] != 0;
+        bool refundOutcome = gh.relayed && (gh.delivered ? gh.forgedRefund : !gh.forgedSuccess);
+        // the refund actually paid, which the token balances check independently (payment conservation)
+        uint256 refunded = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence).refunded;
+        open = !settled && (!gh.relayed || (refundOutcome && refunded < gh.amount));
+        bytes32 ch = keccak256(bytes(packets[i].sourceClient));
+        suspect = !settled && retiredGhost[ch] && gh.relayed && relayBlock[i] >= suspectFromOf[ch];
     }
 
     function setChecker(ICheckpoint c) external {
@@ -290,12 +336,31 @@ contract ReconcileHandler is Test {
                 all = false;
                 continue;
             }
+            IIBCAdmin.Decision memory dec = admin.decision(ep, seqs[i]); // its parameters, before they are cleared
             try admin.execute(seqs[i]) { } catch { }
-            IIBCAdmin.Decision memory dec = admin.decision(ep, seqs[i]);
-            if (dec.state != S.EXECUTED) all = false;
-            else if (dec.kind == S.KIND_REOPEN) _snapshotNew();
+            if (!_noteExecuted(ep, seqs[i], dec)) all = false;
         }
         _checkpoint();
+    }
+
+    /// @notice The ghost follows governance's own executed decisions (what it decided, never the records): a kind 12
+    /// settles its items (forged receives aside), a kind 10 of the live client retires it with its suspect interval,
+    /// a kind 13 starts a reopening (the losses snapshot). `dec`: the decision as recorded, read before it executed
+    /// (execution may clear its parameters). Whether `seq` executed.
+    function _noteExecuted(uint32 ep, uint64 seq, IIBCAdmin.Decision memory dec) internal returns (bool) {
+        if (admin.decision(ep, seq).state != S.EXECUTED) return false;
+        if (dec.kind == S.KIND_SETTLE) {
+            (string memory c, T.SettleItem[] memory items) = abi.decode(dec.params, (string, T.SettleItem[]));
+            for (uint256 k = 0; k < items.length; k++) {
+                if (items[k].action != 5) settledCount[keccak256(abi.encode(c, items[k].sequence))]++;
+            }
+        } else if (dec.kind == S.KIND_ROUTE) {
+            (string memory old, string memory next, uint64 from) = abi.decode(dec.params, (string, string, uint64));
+            if (keccak256(bytes(old)) == keccak256(bytes(_live()))) _retire(next, from);
+        } else if (dec.kind == S.KIND_REOPEN) {
+            _snapshotNew();
+        }
+        return true;
     }
 
     function _one(uint64 s) internal pure returns (uint64[] memory a) {
@@ -397,7 +462,7 @@ contract ReconcileHandler is Test {
             } catch { }
         }
         if (!done) return;
-        ghost[i].relayed = true;
+        _relayed(i);
         if (forged && success) ghost[i].forgedSuccess = true;
         if (forged && !success) ghost[i].forgedRefund = true;
         ok[forged ? "relayForged" : "relayHonest"]++;
@@ -632,7 +697,7 @@ contract ReconcileHandler is Test {
         try router.ackPacket(
             IICS26RouterMsgs.MsgAckPacket(packets[i], ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1))
         ) {
-            ghost[i].relayed = true;
+            _relayed(i);
         } catch {
             return;
         }
@@ -723,9 +788,7 @@ contract ReconcileHandler is Test {
             )
         );
         seqs[1] = _decide(S.KIND_ROUTE, P.route(_live(), next, fromZero ? 0 : uint64(vm.getBlockNumber())));
-        if (!_executeAll(seqs)) return false;
-        clients.push(next);
-        return true;
+        return _executeAll(seqs); // the retirement noted as it executes
     }
 
     function replace(bool fromZero) external {
@@ -759,7 +822,7 @@ contract ReconcileHandler is Test {
         }
         _skip(30 days + 1);
         try admin.executeRecovery() {
-            clients.push(next);
+            _retire(next, 0);
             ok["recover"]++;
         } catch { }
     }
@@ -859,12 +922,7 @@ contract ReconcileHandler is Test {
             p[i] = P.SettleItem(items[i].sequence, items[i].action, items[i].amount);
         }
         done = _executeAll(_one(_decide(S.KIND_SETTLE, P.settle(c, p))));
-        if (done) {
-            for (uint256 i = 0; i < n; i++) {
-                if (items[i].action != 5) settledCount[keccak256(abi.encode(c, items[i].sequence))]++;
-            }
-            ok["settle"] += n;
-        }
+        if (done) ok["settle"] += n; // the settlements noted as it executes
     }
 
     function reconcile(uint256 how, bool all) external {
@@ -948,7 +1006,7 @@ contract ReconcileHandler is Test {
                         packets[i], ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1)
                     )
                 ) {
-                    ghost[i].relayed = true;
+                    _relayed(i);
                     ghost[i].forgedRefund = true;
                 } catch { }
             }
@@ -1111,7 +1169,6 @@ contract ReconcileHandler is Test {
         _prove(i, seed >> 1);
         uint64 s3 = _decide(S.KIND_SETTLE, P.settle1(c, pkt.sequence, 1, 10));
         if (_executeAll(_one(s3))) {
-            settledCount[keccak256(abi.encode(c, pkt.sequence))]++;
             ok["settle"]++;
             uint256 paid = ctl.sendRecord(c, pkt.sequence).refunded;
             uint64 s4 = _decide(S.KIND_SETTLE, P.settle1(c, pkt.sequence, 1, 10));
@@ -1180,11 +1237,9 @@ contract ReconcileHandler is Test {
         if (a == 0 || b == 0) return;
         pending.push(a);
         pending.push(b);
-        replacing[b] = next;
+
         ok["startReplacement"]++;
     }
-
-    mapping(uint64 => string) internal replacing;
 
     /// @notice Records a kind 12 for a retired record (the action its truth calls for), without executing it.
     function decideSettle(uint256 i) external {
@@ -1233,14 +1288,9 @@ contract ReconcileHandler is Test {
             // executes; the controls enforce only the suspected interval and the open records (their own refusals
             // are tested separately)
             if (admin.decision(ep, s).kind == S.KIND_REOPEN) _reconcile(0, true);
-            string memory live = _live();
-            try admin.execute(s) { } catch { }
             IIBCAdmin.Decision memory dec = admin.decision(ep, s);
-            if (dec.state == S.EXECUTED) {
-                n++;
-                if (bytes(replacing[s]).length != 0 && ctl.isRetired(live)) clients.push(replacing[s]);
-                if (dec.kind == S.KIND_REOPEN) _snapshotNew();
-            }
+            try admin.execute(s) { } catch { }
+            if (_noteExecuted(ep, s, dec)) n++;
             _checkpoint();
         }
         delete pending;
@@ -1278,7 +1328,7 @@ contract ReconcileHandler is Test {
         try router.ackPacket(
             IICS26RouterMsgs.MsgAckPacket(packets[i], ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1))
         ) {
-            ghost[i].relayed = true;
+            _relayed(i);
         } catch {
             adapter.setRefuse(false);
             return;
@@ -1414,7 +1464,7 @@ contract ReconcileHandler is Test {
         }
         _skip(30 days);
         try admin.executeRecovery() {
-            clients.push(next);
+            _retire(next, 0);
             ok["recover"]++;
             if (suspended) ok["authoritySuspended"]++;
         } catch { }
@@ -1497,7 +1547,7 @@ contract ReconcileHandler is Test {
                 packets[i], bytes("{\"result\":\"Zm9yZ2Vk\"}"), "", IICS02ClientMsgs.Height(0, 1)
             )
         ) {
-            ghost[i].relayed = true;
+            _relayed(i);
         } catch { }
         adapter.setRefuse(false);
         if (!ghost[i].relayed || !_replace(true) || !_prove(i, 0)) return;
@@ -1586,9 +1636,74 @@ contract ReconcileHandler is Test {
         } catch { }
         vm.etch(frozen, code); // frozen again
         if (!done) return;
-        ghost[i].relayed = true;
+        _relayed(i);
         (,,, uint64 suspect,) = ctl.clientRecon(pkt.sourceClient);
         if (suspect != 0) ok["retiredAck"]++;
+        _checkpoint();
+    }
+
+    // ------------------------------------------------------------------------------------- round 12 actions --
+
+    /// @notice A kind 13 executed while the ghost says a retired client of an unresolved incident still has work
+    /// (an open or a suspect record): it must be spent, and the route stay closed. No reconciliation first.
+    function prematureReopen() public {
+        calls++;
+        if (!ctl.routeClosed(_live()) || ctl.routeReopening(_live())) return;
+        bool work;
+        for (uint256 k = 0; k + 1 < clients.length && !work; k++) {
+            (, uint32 incident,,,) = ctl.clientRecon(clients[k]);
+            (, uint64 resolvedUpTo,) = ctl.incidents(_live());
+            if (incident == 0 || incident - 1 < resolvedUpTo) continue;
+            (uint64 o, uint64 sus) = expectedWork(clients[k]);
+            work = o != 0 || sus != 0;
+        }
+        if (!work) return;
+        uint64 s = _decide(S.KIND_REOPEN, P.reopen(_live()));
+        if (s == 0) return;
+        _executeAll(_one(s));
+        IIBCAdmin.Decision memory dec = admin.decision(admin.epoch(), s);
+        assertTrue(dec.state != S.EXECUTED, "a kind 13 executed while work remained");
+        assertTrue(ctl.routeClosed(_live()) && !ctl.routeReopening(_live()), "the route stays closed");
+        ok["prematureReopenRefused"]++;
+    }
+
+    /// @notice A settled record's late ack or timeout (the retired client's freeze defeated for this one call, test
+    /// only, as in `retiredAck`): ignored, nothing paid, the record unchanged.
+    function lateOnSettled(uint256 i, bool useTimeout) public {
+        calls++;
+        if (packets.length == 0) return;
+        i = i % packets.length;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        if (ghost[i].relayed || settledCount[keccak256(abi.encode(pkt.sourceClient, pkt.sequence))] == 0) return;
+        T.SendRecord memory before = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        address token = ghost[i].token;
+        uint256 senderBal = IERC20(token).balanceOf(ghost[i].sender);
+        address frozen = address(router.getClient(pkt.sourceClient));
+        bytes memory code = frozen.code;
+        vm.etch(frozen, address(new MockLightClient()).code);
+        bool done;
+        if (useTimeout) {
+            MockLightClient(frozen).setTimestamp(pkt.timeoutTimestamp);
+            try router.timeoutPacket(IICS26RouterMsgs.MsgTimeoutPacket(pkt, "", IICS02ClientMsgs.Height(0, 1))) {
+                done = true;
+            } catch { }
+        } else {
+            bytes memory ack = ghost[i].delivered ? bytes("{\"result\":\"AQ==\"}") : ICS24Host.UNIVERSAL_ERROR_ACK;
+            try router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, ack, "", IICS02ClientMsgs.Height(0, 1))) {
+                done = true;
+            } catch { }
+        }
+        vm.etch(frozen, code); // frozen again
+        if (!done) return;
+        _relayed(i); // the commitment is consumed, nothing else
+        T.SendRecord memory after_ = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        assertEq(after_.refunded, before.refunded, "nothing refunded");
+        assertEq(uint8(after_.payment), uint8(before.payment), "payment unchanged");
+        assertEq(uint8(after_.outcome), uint8(before.outcome), "outcome unchanged");
+        assertEq(after_.settlement, before.settlement, "settlement unchanged");
+        assertEq(after_.processedBlock, before.processedBlock, "not processed");
+        assertEq(IERC20(token).balanceOf(ghost[i].sender), senderBal, "nothing paid");
+        ok["lateOnSettledIgnored"]++;
         _checkpoint();
     }
 
@@ -1596,6 +1711,22 @@ contract ReconcileHandler is Test {
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["prematureReopenRefused"] == 0 && _ensureOpen() && clients.length < 40) {
+            _send(alice, tokens[0], 4, false); // outstanding: an open record
+            if (_replace(true)) prematureReopen();
+            _ensureOpen();
+        }
+        if (ok["lateOnSettledIgnored"] == 0 && _ensureOpen() && clients.length < 40) {
+            _send(alice, tokens[0], 3, false);
+            _send(alice, tokens[0], 2, true);
+            uint256 a = packets.length - 2;
+            if (_replace(true)) {
+                _reconcile(0, true); // both settled while outstanding (a refund, a delivery)
+                lateOnSettled(a, true);
+                lateOnSettled(a + 1, false);
+            }
+            _ensureOpen();
+        }
         if (ok["provenAckReplaced"] == 0) this.forgedSuccessAck(9);
         if (ok["approvalWithdrawn"] == 0) this.withdrawApproval();
         if (ok["retiredAck"] == 0 && _ensureOpen() && clients.length < 40) {
@@ -1834,6 +1965,15 @@ contract ReconcileInvariantsTest is ControlsFixture {
             T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
             (bool delivered, bool forgedSuccess,,, address sender, address gtoken, uint256 amount) = h.ghost(i);
             _checkBinding(pkt, rec, i);
+            // open iff the commitment is outstanding or a refund is owed; settled iff governance settled it (the
+            // ghost's, never the record's own flags)
+            (bool expOpen,) = h.expectedOf(i);
+            assertEq(rec.open, expOpen, "open iff outstanding or a refund owed");
+            assertEq(
+                rec.settlement != 0,
+                h.settledCount(keccak256(abi.encode(pkt.sourceClient, pkt.sequence))) != 0,
+                "settled iff governance settled it"
+            );
             uint256 t = _tokenIndex(gtoken, tn);
             uint256 r = _reserveOf(rec, amount);
             f.reserve[t] += r;
@@ -1876,7 +2016,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
             }
         }
         _checkFlows(f, tn, open);
-        _checkCounters(n);
+        _checkCounters();
         // invariant 7: no loss changes while a reopening runs (the snapshot is taken when its kind 13 executes)
         if (ctl.routeReopening(clientId) && keccak256(bytes(h.snapshotClient())) == keccak256(bytes(h.liveClientId())))
         {
@@ -1943,32 +2083,34 @@ contract ReconcileInvariantsTest is ControlsFixture {
         return h.adapterAddress();
     }
 
-    function _checkCounters(uint256 n) internal view {
+    /// @notice A client id's counters against the work the ghost's transport history and incident boundaries call
+    /// for, and resolved-incident completeness: an incident is resolved only once its client has no work left.
+    /// Returns whether the client's incident is unresolved with work left (a pending incident). `retiredOnOpen`: a
+    /// retired client on an open route, which must have none.
+    function _checkClientWork(string memory c, uint64 resolved, bool retiredOnOpen) internal view returns (bool) {
+        (uint64 open, uint32 incident,, uint64 suspect,) = ctl.clientRecon(c);
+        if (retiredOnOpen) {
+            assertEq(open, 0, "a retired client's record open on an open route");
+            assertEq(suspect, 0, "a retired client's suspect record on an open route");
+        }
+        (uint64 o, uint64 sus) = h.expectedWork(c);
+        assertEq(open, o, "open records (the ghost's)");
+        assertEq(suspect, sus, "suspect records (the ghost's)");
+        assertEq(incident != 0, h.retiredGhost(keccak256(bytes(c))), "retired exactly when a replacement retired it");
+        if (incident != 0 && incident - 1 < resolved) {
+            assertEq(o, 0, "a resolved incident's client with an open record");
+            assertEq(sus, 0, "a resolved incident's client with a suspect record");
+        }
+        return incident != 0 && incident - 1 >= resolved && (open != 0 || suspect != 0);
+    }
+
+    function _checkCounters() internal view {
         (T.Incident[] memory inc, uint64 resolved, uint64 pending) = ctl.incidents(clientId);
         uint256 m = h.clientCount();
         bool closed = ctl.routeClosed(clientId);
         uint64 p;
         for (uint256 k = 0; k < m; k++) {
-            string memory c = h.clients(k);
-            (uint64 open, uint32 incident, uint64 start, uint64 suspect,) = ctl.clientRecon(c);
-            uint64 o;
-            uint64 sus;
-            for (uint256 i = 0; i < n; i++) {
-                IICS26RouterMsgs.Packet memory pkt = h.packet(i);
-                if (keccak256(bytes(pkt.sourceClient)) != keccak256(bytes(c))) continue;
-                T.SendRecord memory rec = ctl.sendRecord(c, pkt.sequence);
-                if (rec.open) o++;
-                if (incident != 0 && rec.processedBlock != 0 && rec.settlement == 0 && rec.processedIndex >= start) {
-                    sus++;
-                }
-            }
-            assertEq(open, o, "open records");
-            assertEq(suspect, incident == 0 ? 0 : sus, "suspect records");
-            if (incident != 0 && incident - 1 >= resolved && (open != 0 || suspect != 0)) p++;
-            if (!closed && k + 1 < m) {
-                assertEq(open, 0, "a retired client's record open on an open route");
-                assertEq(suspect, 0, "a retired client's suspect record on an open route");
-            }
+            if (_checkClientWork(h.clients(k), resolved, !closed && k + 1 < m)) p++;
         }
         assertEq(pending, p, "pending incidents");
         if (!closed) assertEq(resolved, inc.length, "open only when every incident resolved");
@@ -1982,7 +2124,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[50] memory names = [
+        string[52] memory names = [
+            "prematureReopenRefused",
+            "lateOnSettledIgnored",
             "provenAckReplaced",
             "approvalWithdrawn",
             "retiredAck",
@@ -2039,7 +2183,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[33] memory required = [
+        string[35] memory required = [
+            "prematureReopenRefused",
+            "lateOnSettledIgnored",
             "provenAckReplaced",
             "approvalWithdrawn",
             "retiredAck",
