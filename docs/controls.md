@@ -105,6 +105,17 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
     duplicate, error ack, timeout), interleaved with replacements and recoveries.
   - An error ack, a timeout, or a send the router refused leaves it owed: anyone calls `resendEpochNotice(epoch)`,
     which sends the same bytes again.
+  - A recorded notice applies on gno.land only while the client that proved it is Active, not retired, and at the
+    same trust generation; otherwise it must be proven afresh. Relaying the original packet again does not do
+    that: its receipt exists, so the gno core answers `RESPONSE_NOOP` before any proof or callback. Each
+    `resendEpochNotice(epoch)` sends the identical notice bytes in a **fresh packet** (`router.sendPacket`, a new
+    transport sequence), and the operator relays that packet
+    (`test_epochNotice_sentOverTheNewClient_ackedOnce` checks the new sequence).
+  - Only status 1 or 3 counts as acknowledged. gno.land answers a notice it recorded as proven but has not applied
+    (an advance of more than one epoch) with the universal error ack, which leaves the notice owed. Ethereum puts no
+    cap on unacknowledged epoch advances. gno.land bounds the work instead, by accepting a notice whose explicit
+    path lies in its expected graph of at most 64 transitions. A cap here could block emergency recovery after the
+    latest client froze before it verified an ack.
   - Each epoch keeps its own notice, so after consecutive replacements (A→B→C: epoch 2 over B, epoch 3 over C) each
     stays re-sendable on its own, and gno.land may skip ahead.
   - The ack and timeout callbacks handle notices and ignore anything else; they never revert.
@@ -307,6 +318,38 @@ bounds (constant work whatever the number of incidents).
 
 Each client id is retired once, so its suspect range never overlaps another incident's and a record reconciled by
 one incident is never counted by another; nothing is counted on the live client.
+
+### Operating rules and accepted residuals
+
+- **Choosing `suspectFrom`.** A replacement's `suspectFrom` (kind 10, the emergency recovery) must be the
+  block of the earliest verification operation the compromised client may have performed falsely. When that is
+  unknown it is **0**, which counts every ack and timeout the retired client ever processed: the range is clamped
+  to the client's activation, because its processed list starts there. A later value may be used only once the
+  compromise is established as header-only (forged consensus states, not a broken verifier). Only then may it be
+  the block of the first client update after the last authenticated root. Every proof the client verified before
+  that update ran against an authentic root. Choosing it later than the facts support leaves forged successes
+  unreserved and outside reconciliation.
+- **Refund liveness on a closed route.** This is a deliberate exception to refund liveness. A closed route pays
+  no refund outside kind 12 until it reopens: no claim, and acks and timeouts do not pay. Those refunds stay owed
+  and their escrow stays reserved, so nothing else can spend it. Getting them paid depends on governed, bounded
+  reconciliation: kind 12 settles them (seven-day delay, at most `MAX_SETTLE_ITEMS` per decision) and kind 13
+  reopens the route, after which a parked refund is claimed (`claimParked`).
+- **Parked refunds when escrow is short.** A genuine refund that kind 12 settles (action 1) is paid only from free
+  escrow: what remains after every other reservation of the route's token. When free escrow is short, the payment
+  is refused and the refund **parks**. It stays owed and fully reserved; it does not fail, and it does not revert
+  the batch. Its record is settled and therefore closed, so it never blocks kind 13. The accepted-deficit
+  reopening completes, and the refund is paid by `claimParked` once the backing returns
+  (`test_parkedShortfallRefunds_reopeningCompletes`, `test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment`).
+- **Settlements are final.** A kind 12 settlement is final once it executes. Before that, it waits its seven-day
+  delay: guardians can hold it, and a compromise discovered meanwhile voids its proofs (the quarantine checkpoint
+  of a verifier swap or replacement changes the verifier generation, and execution requires each record's outcome
+  proven by the active verifier). If the verifier that proved a settled outcome is found compromised only after
+  execution, the settlement is not reopened: a settled record refuses every later kind 12. A genuine refund it
+  denied (settled as delivered, actions 2 and 3) is an **accepted residual**. The ADR compensates it by a governed
+  credit or payment, with the loss booked. **No such path exists on Ethereum today.** No kind pays from escrow
+  or credits a sender outside kind 12, and kind 12 cannot book a loss against a settled record. The only way to
+  add one would be a kind 7 upgrade of the transfer app, which is a code change and not a defined compensation
+  path. Until one is specified, such a refund would be compensated outside the bridge.
 
 ## Execution of decisions, per kind
 

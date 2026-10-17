@@ -2424,7 +2424,7 @@ contract ReviewRegressionsTest is ControlsFixture {
     /// receive leaves 150 in escrow. One kind 12 owes both refunds again: both are reserved before either is paid,
     /// so the first payment (100) would leave the second's 100 short and is refused; both stay parked, fully
     /// reserved, in either item order.
-    function _twinHidden(bool reversed) internal {
+    function _twinHidden(bool reversed) internal returns (uint64, uint64) {
         _setLimits(address(usdc), 1000, 1000, 1000);
         IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId);
         IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 100, clientId);
@@ -2447,6 +2447,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.reserved(clientId, address(usdc)), 200);
         assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Parked));
         assertEq(uint8(ctl.sendRecord(clientId, b.sequence).payment), uint8(T.Payment.Parked));
+        return (a.sequence, b.sequence);
     }
 
     function test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment() public {
@@ -2455,6 +2456,26 @@ contract ReviewRegressionsTest is ControlsFixture {
 
     function test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment_reversed() public {
         _twinHidden(true);
+    }
+
+    /// @notice A genuine refund from escrow with too little free escrow parks (owed, fully reserved) instead of
+    /// failing: its record is settled, so the accepted-deficit reopening completes; the refunds stay owed and are
+    /// paid once the backing returns.
+    function test_parkedShortfallRefunds_reopeningCompletes() public {
+        (uint64 a, uint64 b) = _twinHidden(false);
+        vm.prank(address(admin));
+        ctl.reopenRoute(clientId);
+        assertFalse(ctl.routeClosed(clientId), "reopened with both refunds parked");
+        assertEq(ctl.reserved(clientId, address(usdc)), 200, "still fully reserved");
+        // 100 out of the escrow's 150 would leave the other refund's 100 short
+        vm.expectRevert(abi.encodeWithSelector(T.GnoRefundFailed.selector, clientId, a));
+        ctl.claimParked(clientId, a, 0);
+        usdc.mint(ics20.getEscrow(clientId), 50); // the backing restored
+        uint256 before = usdc.balanceOf(alice);
+        assertEq(ctl.claimParked(clientId, a, 0), 100);
+        assertEq(ctl.claimParked(clientId, b, 0), 100);
+        assertEq(usdc.balanceOf(alice), before + 200);
+        assertEq(ctl.reserved(clientId, address(usdc)), 0);
     }
 
     /// @notice r17 #2: an enabled recovery's public delay is at least 30 days (`MIN_RECOVERY_DELAY`); zero disables
