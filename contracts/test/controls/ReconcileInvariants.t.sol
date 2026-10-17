@@ -226,7 +226,8 @@ contract ReconcileHandler is Test {
     function _limits(address token) internal {
         if (limited[token]) return;
         vm.prank(address(admin));
-        ctl.setLimits(_live(), token, T.Limits(1e24, 1e25, 1e24, 0, 0));
+        // usdc's refund meter is small, so refunds queue and claims pay them
+        ctl.setLimits(_live(), token, T.Limits(1e24, 1e25, token == tokens[0] ? 50 : 1e24, 0, 0));
         limited[token] = true;
     }
 
@@ -791,10 +792,75 @@ contract ReconcileHandler is Test {
         _skip(bound(dt, 1, 2 days));
     }
 
+    /// @notice The route open again: a reopening under way continued, a closed route reconciled and reopened.
+    function _ensureOpen() internal returns (bool) {
+        for (uint256 i = 0; i < 4 && ctl.routeReopening(_live()); i++) {
+            try ctl.continueReopen(_live(), 16) {
+                ok["continueReopen"]++;
+            } catch { }
+        }
+        if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
+            _reconcile(0, true);
+            _reopen();
+        }
+        for (uint256 g = 0; g < 4; g++) {
+            vm.prank(G[g]);
+            try ctl.clearRefundsFlag(_live()) { } catch { }
+        }
+        _liveClient().setStatus(false, false);
+        return !ctl.routeClosed(_live());
+    }
+
+    /// @notice Ordinary traffic on an open route: sends of random truth relayed honestly or forged, a queued
+    /// refund claimed, a refused refund parked and claimed, honest and forged receives.
+    function transportRound(uint256 seed) public {
+        calls++;
+        if (!_ensureOpen()) return;
+        for (uint256 k = 0; k < 4; k++) {
+            if (!_send(alice, tokens[0], 20, (seed >> k) & 1 == 1)) return;
+            this.relay(packets.length - 1, (seed >> (k + 8)) & 1 == 1, (seed >> (k + 16)) & 1 == 1);
+        }
+        _skip(1 days);
+        this.claim(0);
+        this.claim(tokens.length - 1); // nothing queued ahead of the next hook-token refund
+        if (_send(alice, address(hookToken), 5, false)) {
+            uint256 i = packets.length - 1;
+            hookToken.setBlocked(alice, true);
+            this.relay(i, false, false); // refused by the token: parked
+            hookToken.setBlocked(alice, false);
+            this.claimParked(i);
+        }
+        // a delivered send's escrow (its vouchers on gno.land) backs the receives
+        if (_send(alice, tokens[0], 30, true)) this.relay(packets.length - 1, false, false);
+        this.receive_(0, 5, false);
+        this.receive_(0, 3, true);
+        ok["transportRound"]++;
+    }
+
+    /// @notice A forged refund processed before the next replacement's suspected interval is left by the
+    /// reconciliation kind 13 needs; settled after the reopening, its loss closes the route again (a late loss), and
+    /// a new kind 13 accepts it.
+    function lateLossScenario() public {
+        calls++;
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        if (!_send(alice, tokens[1], 10, true)) return;
+        this.relay(packets.length - 1, true, false); // a forged error ack: refunded at once
+        _skip(1 days);
+        if (!_replace(false)) return; // its interval starts after the forged refund
+        _reconcile(0, false);
+        if (!_reopen()) return;
+        if (_reconcile(1, true) && ctl.routeClosed(_live())) {
+            ok["lateLoss"]++;
+            _reopen();
+        }
+    }
+
     // ----------------------------------------------------------------------------------- coverage sweep --
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["transportRound"] == 0) transportRound(0xA5A5A5);
+        if (ok["lateLoss"] == 0) lateLossScenario();
         if (ok["replace"] == 0 && clients.length < 6 && _replace(true)) ok["replace"]++;
         if (ok["reconcile"] == 0 && _reconcile(0, true)) ok["reconcile"]++;
         if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) _reopen();
@@ -947,7 +1013,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[27] memory names = [
+        string[28] memory names = [
             "send",
             "sendFromAdapter",
             "relayHonest",
@@ -974,15 +1040,29 @@ contract ReconcileInvariantsTest is ControlsFixture {
             "replaceDuringReopening",
             "backfill",
             "abortAfterBackfill",
-            "lateLoss"
+            "lateLoss",
+            "transportRound"
         ];
         string memory line = "ACTIONS";
         for (uint256 i = 0; i < names.length; i++) {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[6] memory required =
-            ["reconcile", "reopen", "continueReopen", "replaceDuringReopening", "backfill", "abortAfterBackfill"];
+        string[13] memory required = [
+            "reconcile",
+            "reopen",
+            "continueReopen",
+            "replaceDuringReopening",
+            "backfill",
+            "abortAfterBackfill",
+            "lateLoss",
+            "transportRound",
+            "relayHonest",
+            "relayForged",
+            "claimParked",
+            "receiveForged",
+            "settle"
+        ];
         for (uint256 i = 0; i < required.length; i++) {
             assertGe(h.ok(required[i]), 1, required[i]);
         }
