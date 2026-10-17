@@ -435,6 +435,10 @@ contract ReviewRegressionsTest is ControlsFixture {
     // ======================================================================= #12 recovery thresholds ==
 
     function _adminWith(uint8 threshold, uint8 cancelThreshold) internal returns (IBCAdmin) {
+        return _adminWith(30 days, threshold, cancelThreshold);
+    }
+
+    function _adminWith(uint64 delay, uint8 threshold, uint8 cancelThreshold) internal returns (IBCAdmin) {
         return new IBCAdmin(
             IBCAdmin.Config({
                 router: address(router),
@@ -445,7 +449,7 @@ contract ReviewRegressionsTest is ControlsFixture {
                 gnoChainId: "gno-test",
                 seats: G,
                 watch: W,
-                recovery: IIBCAdmin.RecoveryConfig(30 days, threshold, cancelThreshold, 30 days, 14 days)
+                recovery: IIBCAdmin.RecoveryConfig(delay, threshold, cancelThreshold, 30 days, 14 days)
             })
         );
     }
@@ -1234,7 +1238,8 @@ contract ReviewRegressionsTest is ControlsFixture {
     }
 
     /// @notice Round 5 #5: the first refund's token freezes the verifier from its transfer hook; the batch, whose
-    /// second outcome was proven by that verifier, rolls back whole. A lone item whose own payment freezes it
+    /// outcomes were proven by that verifier, rolls back whole (since round 17 by the check after the last payment,
+    /// every item being validated before any payment). A lone item whose own payment freezes it
     /// rolls back too (checked after the last payment).
     function test_r5_5_verifierFrozenByAPaymentHook_rollsTheBatchBack() public {
         HookToken h = new HookToken();
@@ -1254,7 +1259,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         items[1] = T.SettleItem(b.sequence, 1, 200);
         h.setHook(alice, lc9, freeze);
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, 1));
+        // every item is validated before any payment (round 17): the check after the last payment refuses it
+        vm.expectRevert(abi.encodeWithSelector(T.GnoBadSettlement.selector, type(uint256).max));
         ctl.settleRecords(clientId, items);
         h.setHook(alice, lc9, freeze);
         vm.prank(address(admin));
@@ -2408,5 +2414,55 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
         ctl.retryNotification(clientId, pkt.sequence, _ackNotice(pkt, ok, address(this)), 0);
         assertEq(adapter.successes(), 1);
+    }
+
+    // ============================================================================================= round 17 ==
+
+    /// @notice r17 #1: two undelivered sends of 100 get forged success acks (their reservations released); a forged
+    /// receive leaves 150 in escrow. One kind 12 owes both refunds again: both are reserved before either is paid,
+    /// so the first payment (100) would leave the second's 100 short and is refused; both stay parked, fully
+    /// reserved, in either item order.
+    function _twinHidden(bool reversed) internal {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 100, clientId);
+        _ack(a, bytes("{\"result\":\"AQ==\"}"));
+        _ack(b, bytes("{\"result\":\"AQ==\"}")); // forged success acks
+        assertEq(ctl.reserved(clientId, address(usdc)), 0);
+        _transferIn(clientId, string.concat("transfer/", CP, "/", Strings.toHexString(address(usdc))), 50, bob);
+        address escrow = ics20.getEscrow(clientId);
+        assertEq(usdc.balanceOf(escrow), 150);
+        _retire();
+        _proveRefundable(a);
+        _proveRefundable(b);
+        T.SettleItem[] memory items = new T.SettleItem[](2);
+        items[reversed ? 1 : 0] = T.SettleItem(a.sequence, 1, 100);
+        items[reversed ? 0 : 1] = T.SettleItem(b.sequence, 1, 100);
+        vm.prank(address(admin));
+        ctl.settleRecords(clientId, items);
+        // neither paid: either payment would have taken the other's backing
+        assertEq(usdc.balanceOf(escrow), 150);
+        assertEq(ctl.reserved(clientId, address(usdc)), 200);
+        assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Parked));
+        assertEq(uint8(ctl.sendRecord(clientId, b.sequence).payment), uint8(T.Payment.Parked));
+    }
+
+    function test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment() public {
+        _twinHidden(false);
+    }
+
+    function test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment_reversed() public {
+        _twinHidden(true);
+    }
+
+    /// @notice r17 #2: an enabled recovery's public delay is at least 30 days (`MIN_RECOVERY_DELAY`); zero disables
+    /// it.
+    function test_r17_2_recoveryDelay_atLeast30Days() public {
+        _adminWith(0, 3, 3); // disabled
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        _adminWith(1, 3, 3);
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        _adminWith(30 days - 1, 3, 3);
+        _adminWith(30 days, 3, 3);
     }
 }

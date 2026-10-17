@@ -51,8 +51,8 @@ import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol
 ///                               min(25,000 GNOT, day cap), the refund cap the day cap (ADR §7.2, §9)
 ///   GNOT_MAX_PER_MESSAGE, GNOT_DAY_CAP, GNOT_REFUND_CAP  optional lower ugnot launch limits, in base units
 ///   QUARANTINE_SECONDS          the route's quarantine after a validator-set transition; default 7 days
-///   RECOVERY_DELAY              the emergency recovery's delay; 0 (default) deploys it disabled (§7.12).
-///   RECOVERY_THRESHOLD, RECOVERY_CANCEL_THRESHOLD, RECOVERY_SILENCE, RECOVERY_HOLD_PERIOD  its other settings
+///   RECOVERY_DELAY              the emergency recovery's delay; 0 (default) deploys it disabled, else at least 30 days
+/// (§7.12). RECOVERY_THRESHOLD, RECOVERY_CANCEL_THRESHOLD, RECOVERY_SILENCE, RECOVERY_HOLD_PERIOD  its other settings
 ///                               (approval at least 3 of 4 guardians, cancellation at least 2)
 ///   DEPLOYMENTS_FILE            output JSON; default deployments/<chainid>.json
 /// Run: forge script script/DeployGnoIBC.s.sol --rpc-url $ETH_RPC_URL --broadcast
@@ -165,6 +165,10 @@ contract DeployGnoIBC is Script {
             silence: _u64(vm.envOr("RECOVERY_SILENCE", uint256(30 days)), "RECOVERY_SILENCE"),
             holdPeriod: _u64(vm.envOr("RECOVERY_HOLD_PERIOD", uint256(14 days)), "RECOVERY_HOLD_PERIOD")
         });
+        // an enabled recovery's public delay is long (IBCAdmin refuses less, too)
+        require(
+            p.recovery.delay == 0 || p.recovery.delay >= 30 days, "RECOVERY_DELAY: zero (disabled) or 30 days or more"
+        );
     }
 
     /// @notice The ugnot launch limits of ADR §9 for an expected lock: day cap min(100,000 GNOT, lock / 10), maximum

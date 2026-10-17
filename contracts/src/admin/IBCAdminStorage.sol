@@ -50,6 +50,10 @@ library IBCAdminStorage {
     uint8 internal constant SPENT = 4;
     uint8 internal constant CANCELLED = 5;
 
+    /// @notice An enabled emergency recovery's shortest public delay (ADR §7.12 step 3, "a long public delay"):
+    /// the time everyone has to see an opened recovery and the guardians to cancel it.
+    uint64 internal constant MIN_RECOVERY_DELAY = 30 days;
+
     // kinds (§5.4)
     uint8 internal constant KIND_CANCEL = 1;
     uint8 internal constant KIND_UNPAUSE = 2;

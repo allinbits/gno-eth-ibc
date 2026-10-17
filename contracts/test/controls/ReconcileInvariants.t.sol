@@ -87,6 +87,7 @@ contract ReconcileHandler is Test {
     uint256 internal constant LOSS_TOKENS = 33;
     address public partialToken; // only `partialBacking` sends it
     address public twinToken; // only `twinEligibleRefunds` sends it
+    address public twinInitialToken; // only `twinHiddenInitial` sends it
     // each record's refund paid as of the last step's start: a record paid since must have left every other
     // record's reservation backed (the payment's own postcondition)
     mapping(uint256 => uint256) public refundedAt;
@@ -168,13 +169,14 @@ contract ReconcileHandler is Test {
         (router, ctl, ics20, admin, alice, bob, G) = (router_, ctl_, ics20_, admin_, alice_, bob_, guardians);
         clients.push(clientId);
         tokens.push(usdc);
-        for (uint256 i = 0; i <= LOSS_TOKENS + 1; i++) {
+        for (uint256 i = 0; i <= LOSS_TOKENS + 2; i++) {
             ERC20Mock t = new ERC20Mock();
             t.mint(alice, 1e30);
             tokens.push(address(t));
         }
         partialToken = tokens[LOSS_TOKENS + 1];
         twinToken = tokens[LOSS_TOKENS + 2];
+        twinInitialToken = tokens[LOSS_TOKENS + 3];
         hookToken = new HookToken();
         hookToken.mint(alice, 1e30);
         tokens.push(address(hookToken));
@@ -539,7 +541,9 @@ contract ReconcileHandler is Test {
     /// @notice A random token, never the partial-backing one.
     function _pick(uint256 seed) internal view returns (address token) {
         token = tokens[seed % 2 == 0 ? 0 : bound(seed, 0, tokens.length - 1)];
-        if ((token == partialToken && !partialDone) || token == twinToken) token = tokens[0];
+        if ((token == partialToken && !partialDone) || token == twinToken || token == twinInitialToken) {
+            token = tokens[0];
+        }
     }
 
     /// @notice A receive of `amount` of `token` to bob over the live client; whether it was received.
@@ -1956,6 +1960,44 @@ contract ReconcileHandler is Test {
         }
     }
 
+    // ------------------------------------------------------------------------------------- round 17 actions --
+
+    /// @notice Two refunds a forged success ack hid, owed again in ONE kind 12 (in either order) against 150 of
+    /// backing: both are reserved before either is paid, so neither payment may proceed (it would take the
+    /// other's backing).
+    function twinHiddenInitial(bool reversed) public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 40 || !_ensureOpen()) return;
+        address p = twinInitialToken;
+        _limits(p);
+        if (!_send(alice, p, 100, false) || !_send(alice, p, 100, false)) return;
+        uint256 a = packets.length - 2;
+        this.relay(a, true, false);
+        this.relay(a + 1, true, false);
+        if (!ghost[a].forgedSuccess || !ghost[a + 1].forgedSuccess) return;
+        address escrow = ics20.getEscrow(_live());
+        uint256 bal = IERC20(p).balanceOf(escrow);
+        uint256 reserved = ctl.reserved(_live(), p);
+        if (bal < reserved + 150) return;
+        if (bal - reserved - 150 != 0 && !_receiveToken(p, bal - reserved - 150, true)) return;
+        string memory c = packets[a].sourceClient;
+        if (!_replace(true) || !_prove(a, 0) || !_prove(a + 1, 0)) {
+            _ensureOpen();
+            return;
+        }
+        T.SettleItem[] memory items = new T.SettleItem[](2);
+        items[reversed ? 1 : 0] = _action(a);
+        items[reversed ? 0 : 1] = _action(a + 1);
+        bool settled = items[0].action == 1 && items[1].action == 1 && _settleBatch(c, items, 2);
+        T.SendRecord memory ra = ctl.sendRecord(c, packets[a].sequence);
+        T.SendRecord memory rb = ctl.sendRecord(c, packets[a + 1].sequence);
+        if (settled && ra.refunded == 0 && rb.refunded == 0 && ra.settlement == 1 && rb.settlement == 1) {
+            ok[reversed ? "twinInitialHeldReversed" : "twinInitialHeld"]++;
+        }
+        _ensureOpen();
+    }
+
     // ------------------------------------------------------------------------------------- round 16 actions --
 
     /// @notice Two refunds a forged success ack hid, both owed again by reconciliation and unpaid against too little
@@ -2006,6 +2048,8 @@ contract ReconcileHandler is Test {
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["twinInitialHeld"] == 0) twinHiddenInitial(false);
+        if (ok["twinInitialHeldReversed"] == 0) twinHiddenInitial(true);
         if (ok["twinRefundHeld"] == 0) this.twinEligibleRefunds();
         if (ok["replaceInDipRefunds"] == 0) replaceDuringDip(true);
         if (ok["replaceInDipRoute"] == 0) replaceDuringDip(false);
@@ -2456,7 +2500,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[59] memory names = [
+        string[61] memory names = [
+            "twinInitialHeld",
+            "twinInitialHeldReversed",
             "twinRefundHeld",
             "replaceInDipRefunds",
             "replaceInDipRoute",
@@ -2522,7 +2568,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[42] memory required = [
+        string[44] memory required = [
+            "twinInitialHeld",
+            "twinInitialHeldReversed",
             "twinRefundHeld",
             "replaceInDipRefunds",
             "replaceInDipRoute",

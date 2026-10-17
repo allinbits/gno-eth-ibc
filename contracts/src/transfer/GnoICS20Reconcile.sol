@@ -152,14 +152,16 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         // payment runs token code that could freeze or swap it (any change rolls the whole batch back)
         address active = GnoTransferStorage.activeClient(clientId);
         uint64 gen = g.routes[route].verifierGen;
-        // two passes: every action that moves no tokens first (rejections, delivered, forged refunds and receives),
-        // so each payment checks the escrow against the batch's complete reservations, whatever the items' order
-        for (uint256 pass = 0; pass < 2; pass++) {
-            for (uint256 i = 0; i < items.length; i++) {
-                if ((items[i].action == 1) != (pass == 1)) continue;
-                if (items[i].action == 5) _bookForgedReceive(g, route, clientHash, clientId, items[i], i);
-                else _settleRecord(g, route, clientHash, clientId, items[i], i, active, gen);
-            }
+        // two passes. The first validates and settles every item, and owes every refund (action 1) its whole unpaid
+        // remainder, so each one's reservation is restored, a refund a forged success ack hid included. The second
+        // pays the refunds, each against the batch's complete reservations, whatever the items' order: a payment
+        // never takes the backing of another refund of the same batch
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].action == 5) _bookForgedReceive(g, route, clientHash, clientId, items[i], i);
+            else _settleRecord(g, route, clientHash, clientId, items[i], i, active, gen);
+        }
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].action == 1) _payOwed(g, route, clientHash, clientId, items[i].sequence);
         }
         require(
             GnoTransferStorage.activeClient(clientId) == active && g.routes[route].verifierGen == gen,
@@ -208,17 +210,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
                 GnoBadSettlement(i)
             );
             rec.settlement = 1;
-            if (left != 0) {
-                if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, 0)) {
-                    rec.payment = Payment.Claimed;
-                    emit GnoRefundPaid(clientId, it.sequence, rec.token, rec.sender, left);
-                    // the notification is due: anyone delivers it by retryNotification
-                    GnoTransferStorage.releaseNotice(clientId, it.sequence);
-                } else {
-                    rec.payment = Payment.Parked;
-                    emit GnoRefundParked(clientId, it.sequence, rec.token, left);
-                }
-            }
+            // owed, and reserved, before any payment of the batch (paid in the second pass)
+            if (left != 0) rec.payment = Payment.Parked;
         } else if (action == 2 || action == 3) {
             // a refund already (partly) paid can only be settled as forged (action 4, which books the loss) or
             // genuine (action 1)
@@ -244,11 +237,42 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
         if (transport != terminal) {
             if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
-            if (terminal == 1 || rec.payment == Payment.Claimed) emit GnoNotificationDue(clientId, it.sequence);
+            // a refund settled with nothing left to pay is due now; one still owed, once paid
+            if (terminal == 1 || (action == 1 && rec.refunded == rec.amount)) {
+                emit GnoNotificationDue(clientId, it.sequence);
+            }
         }
         GnoTransferStorage.closeRecord(rec, clientHash);
         GnoTransferStorage.syncReserve(route, rec, reservedBefore);
         emit GnoSettled(clientId, it.sequence, action, it.amount);
+    }
+
+    /// @notice Kind 12's second pass: pays a refund action 1 owed, against the batch's complete reservations; one
+    /// that cannot be paid now stays parked (owed, reserved) for `claimParked`.
+    function _payOwed(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        bytes32 clientHash,
+        string calldata clientId,
+        uint64 sequence
+    )
+        private
+    {
+        SendRecord storage rec = g.records[clientHash][sequence];
+        if (rec.payment != Payment.Parked) return; // settled with nothing left to pay
+        uint256 left = rec.amount - rec.refunded;
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, 0)) {
+            rec.payment = Payment.Claimed;
+            emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, left);
+            // the notification is due: anyone delivers it by retryNotification
+            GnoTransferStorage.releaseNotice(clientId, sequence);
+            (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+            if (transport != terminal) emit GnoNotificationDue(clientId, sequence);
+            GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+        } else {
+            emit GnoRefundParked(clientId, sequence, rec.token, left);
+        }
     }
 
     /// @notice Kind 12 action 5: a forged receive at an inbound sequence of the retired client, whose release or

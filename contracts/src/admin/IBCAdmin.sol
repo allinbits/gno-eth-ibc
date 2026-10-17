@@ -113,8 +113,14 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         (address r, address am, address t) = IBCAdminExec(c.exec).bindings();
         if (r != c.router || am != c.accessManager || t != c.ics20) revert ForeignExec();
         RecoveryConfig memory rc = c.recovery;
-        if (rc.delay != 0 && (rc.threshold < 3 || rc.threshold > 4 || rc.cancelThreshold < 3 || rc.cancelThreshold > 4))
-        {
+        if (
+            rc.delay != 0
+                && (rc.delay < S.MIN_RECOVERY_DELAY
+                    || rc.threshold < 3
+                    || rc.threshold > 4
+                    || rc.cancelThreshold < 3
+                    || rc.cancelThreshold > 4)
+        ) {
             revert RecoveryState();
         }
         router = c.router;
