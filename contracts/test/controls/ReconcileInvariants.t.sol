@@ -89,6 +89,10 @@ contract ReconcileHandler is Test {
     // the permitted shortfall per token: what reconciliation recognized as compromise losses (the refunds a forged
     // success ack hid, owed again), never raised by a receive or a payment, lowered as the escrow covers it again
     mapping(address => uint256) public permittedShortfall;
+    // the refunds that allowance belongs to (packet index => true): a forged success ack hid them, kind 12 owes them
+    // again; the allowance is never more than what of them is still unpaid
+    mapping(uint256 => bool) public eligible;
+    bool internal partialDone; // after its scenario, ordinary sends may use the partial-backing token
     uint256 internal contSeed;
     HookToken internal hookToken;
     mapping(address => bool) internal limited;
@@ -383,7 +387,10 @@ contract ReconcileHandler is Test {
                 // a refund a forged success ack hid, owed again: the compromise loss reconciliation recognizes
                 if (items[k].action == 1) {
                     uint256 j = _packetIndex(c, items[k].sequence);
-                    if (ghost[j].forgedSuccess) permittedShortfall[ghost[j].token] += items[k].amount;
+                    if (ghost[j].forgedSuccess) {
+                        permittedShortfall[ghost[j].token] += items[k].amount;
+                        eligible[j] = true;
+                    }
                 }
             }
         } else if (dec.kind == S.KIND_ROUTE) {
@@ -524,7 +531,7 @@ contract ReconcileHandler is Test {
     /// @notice A random token, never the partial-backing one.
     function _pick(uint256 seed) internal view returns (address token) {
         token = tokens[seed % 2 == 0 ? 0 : bound(seed, 0, tokens.length - 1)];
-        if (token == partialToken) token = tokens[0];
+        if (token == partialToken && !partialDone) token = tokens[0];
     }
 
     /// @notice A receive of `amount` of `token` to bob over the live client; whether it was received.
@@ -1839,6 +1846,19 @@ contract ReconcileHandler is Test {
         uint256 before = IERC20(p).balanceOf(escrow);
         bool refused = !_receiveToken(p, 50, true) && !_receiveToken(p, 1, false);
         if (refused && IERC20(p).balanceOf(escrow) == before) ok["partialBackingHeld"]++;
+        // a new outstanding send escrows 100 more; the older refund, retried, must not take the new send's backing
+        if (_send(alice, p, 100, true)) {
+            uint256 reservedBefore = ctl.reserved(_live(), p);
+            uint256 refunded = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence).refunded;
+            try ctl.claim(_live(), p, 20) { } catch { }
+            try ctl.claimParked(packets[i].sourceClient, packets[i].sequence, 300_000) { } catch { }
+            uint256 paid = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence).refunded - refunded;
+            // whatever was paid, every other record's reservation is still backed in full
+            uint256 others = reservedBefore - (100 - refunded);
+            assertGe(IERC20(p).balanceOf(escrow), others, "a refund took another record's backing");
+            if (paid == 0) ok["olderRefundHeld"]++;
+        }
+        partialDone = true;
         _ensureOpen();
     }
 
@@ -1883,6 +1903,7 @@ contract ReconcileHandler is Test {
 
     /// @notice Runs each required composite once after the random sequence when the sequence did not.
     function sweep() external {
+        if (ok["olderRefundHeld"] == 0) this.partialBacking();
         if (ok["partialBackingHeld"] == 0) this.partialBacking();
         if (ok["lossResolvedIncidentSealed"] == 0) this.lossResolvedIncidentDuringReopening();
         if (ok["continueNonTerminal"] == 0) {
@@ -2116,10 +2137,12 @@ contract ReconcileInvariantsTest is ControlsFixture {
         uint256[] refundedSenders;
         uint256[] refundedAll;
         uint256[] loss;
+        uint256[] eligibleUnpaid; // the unpaid part of the refunds the shortfall allowance belongs to
     }
 
     function _flows(uint256 tn) internal pure returns (Flows memory f) {
         f.reserve = new uint256[](tn + 1);
+        f.eligibleUnpaid = new uint256[](tn + 1);
         f.refundedAlice = new uint256[](tn + 1);
         f.refundedSenders = new uint256[](tn + 1);
         f.refundedAll = new uint256[](tn + 1);
@@ -2153,6 +2176,7 @@ contract ReconcileInvariantsTest is ControlsFixture {
             uint256 t = _tokenIndex(gtoken, tn);
             uint256 r = _reserveOf(rec, amount);
             f.reserve[t] += r;
+            if (h.eligible(i)) f.eligibleUnpaid[t] += r;
             f.refundedAll[t] += rec.refunded;
             if (sender == alice) f.refundedAlice[t] += rec.refunded;
             else f.refundedSenders[t] += rec.refunded;
@@ -2230,10 +2254,13 @@ contract ReconcileInvariantsTest is ControlsFixture {
             assertEq(IERC20(token).balanceOf(bob), h.received(token), "bob's tokens");
             // and the escrow covers the reservation, but for the shortfall reconciliation recognized (the ghost's:
             // a forged success ack's hidden refund, owed again), which no receive or payment may increase
+            // and only on the very refunds it belongs to, while unpaid: every other record's reservation is backed in
+            // full (a payment of one refund never takes another's backing)
             uint256 bal = IERC20(token).balanceOf(escrow);
-            assertLe(
-                reserved > bal ? reserved - bal : 0, h.permittedShortfall(token), "uncovered beyond the recognized loss"
-            );
+            uint256 allowed = h.permittedShortfall(token);
+            if (f.eligibleUnpaid[t] < allowed) allowed = f.eligibleUnpaid[t];
+            assertLe(reserved > bal ? reserved - bal : 0, allowed, "uncovered beyond the recognized loss");
+            assertGe(bal, reserved - f.eligibleUnpaid[t], "another record's reservation lost its backing");
             // the booked losses equal the independently computed forged payouts
             assertEq(ctl.losses(clientId, token), f.loss[t], "losses equal the forged payouts");
             if (open) assertEq(ctl.acceptedDeficit(clientId, token), f.loss[t], "deficit accepted exactly");
@@ -2302,7 +2329,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[55] memory names = [
+        string[56] memory names = [
+            "olderRefundHeld",
             "partialBackingHeld",
             "lossResolvedIncidentSealed",
             "continueNonTerminal",
@@ -2364,7 +2392,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[38] memory required = [
+        string[39] memory required = [
+            "olderRefundHeld",
             "partialBackingHeld",
             "lossResolvedIncidentSealed",
             "continueNonTerminal",

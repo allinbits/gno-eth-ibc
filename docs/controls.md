@@ -195,12 +195,16 @@ bounds (constant work whatever the number of incidents).
     settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
 5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12). The only
    permitted shortfall is the one reconciliation recognizes: the refunds kind 12 owes again for packets a forged
-   success ack released, whose backing the compromise consumed. No receive or payment ever increases the shortfall.
-   The invariant campaign tracks the permitted shortfall in its ghost. It is raised only by those refunds' amounts
-   when kind 12 settles them, and lowered to what is actually uncovered at every step, so escrow covered again is
-   never given away later. `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
-   receives on the new live client, which must be refused. Removing the receive path's reservation guard fails the
-   campaign.
+   success ack released, whose backing the compromise consumed. That allowance belongs to those very refunds and
+   only while they are unpaid. Every other record's reservation is backed in full at all times, so a payment of one
+   refund never takes another's backing, and no receive or payment ever increases the shortfall.
+   The invariant campaign checks this from its own ghost. It marks the eligible refunds when kind 12 owes them
+   again, and bounds the allowance by their unpaid part and by what was uncovered at the previous step (lowered at
+   every step, never raised but by kind 12). It asserts that the escrow covers every reservation but the eligible
+   refunds' unpaid part. `partialBacking` drives the case: a hidden refund of 100 owed again against 50 left, then
+   receives on the new live client, which must be refused. A new outstanding send of 100 follows, then a retry of
+   the older refund, which must not take the new send's backing. Removing either the receive path's or the payment's
+   reservation guard fails the campaign.
 6. When a route opens, every token's losses equal its accepted deficit.
 7. While a route is reopening, its losses do not change. Reconciliation is sealed: no kind 12 on a client whose
    incident is reopening, and no loss booked anywhere on the route. The invariant campaign snapshots every token's
