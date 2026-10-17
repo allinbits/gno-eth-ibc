@@ -622,4 +622,82 @@ contract IBCAdminKindsTest is ControlsFixture {
         vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.SetupIncomplete.selector, 4));
         check.check(address(admin), deployer);
     }
+
+    // ============================================================================================= round 13 ==
+
+    /// @notice r13 #1: kind 5's denom grammar is the one shared with gno.land's ibcgov builder (`isGnoWireDenom`):
+    /// a native `[a-z][a-z0-9]{2,15}`, or `gno.land:r` and at least two Re_name segments
+    /// `[a-z][a-z0-9]*([_-][a-z0-9]+)*` with an optional `.` slug of 1 to 32 `[A-Za-z0-9_-]`, at most 128 bytes. Cases
+    /// mirror the gno side's.
+    function test_r13_1_kind5_gnoDenomGrammar() public pure {
+        string[14] memory good = [
+            // gno-realms' TestGRC20AliasRoundTrip
+            "gno.land:r:demo:foo",
+            "gno.land:r:demo:foo.FOO",
+            "gno.land:r:demo:foo.Bar123",
+            // hyphenated and underscored paths, version segments
+            "gno.land:r:my-org:token.TKN",
+            "gno.land:r:my-org:token.TOK",
+            "gno.land:r:my_org:my-token_v2.TKN",
+            "gno.land:r:nt:grc20:v0.TKN",
+            "gno.land:r:a1-b2_c3:d4.T",
+            "gno.land:r:demo:foo.A-b_9",
+            "gno.land:r:demo:foo.ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", // a 32-byte slug
+            // native
+            "ugnot",
+            "abc",
+            "abcdefghijklmnop",
+            "a1b2"
+        ];
+        for (uint256 i = 0; i < good.length; i++) {
+            assertTrue(S.canonicalGnoDenom(good[i]), good[i]);
+        }
+        string[22] memory bad = [
+            "gno.land:r:my--org:token.TKN", // doubled separator
+            "gno.land:r:my_:token.TKN", // trailing `_`
+            "gno.land:r:my-:token.TKN", // trailing `-`
+            "gno.land:r:-my:token.TKN", // leading separator
+            "gno.land:r:my_-org:token.TKN",
+            "gno.land:r:1org:token.TKN",
+            "gno.land:r:demo.FOO", // one segment
+            "gno.land:r:demo",
+            "gno.land:r:demo:foo.ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456", // a 33-byte slug
+            "gno.land:r:demo:foo.",
+            "gno.land:r:demo:foo.T.U",
+            "gno.land:r:demo#sub:foo.T",
+            "gno.land:p:demo:foo.T",
+            "gno.land:e:g1abc:run.T",
+            "/gno.land/r/demo:foo", // a realm-issued coin
+            "ibc/ABC123",
+            "u_gnot",
+            "abcdefghijklmnopq", // 17
+            "Ugnot",
+            "ug",
+            "1gnot",
+            "gno.land:r:demo:foo.FO O"
+        ];
+        for (uint256 i = 0; i < bad.length; i++) {
+            assertFalse(S.canonicalGnoDenom(bad[i]), bad[i]);
+        }
+        // at most 128 bytes in all
+        bytes memory long = bytes("gno.land:r:demo:");
+        while (long.length < 128) long = bytes.concat(long, "a");
+        assertEq(bytes(long).length, 128);
+        assertTrue(S.canonicalGnoDenom(string(long)));
+        assertFalse(S.canonicalGnoDenom(string.concat(string(long), "a")));
+    }
+
+    /// @notice r13 #1, across the chains: kind 5 registers `gno.land:r:my-org:token.TKN`'s voucher, and a transfer of
+    /// that denom from gno.land mints it.
+    function test_r13_1_hyphenatedGrc20_registeredAndReceived() public {
+        string memory denom = "gno.land:r:my-org:token.TKN";
+        GnoVoucher v =
+            new GnoVoucher("Token", "TOK", 6, address(ics20), string.concat("transfer/", clientId, "/", denom));
+        uint64 seq = _decidePending(S.KIND_VOUCHER, P.voucher(clientId, denom, address(v), address(v).codehash));
+        _executeAfterWeek(seq);
+        assertEq(_state(seq), S.EXECUTED);
+        _setLimits(address(v), 1000, 1000, 1000);
+        assertTrue(_isSuccessAck(_transferIn(clientId, denom, 25, bob)));
+        assertEq(v.balanceOf(bob), 25);
+    }
 }

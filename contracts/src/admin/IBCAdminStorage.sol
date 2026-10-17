@@ -152,41 +152,51 @@ library IBCAdminStorage {
             && keccak256(prefix[1]) == keccak256(GNO_KEY_PREFIX);
     }
 
-    /// @notice A gno.land denom in the exact form gno-realms' transfer app puts on the wire, by a strict grammar:
-    /// a native denom `[a-z][a-z0-9]{2,15}` (e.g. `ugnot`), or a GRC20 alias, the grc20reg key `<realm path>.<symbol>`
-    /// with `/` replaced by `:` (`GRC20Alias`): `gno.land:r(:[a-z][a-z0-9_]*){2,}(\.[A-Za-z0-9_-]{1,32})?`, at
-    /// most 128 bytes.
+    /// @notice A gno.land denom in exactly the wire grammar shared with gno.land's ibcgov builder
+    /// (`isGnoWireDenom`), at most 128 bytes:
+    ///
+    /// - native: `[a-z][a-z0-9]{2,15}` (e.g. `ugnot`);
+    /// - GRC20 alias (gno-realms' `GRC20Alias` of a grc20reg key): the literal `gno.land:r`, then at least two
+    ///   `:`-separated segments, each GnoVM's `Re_name` `[a-z][a-z0-9]*([_-][a-z0-9]+)*` (single `_` or `-`
+    ///   separators, never leading, trailing or doubled), then optionally `.` and a slug of 1 to 32 bytes of
+    ///   `[A-Za-z0-9_-]`.
+    ///
+    /// Realm-issued coins (`/gno.land/r/...:denom`) are refused: the gno side never sends them.
     function canonicalGnoDenom(string memory denom) internal pure returns (bool) {
         bytes memory b = bytes(denom);
         uint256 n = b.length;
         if (n == 0 || n > 128) return false;
-        bytes memory head = "gno.land:r:";
-        bool grc20 = n > head.length;
-        for (uint256 i = 0; grc20 && i < head.length; i++) {
-            grc20 = b[i] == head[i];
+        bytes memory head = "gno.land:r";
+        bool isAlias = n > head.length;
+        for (uint256 i = 0; isAlias && i < head.length; i++) {
+            isAlias = b[i] == head[i];
         }
-        if (!grc20) {
+        if (!isAlias) {
             if (n < 3 || n > 16 || !_lower(b[0])) return false;
             for (uint256 i = 1; i < n; i++) {
                 if (!_lower(b[i]) && !_digit(b[i])) return false;
             }
             return true;
         }
-        // segments after "gno.land:r": each ':' then [a-z][a-z0-9_]*, at least two, then '.' and the symbol
+        uint256 j = head.length; // at the ':' before the first segment
         uint256 segs;
-        uint256 j = head.length - 1; // at the ':' before the first segment
         while (j < n && b[j] == ":") {
             j++;
             if (j >= n || !_lower(b[j])) return false;
             j++;
-            while (j < n && (_lower(b[j]) || _digit(b[j]) || b[j] == "_")) j++;
+            while (j < n && (_lower(b[j]) || _digit(b[j]))) j++;
+            while (j < n && (b[j] == "_" || b[j] == "-")) {
+                j++;
+                if (j >= n || !(_lower(b[j]) || _digit(b[j]))) return false;
+                while (j < n && (_lower(b[j]) || _digit(b[j]))) j++;
+            }
             segs++;
         }
         if (segs < 2) return false;
-        if (j == n) return true; // a key without a symbol (`fqname.Construct` with an empty one)
+        if (j == n) return true;
         if (b[j] != ".") return false;
-        uint256 sym = n - j - 1;
-        if (sym == 0 || sym > 32) return false;
+        uint256 slug = n - j - 1;
+        if (slug == 0 || slug > 32) return false;
         for (uint256 k = j + 1; k < n; k++) {
             bytes1 c = b[k];
             if (!_lower(c) && !_digit(c) && !(c >= "A" && c <= "Z") && c != "_" && c != "-") return false;

@@ -1439,25 +1439,21 @@ contract ReviewRegressionsTest is ControlsFixture {
         for (uint256 i = 0; i < good.length; i++) {
             assertTrue(S.canonicalGnoDenom(good[i]), good[i]);
         }
-        string[18] memory bad = [
+        string[14] memory bad = [
             "",
             "ug",
             "Ugnot",
-            "u_gnot",
             "1gnot",
-            "abcdefghijklmnopq",
+            "u gnot",
+            "u_gnot",
             "ibc/ABC123",
             "transfer/client-0/ugnot",
             "gno.land/r/demo/foo.FOO",
-            "gno.land:r:demo.FOO",
             "gno.land:p:demo:foo.FOO",
             "gno.land:r:demo:foo.",
             "gno.land:r:Demo:foo.FOO",
             "gno.land:r:demo::foo.FOO",
-            "gno.land:r:demo:foo.FO O",
-            "gno.land:r:demo:foo.FOO.x",
-            "gno.land:r:demo:foo.ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456",
-            "gno.land:r:demo:_foo.FOO"
+            "gno.land:r:demo:foo.FO O"
         ];
         for (uint256 i = 0; i < bad.length; i++) {
             assertFalse(S.canonicalGnoDenom(bad[i]), bad[i]);
