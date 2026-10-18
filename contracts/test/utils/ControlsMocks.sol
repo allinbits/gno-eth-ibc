@@ -129,9 +129,13 @@ contract SenderAdapter is IIBCSenderCallbacks {
         _forward();
     }
 
+    /// @notice Everything forwarded to the owner so far (for balance oracles that check owner and adapter apart).
+    uint256 public forwarded;
+
     function _forward() private {
         uint256 b = token.balanceOf(address(this));
         require(b != 0, "nothing refunded yet");
+        forwarded += b;
         token.transfer(owner, b);
     }
 

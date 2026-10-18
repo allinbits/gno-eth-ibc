@@ -265,6 +265,11 @@ bounds (constant work whatever the number of incidents).
     records show; the escrow holds what was sent, less every refund and every receive; receivers hold exactly what
     was received; a voucher's supply moves only by receives, returns and refunds. An undelivered packet's sender
     ends refunded its packet's full amount, or the remainder stays reserved.
+    Every party is checked on its own, never pooled: alice, the contract sender that re-enters, the sender adapter
+    (less what it forwarded) and the adapter's owner (exactly what was forwarded), each from what the campaign minted
+    to it per (sender, token), what it sent and the refunds of its own records; only bob sends the voucher. Probes
+    that move a paid refund to another party, with every total unchanged, fail it at once
+    (`test_r23_reentrantRefundRedirected_failsAtOnce`, `test_r23_adapterRefundRedirectedToOwner_failsAtOnce`).
 4c. Kind 12's actions agree with the proven outcomes (a refund only for a packet not delivered, a delivered
     settlement only for one delivered), and the losses booked equal the forged payouts as amounts.
 5. Escrow per route and token is at least the reservation (owed refunds and outstanding sends, §7.12).

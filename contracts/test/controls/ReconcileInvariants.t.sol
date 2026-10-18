@@ -161,7 +161,8 @@ contract ReconcileHandler is Test {
     mapping(address => mapping(address => uint256)) public sentBy; // sender => token => amount escrowed by sends
     mapping(address => uint256) public received; // token => amount released or minted to bob by receives
     mapping(address => uint256) public initialAlice; // token => alice's balance when the campaign starts
-    mapping(address => uint256) public mintedToSenders; // token => minted to the contract senders
+    // what the handler minted to each contract sender, per (sender, token)
+    mapping(address => mapping(address => uint256)) public minted;
     ReentrantSender public reentrant;
     GnoVoucher public ugnot;
     uint256 public ugnotSupply0;
@@ -622,7 +623,7 @@ contract ReconcileHandler is Test {
         _ratchet();
         amount = bound(amount, 1, 100);
         ERC20Mock(tokens[0]).mint(address(adapter), amount);
-        mintedToSenders[tokens[0]] += amount;
+        minted[address(adapter)][tokens[0]] += amount;
         _limits(tokens[0]);
         vm.recordLogs();
         try adapter.send(amount, _live()) {
@@ -910,7 +911,7 @@ contract ReconcileHandler is Test {
         }
         try ctl.claim(_live(), tokens[2], 20) { } catch { }
         ERC20Mock(tokens[2]).mint(address(reentrant), amount);
-        mintedToSenders[tokens[2]] += amount;
+        minted[address(reentrant)][tokens[2]] += amount;
         _limits(tokens[2]);
         vm.recordLogs();
         try reentrant.send(amount, _live()) { }
@@ -1571,7 +1572,7 @@ contract ReconcileHandler is Test {
         if (ctl.routeClosed(_live())) return;
         amount = amount % 50 + 1;
         ERC20Mock(tokens[0]).mint(address(adapter), amount);
-        mintedToSenders[tokens[0]] += amount;
+        minted[address(adapter)][tokens[0]] += amount;
         _limits(tokens[0]);
         try ctl.claim(_live(), tokens[0], 20) { } catch { }
         vm.recordLogs();
@@ -1794,7 +1795,7 @@ contract ReconcileHandler is Test {
         if (clients.length >= 64 || !_ensureOpen()) return;
         amount = amount % 50 + 1;
         ERC20Mock(tokens[0]).mint(address(adapter), amount);
-        mintedToSenders[tokens[0]] += amount;
+        minted[address(adapter)][tokens[0]] += amount;
         _limits(tokens[0]);
         try ctl.claim(_live(), tokens[0], 20) { } catch { }
         vm.recordLogs();
@@ -2847,6 +2848,48 @@ contract ReconcileInvariantsTest is ControlsFixture {
         revert("the burned bit not found");
     }
 
+    /// @notice r23, redirection probes: a refund the record shows paid to its contract sender, moved afterwards to
+    /// another party (the adapter, or the adapter's owner) with every total unchanged. The oracle checks each party
+    /// on its own and must reject it at once.
+    function test_r23_reentrantRefundRedirected_failsAtOnce() public {
+        h.senderReentry(5);
+        uint256 i = h.packetCount() - 1;
+        IICS26RouterMsgs.Packet memory pkt = h.packet(i);
+        assertEq(ctl.sendRecord(pkt.sourceClient, pkt.sequence).refunded, 5, "refunded to the re-entrant sender");
+        this.checkpoint();
+        address re = address(h.reentrant());
+        IERC20 token = IERC20(h.tokens(2));
+        address ad = h.adapterAddress();
+        vm.prank(re);
+        token.transfer(ad, 5); // as if the refund had gone to the adapter
+        vm.expectRevert(bytes("the re-entrant sender's tokens: 0 != 5"));
+        this.checkpoint();
+    }
+
+    function test_r23_adapterRefundRedirectedToOwner_failsAtOnce() public {
+        h.sendFromAdapter(7, false);
+        uint256 i = h.packetCount() - 1;
+        IICS26RouterMsgs.Packet memory pkt = h.packet(i);
+        h.relay(i, false, true); // a timeout: refunded to the adapter, which forwards it to its owner
+        assertEq(ctl.sendRecord(pkt.sourceClient, pkt.sequence).refunded, 7);
+        this.checkpoint();
+        // a second refund of 7 the adapter kept, then moved to the owner outside a forward
+        SenderAdapter ad = SenderAdapter(h.adapterAddress());
+        h.sendFromAdapter(7, false);
+        i = h.packetCount() - 1;
+        pkt = h.packet(i);
+        ad.setRefuse(true); // the callback fails: the refund stays with the adapter, not forwarded
+        h.relay(i, false, true);
+        ad.setRefuse(false);
+        assertEq(ctl.sendRecord(pkt.sourceClient, pkt.sequence).refunded, 7);
+        this.checkpoint();
+        address owner = ad.owner();
+        vm.prank(address(ad));
+        usdc.transfer(owner, 7);
+        vm.expectRevert(bytes("the adapter's tokens: 0 != 7"));
+        this.checkpoint();
+    }
+
     /// @notice r22 #1, corruption probes: packet 0's sender or denom substituted while the record's commitment is
     /// moved to the substituted packet (consistent with it), amount and everything else unchanged. The oracle must
     /// reject both from the ghost's own send inputs.
@@ -3001,7 +3044,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
     struct Flows {
         uint256[] reserve;
         uint256[] refundedAlice;
-        uint256[] refundedSenders;
+        uint256[] refundedAdapter;
+        uint256[] refundedReentrant;
         uint256[] refundedAll;
         uint256[] loss;
         uint256[] eligibleUnpaid; // the unpaid part of the refunds the shortfall allowance belongs to
@@ -3011,7 +3055,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
         f.reserve = new uint256[](tn + 1);
         f.eligibleUnpaid = new uint256[](tn + 1);
         f.refundedAlice = new uint256[](tn + 1);
-        f.refundedSenders = new uint256[](tn + 1);
+        f.refundedAdapter = new uint256[](tn + 1);
+        f.refundedReentrant = new uint256[](tn + 1);
         f.refundedAll = new uint256[](tn + 1);
         f.loss = new uint256[](tn + 1); // index tn: the ugnot voucher
     }
@@ -3047,8 +3092,12 @@ contract ReconcileInvariantsTest is ControlsFixture {
             f.reserve[t] += r;
             if (h.eligible(i)) f.eligibleUnpaid[t] += r;
             f.refundedAll[t] += rec.refunded;
+            // each sender's refunds on its own: a refund paid to another party than the record's sender shows
             if (sender == alice) f.refundedAlice[t] += rec.refunded;
-            else f.refundedSenders[t] += rec.refunded;
+            else if (sender == _adapter()) f.refundedAdapter[t] += rec.refunded;
+            else if (sender == address(h.reentrant())) f.refundedReentrant[t] += rec.refunded;
+            else require(sender == bob && t == tn, "a sender the oracle does not track");
+            if (t == tn) require(sender == bob, "only bob sends the voucher");
             // every record settled at most once, never refunded beyond its amount
             assertLe(h.settledCount(keccak256(abi.encode(pkt.sourceClient, pkt.sequence))), 1, "settled once");
             assertLe(rec.refunded, amount, "refunded once");
@@ -3160,16 +3209,24 @@ contract ReconcileInvariantsTest is ControlsFixture {
             assertEq(ctl.losses(clientId, token), f.loss[t], "losses equal the forged payouts");
             if (open) assertEq(ctl.acceptedDeficit(clientId, token), f.loss[t], "deficit accepted exactly");
         }
-        // the contract senders hold what was minted to them, less what they sent, plus their refunds
+        // each contract sender holds what was minted to it, less what it sent, plus its own refunds; the adapter
+        // less what it forwarded, which its owner holds, and nothing else
+        SenderAdapter ad = SenderAdapter(_adapter());
+        address re = address(h.reentrant());
         for (uint256 t = 0; t < tn; t++) {
             address token = h.tokens(t);
+            uint256 fwd = token == address(ad.token()) ? ad.forwarded() : 0;
             assertEq(
-                IERC20(token).balanceOf(_adapter()) + IERC20(token).balanceOf(address(0xADA))
-                    + IERC20(token).balanceOf(address(h.reentrant())),
-                h.mintedToSenders(token) - h.sentBy(_adapter(), token) - h.sentBy(address(h.reentrant()), token)
-                    + f.refundedSenders[t],
-                "the contract senders' tokens"
+                IERC20(token).balanceOf(re),
+                h.minted(re, token) - h.sentBy(re, token) + f.refundedReentrant[t],
+                "the re-entrant sender's tokens"
             );
+            assertEq(
+                IERC20(token).balanceOf(address(ad)),
+                h.minted(address(ad), token) - h.sentBy(address(ad), token) + f.refundedAdapter[t] - fwd,
+                "the adapter's tokens"
+            );
+            assertEq(IERC20(token).balanceOf(ad.owner()), fwd, "the adapter's owner's tokens: what it forwarded");
         }
         // the voucher: minted by receives and refunds, burned by bob's sends, all held by bob
         uint256 v = h.received(address(ugnot)) + f.refundedAll[tn] - h.sentBy(bob, address(ugnot));
