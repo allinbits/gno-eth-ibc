@@ -135,6 +135,8 @@ contract ReconcileHandler is Test {
 
     IICS26RouterMsgs.Packet[] internal packets;
     mapping(uint256 => Ghost) public ghost;
+    // the client id each send named (the handler's own input, never read back from the packet)
+    mapping(uint256 => string) public sentOver;
     mapping(bytes32 => uint256) public settledCount;
     // the ghost transport history: the block each packet's ack or timeout was processed in (0: never)
     mapping(uint256 => uint256) public relayBlock;
@@ -398,6 +400,12 @@ contract ReconcileHandler is Test {
         _ratchet();
     }
 
+    /// @notice Test-only (excluded from the fuzzed selectors): replaces packet `i` as the handler saw it, for the
+    /// binding corruption probes.
+    function probeSetPacket(uint256 i, IICS26RouterMsgs.Packet memory pkt) external {
+        packets[i] = pkt;
+    }
+
     function setVoucher(GnoVoucher v) external {
         ugnot = v;
         ugnotSupply0 = v.totalSupply();
@@ -572,6 +580,7 @@ contract ReconcileHandler is Test {
             if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
                 packets.push(abi.decode(logs[i].data, (IICS26RouterMsgs.Packet)));
                 ghost[packets.length - 1] = Ghost(delivered, false, false, false, from, token, amount);
+                sentOver[packets.length - 1] = _live();
                 if (delivered) redeemable[token] += amount;
                 sentBy[from][token] += amount;
                 return true;
@@ -847,6 +856,7 @@ contract ReconcileHandler is Test {
         hookToken.setHook(ics20.getEscrow(_live()), address(busyProbe), abi.encodeCall(BusyProbe.probe, (gov)));
         amount = bound(amount, 1, 10);
         _limits(address(hookToken));
+        string memory sentClient = _live();
         vm.recordLogs();
         vm.prank(alice);
         try ics20.sendTransfer(
@@ -854,7 +864,7 @@ contract ReconcileHandler is Test {
                 denom: address(hookToken),
                 amount: amount,
                 receiver: "g1receiver",
-                sourceClient: _live(),
+                sourceClient: sentClient,
                 destPort: ICS20Lib.DEFAULT_PORT_ID,
                 timeoutTimestamp: uint64(_now() + 600),
                 memo: ""
@@ -873,6 +883,7 @@ contract ReconcileHandler is Test {
             if (logs[i].emitter == address(router) && logs[i].topics[0] == IICS26Router.SendPacket.selector) {
                 packets.push(abi.decode(logs[i].data, (IICS26RouterMsgs.Packet)));
                 ghost[packets.length - 1] = Ghost(true, false, false, false, alice, address(hookToken), amount);
+                sentOver[packets.length - 1] = sentClient;
                 redeemable[address(hookToken)] += amount;
                 sentBy[alice][address(hookToken)] += amount;
             }
@@ -2703,10 +2714,11 @@ contract ReconcileInvariantsTest is ControlsFixture {
         vm.prank(alice);
         usdc.approve(address(ics20), type(uint256).max);
         targetContract(address(h));
-        bytes4[] memory sel = new bytes4[](3);
+        bytes4[] memory sel = new bytes4[](4);
         sel[0] = ReconcileHandler.sweep.selector;
         sel[1] = ReconcileHandler.setVoucher.selector;
         sel[2] = ReconcileHandler.setChecker.selector;
+        sel[3] = ReconcileHandler.probeSetPacket.selector;
         excludeSelector(FuzzSelector(address(h), sel));
     }
 
@@ -2716,24 +2728,25 @@ contract ReconcileInvariantsTest is ControlsFixture {
     }
 
     /// @notice Whether packet `i` burned a voucher rather than escrowing a native token, from the ghost's own token
-    /// origin (the voucher gno.land's ugnot mints) and the authenticated packet's denom (a returning voucher carries
-    /// its `transfer/<client>/` trace; a native token its address), never from the record's flag; both must agree.
+    /// origin (the voucher gno.land's ugnot mints), never from the record's flag; the authenticated packet's full
+    /// denom must be the one that origin calls for.
     function _burnedOf(uint256 i) internal view returns (bool) {
         (,,,,, address gtoken,) = h.ghost(i);
         IICS20TransferMsgs.FungibleTokenPacketData memory data =
             abi.decode(h.packet(i).payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
-        bytes memory denom = bytes(data.denom);
-        bool traced = denom.length > 9 && keccak256(_head(denom, 9)) == keccak256("transfer/");
-        bool voucher = gtoken == address(ugnot);
-        require(traced == voucher, "the packet's denom and the ghost's token origin disagree");
-        return voucher;
+        require(
+            keccak256(bytes(data.denom)) == keccak256(bytes(_wireDenom(i))),
+            "the packet's denom is the ghost's wire denom"
+        );
+        return gtoken == address(ugnot);
     }
 
-    function _head(bytes memory b, uint256 n) internal pure returns (bytes memory out) {
-        out = new bytes(n);
-        for (uint256 k = 0; k < n; k++) {
-            out[k] = b[k];
-        }
+    /// @notice The full wire denom of send `i`, from the ghost's inputs alone: a native token its address in
+    /// lowercase hex; gno.land's ugnot voucher, returning to its source, `transfer/<the client the send named>/ugnot`.
+    function _wireDenom(uint256 i) internal view returns (string memory) {
+        (,,,,, address gtoken,) = h.ghost(i);
+        if (gtoken == address(ugnot)) return string.concat("transfer/", h.sentOver(i), "/ugnot");
+        return Strings.toHexString(gtoken);
     }
 
     /// @notice What the record still owes its sender: escrowed tokens reserved, or vouchers to mint again (a burn).
@@ -2769,11 +2782,24 @@ contract ReconcileInvariantsTest is ControlsFixture {
     }
 
     /// @notice The record is bound to its packet: the token, sender and amount the handler sent, which the packet the
-    /// router committed (and emitted) carries too.
+    /// router committed (and emitted) carries too. The packet's metadata is derived independently from the ghost's
+    /// send inputs: the client the send named, the canonical sender (lowercase hex) and the full wire denom.
     function _checkBinding(IICS26RouterMsgs.Packet memory pkt, T.SendRecord memory rec, uint256 i) internal view {
         (,,,, address sender, address token, uint256 amount) = h.ghost(i);
         IICS20TransferMsgs.FungibleTokenPacketData memory data =
             abi.decode(pkt.payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
+        require(
+            keccak256(bytes(pkt.sourceClient)) == keccak256(bytes(h.sentOver(i))), "the packet's client is the send's"
+        );
+        require(
+            keccak256(bytes(data.sender)) == keccak256(bytes(Strings.toHexString(sender))),
+            "the packet's sender is the ghost's canonical sender"
+        );
+        require(
+            keccak256(bytes(data.denom)) == keccak256(bytes(_wireDenom(i))),
+            "the packet's denom is the ghost's wire denom"
+        );
+        require(keccak256(bytes(data.receiver)) == keccak256("g1receiver"), "the packet's receiver is the send's");
         assertEq(data.amount, amount, "the packet carries the amount sent");
         assertEq(rec.amount, amount, "the record's amount is the packet's");
         assertEq(rec.token, token, "the record's token is the packet's");
@@ -2819,6 +2845,52 @@ contract ReconcileInvariantsTest is ControlsFixture {
             }
         }
         revert("the burned bit not found");
+    }
+
+    /// @notice r22 #1, corruption probes: packet 0's sender or denom substituted while the record's commitment is
+    /// moved to the substituted packet (consistent with it), amount and everything else unchanged. The oracle must
+    /// reject both from the ghost's own send inputs.
+    function test_r22_1_senderSubstituted_failsAtOnce() public {
+        _substitute(true);
+    }
+
+    function test_r22_1_denomSubstituted_failsAtOnce() public {
+        _substitute(false);
+    }
+
+    function _substitute(bool sender) internal {
+        h.send(0, 40, true); // usdc, outstanding
+        IICS26RouterMsgs.Packet memory pkt = h.packet(0);
+        this.checkpoint();
+        bytes32 old = ICS24Host.packetCommitmentBytes32(pkt);
+        IICS20TransferMsgs.FungibleTokenPacketData memory data =
+            abi.decode(pkt.payloads[0].value, (IICS20TransferMsgs.FungibleTokenPacketData));
+        if (sender) data.sender = Strings.toHexString(bob);
+        else data.denom = Strings.toHexString(h.tokens(1));
+        pkt.payloads[0].value = abi.encode(data);
+        bytes32 forged = ICS24Host.packetCommitmentBytes32(pkt);
+        // the record's commitment moved to the substituted packet
+        vm.record();
+        ctl.sendRecord(pkt.sourceClient, pkt.sequence);
+        (bytes32[] memory reads,) = vm.accesses(address(ics20));
+        bool moved;
+        for (uint256 k = 0; k < reads.length && !moved; k++) {
+            if (vm.load(address(ics20), reads[k]) == old) {
+                vm.store(address(ics20), reads[k], forged);
+                moved = true;
+            }
+        }
+        assertTrue(moved, "the commitment slot not found");
+        assertEq(ctl.sendRecord(pkt.sourceClient, pkt.sequence).commitment, forged);
+        h.probeSetPacket(0, pkt);
+        vm.expectRevert(
+            bytes(
+                sender
+                    ? "the packet's sender is the ghost's canonical sender"
+                    : "the packet's denom is the ghost's wire denom"
+            )
+        );
+        this.checkpoint();
     }
 
     /// @notice r21 #2, a corruption probe: an outstanding native send's record set to `Success` and its reservation

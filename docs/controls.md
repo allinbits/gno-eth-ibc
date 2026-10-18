@@ -255,7 +255,12 @@ bounds (constant work whatever the number of incidents).
 3. Acks and timeouts on the live client never count against any incident.
 4. Every send record is settled at most once, and a refund is never paid twice (`refunded <= amount`).
 4a. A send record is bound to its packet: its token, sender, amount and commitment are those of the packet the
-    router committed (the packet's own data), never changed after the send.
+    router committed (the packet's own data), never changed after the send. The campaign derives the packet's
+    metadata independently from its own send inputs and compares it with the decoded payload: the source client
+    the send named, the canonical sender (`Strings.toHexString`, lowercase), the full wire denom (a native token's
+    address; gno.land's voucher `transfer/<that client>/ugnot`), the receiver and the amount. Corruption probes
+    that substitute the sender or the denom, with the record's commitment moved to match, fail it at once
+    (`test_r22_1_senderSubstituted_failsAtOnce`, `test_r22_1_denomSubstituted_failsAtOnce`).
 4b. Payments conserve tokens: every sender holds what it had, less what it sent, plus exactly the refunds its
     records show; the escrow holds what was sent, less every refund and every receive; receivers hold exactly what
     was received; a voucher's supply moves only by receives, returns and refunds. An undelivered packet's sender
