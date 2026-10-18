@@ -283,8 +283,7 @@ contract GovVectorsTest is ControlsFixture {
             assertEq(vm.parseJsonBytes(file, ".epochNotice.ackDuplicate"), _noticeAck(3));
         }
         router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, _noticeAck(1), "", IICS02ClientMsgs.Height(0, 1)));
-        vm.expectRevert(IIBCAdmin.NoNoticeOwed.selector);
-        admin.resendEpochNotice(2);
+        assertTrue(admin.epochNoticeAcked(2));
     }
 
     function _escape(string memory s) internal pure returns (string memory) {

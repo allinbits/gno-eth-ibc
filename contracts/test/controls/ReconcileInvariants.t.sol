@@ -96,6 +96,8 @@ contract ReconcileHandler is Test {
     // the permitted shortfall per token: what reconciliation recognized as compromise losses (the refunds a forged
     // success ack hid, owed again), never raised by a receive or a payment, lowered as the escrow covers it again
     mapping(address => uint256) public permittedShortfall;
+    // the epochs whose notice a switched (or duplicate) ack reached
+    mapping(uint32 => bool) internal noticeAckedGhost;
     // the refunds that allowance belongs to (packet index => true): a forged success ack hid them, kind 12 owes them
     // again; the allowance is never more than what of them is still unpaid
     mapping(uint256 => bool) public eligible;
@@ -2161,9 +2163,10 @@ contract ReconcileHandler is Test {
         _ensureOpen();
     }
 
-    /// @notice The epoch notices, interleaved with the replacements and recoveries that send them: an owed notice
-    /// (of any epoch) re-sent, then answered by gno.land's switched ack, an error ack, or a timeout. Only the switched
-    /// ack ends it; the others leave it re-sendable. A notice over a client since retired (frozen) cannot be answered.
+    /// @notice The epoch notices, interleaved with the replacements and recoveries that send them: a recorded notice
+    /// (of any epoch, acknowledged or not, over its own client even once retired) re-sent, then answered by gno.land's
+    /// switched ack, an error ack, or a timeout. Only the switched (or duplicate) ack marks it acknowledged, once; a
+    /// resend never fails and never changes the epoch. A notice over a retired (frozen) client cannot be answered.
     function noticeStep(uint256 seed) public {
         calls++;
         _ratchet();
@@ -2171,12 +2174,14 @@ contract ReconcileHandler is Test {
         if (top < 2) return;
         uint32 ep = uint32(2 + (seed & 0xffff) % (top - 1));
         bytes memory notice = admin.epochNotice(ep);
-        if (notice.length == 0) return;
+        assertEq(notice.length != 0, true, "every opened epoch's notice recorded");
+        string memory gc = admin.govClient();
         vm.recordLogs();
-        try admin.resendEpochNotice(ep) { }
-        catch {
-            return; // answered already
-        }
+        admin.resendEpochNotice(ep); // always: acknowledged or not, retired client or not
+        assertEq(admin.epoch(), top, "a resend changes no epoch");
+        assertEq(admin.govClient(), gc, "nor the client");
+        if (noticeAckedGhost[ep]) ok["noticeResentAfterAck"]++;
+        if (ep != top) ok["noticeResentOld"]++;
         IICS26RouterMsgs.Packet memory pkt;
         bool sent;
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -2203,18 +2208,14 @@ contract ReconcileHandler is Test {
                 ? abi.encodePacked(ep, uint64(0), uint8(1 + 2 * ((seed >> 24) % 2)), uint8(0))  // switched or duplicate
                 : ICS24Host.UNIVERSAL_ERROR_ACK;
             try router.ackPacket(IICS26RouterMsgs.MsgAckPacket(pkt, ack, "", IICS02ClientMsgs.Height(0, 1))) {
-                if (how == 0) ok["noticeAcked"]++;
-            } catch {
-                return;
-            }
+                if (how == 0) {
+                    ok["noticeAcked"]++;
+                    noticeAckedGhost[ep] = true;
+                }
+            } catch { }
         }
-        // only the switched (or duplicate) ack ends it
-        bool ended;
-        try admin.resendEpochNotice(ep) { }
-        catch {
-            ended = true;
-        }
-        assertEq(ended, how == 0, "only gno.land's switch ends a notice");
+        // only a switched (or duplicate) ack ever marks it, and nothing unmarks it
+        assertEq(admin.epochNoticeAcked(ep), noticeAckedGhost[ep], "acknowledged iff gno.land's switch landed");
         _checkpoint();
     }
 
@@ -2514,6 +2515,21 @@ contract ReconcileHandler is Test {
         }
         if (ok["noticeAcked"] == 0 && clients.length < 64 && _ensureOpen() && _replace(true)) {
             noticeStep(admin.epoch() - 2); // the latest epoch's notice, switched
+        }
+        if (ok["noticeResentAfterAck"] == 0) {
+            // an acknowledged notice re-sent (then answered by an error ack, which unmarks nothing)
+            for (uint32 e = 2; e <= admin.epoch(); e++) {
+                if (noticeAckedGhost[e]) {
+                    noticeStep((uint256(1) << 16) | (e - 2));
+                    break;
+                }
+            }
+        }
+        if (ok["noticeResentOld"] == 0) {
+            for (uint256 k = 0; k < 2 && admin.epoch() < 3 && clients.length < 64 && _ensureOpen(); k++) {
+                _replace(true);
+            }
+            if (admin.epoch() >= 3) noticeStep(uint256(1) << 16); // epoch 2's, a newer one current
         }
         if (ok["preparePartial"] == 0 && _ensureOpen() && clients.length < 64) {
             // two successes processed, the route replaced from 0, then a batch of one: partial, then the rest
@@ -3136,7 +3152,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[76] memory names = [
+        string[78] memory names = [
+            "noticeResentAfterAck",
+            "noticeResentOld",
             "preparePartial",
             "deliveredVoidHeld",
             "deliveredVoidHeldReversed",
@@ -3219,7 +3237,9 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[59] memory required = [
+        string[61] memory required = [
+            "noticeResentAfterAck",
+            "noticeResentOld",
             "preparePartial",
             "deliveredVoidHeld",
             "deliveredVoidHeldReversed",

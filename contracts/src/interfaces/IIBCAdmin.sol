@@ -86,8 +86,8 @@ interface IIBCAdmin {
     error SetupIncomplete(uint8 check);
     /// @notice Governance waits for `finishSetup`: nothing is recorded, executed or recovered before it.
     error SetupPending();
-    /// @notice No epoch notice is owed: none since the launch, or gno.land acknowledged it.
-    error NoNoticeOwed();
+    /// @notice No notice recorded for that epoch (the launch epoch, or one not opened yet).
+    error NoNotice();
     error RecoveryDisabled();
     error RecoveryNotEligible();
     error RecoveryState();

@@ -133,10 +133,10 @@ library IBCAdminStorage {
         mapping(uint32 epoch => Notice) notices;
     }
 
-    /// @notice An epoch's notice: owed since its epoch opened by kind 10 or the emergency recovery, the client it
+    /// @notice An epoch's notice: recorded when its epoch opened by kind 10 or the emergency recovery, the client it
     /// travels over (the epoch's), whether gno.land acknowledged it, and its last send's sequence (zero: none).
     struct Notice {
-        bool owed;
+        bool recorded;
         bool acked;
         uint64 seq;
         string client;

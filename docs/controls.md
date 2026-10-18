@@ -99,23 +99,46 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   `gov` port: payload `sourcePort "ibcgov"`, `destPort "gov"`, `version "ibcgov-1"`, `encoding
   "application/x-ibcgov"`, value `version u8 (1) ‖ epoch u32 BE ‖ clientId`, the client id as raw trailing bytes
   (no length) and equal to the packet's source client. Its timeout is a fixed 23 hours.
-  - gno.land answers in IBCAdmin's ack layout, `epoch u32 ‖ seq u64 (0) ‖ status u8 ‖ redispatch u8 (0)`: status 1
-    (switched) or 3 (already switched) for that epoch, with sequence 0 and redispatch 0, ends it. Any other value of
-    any field leaves it owed. The campaign's `noticeStep` re-sends notices of any epoch and answers them (switched,
-    duplicate, error ack, timeout), interleaved with replacements and recoveries.
-  - An error ack, a timeout, or a send the router refused leaves it owed: anyone calls `resendEpochNotice(epoch)`,
-    which sends the same bytes again.
+  - gno.land answers in IBCAdmin's ack layout, `epoch u32 ‖ seq u64 (0) ‖ status u8 ‖ redispatch u8 (0)`. Status 1
+    (switched) or 3 (already switched) for that epoch, with sequence 0 and redispatch 0, marks the notice
+    **acknowledged** (`epochNoticeAcked(epoch)`); any other value of any field does not. An ack of an epoch already
+    acknowledged is ignored, and nothing ever clears the mark. gno.land answers a notice it recorded as proven but
+    has not applied (an advance of more than one epoch), a competing transition and every other refusal with the
+    universal error ack.
+  - **A recorded notice is always re-sendable.** `resendEpochNotice(epoch)` works for any epoch whose notice was
+    recorded (every epoch a kind 10 or the emergency recovery opened; never the launch epoch), at any time: before
+    or after an acknowledgement, and whatever the current epoch. It is permissionless: a notice states a fact and
+    gno.land de-duplicates it. An acknowledgement never closes it, because a compromised Ethereum-side gno.land
+    verifier could authenticate forged acks for many epochs. Each resend sends the identical bytes in a **fresh
+    packet** (`router.sendPacket`, a new transport sequence) over **that epoch's own client**, even one Ethereum has
+    since retired. eureka's `sendPacket` reads only the client's counterparty, never its light client. So neither
+    the retirement (the id migrated to the frozen light client) nor a frozen verifier blocks it. A resend changes
+    nothing on Ethereum but the notice's last sequence, and neither does its ack or timeout
+    (`test_r22_resendAfterAck_freshPacket_repeatAckIgnored`, `test_r22_resendOverARetiredClient`,
+    `test_r22_resendOldEpoch_changesNothing`, `test_r22_timeoutOfAnAckedResend_changesNothing`). A resend over a
+    client Ethereum retired can be neither acknowledged nor timed out on Ethereum (the frozen client verifies
+    nothing). It stays committed, harmlessly.
   - A recorded notice applies on gno.land only while the client that proved it is Active, not retired, and at the
     same trust generation; otherwise it must be proven afresh. Relaying the original packet again does not do
-    that: its receipt exists, so the gno core answers `RESPONSE_NOOP` before any proof or callback. Each
-    `resendEpochNotice(epoch)` sends the identical notice bytes in a **fresh packet** (`router.sendPacket`, a new
-    transport sequence), and the operator relays that packet
-    (`test_epochNotice_sentOverTheNewClient_ackedOnce` checks the new sequence).
-  - Only status 1 or 3 counts as acknowledged. gno.land answers a notice it recorded as proven but has not applied
-    (an advance of more than one epoch) with the universal error ack, which leaves the notice owed. Ethereum puts no
-    cap on unacknowledged epoch advances. gno.land bounds the work instead, by accepting a notice whose explicit
-    path lies in its expected graph of at most 64 transitions. A cap here could block emergency recovery after the
-    latest client froze before it verified an ack.
+    that: its receipt exists, so the gno core answers `RESPONSE_NOOP` before any proof or callback. The operator
+    relays a fresh packet from `resendEpochNotice(epoch)` instead.
+  - **What gno.land answers to resends.** A resend of the current epoch's notice over its own client: status 3
+    (duplicate). A resend of a competing transition: the universal error ack. A resend of an epoch gno.land has
+    already passed, over a client gno.land retired for its gov port, is refused by gno's core. The relay transaction
+    aborts, no ack returns, and the packet times out on Ethereum if its client there can still verify one. That is
+    harmless: a passed epoch's notice is never needed again.
+  - **No cap on unacknowledged advances.** Ethereum puts no bound on how far its epoch runs ahead of gno.land's
+    acknowledgements. A cap could block the emergency recovery after the latest client froze before it verified an
+    ack. gno.land bounds its own work instead: it accepts a notice whose explicit path lies in its expected graph,
+    and it caps both that graph and each notice's path at 64 transitions.
+  - **Catch-up when gno.land is more than 64 epochs behind.** gno.land advances in bounded prefixes. It applies a
+    prefix of at most 64 transitions, records the next expectations, and repeats. The operator drives it by
+    resending the intermediate epochs' notices in order (`resendEpochNotice(e)` for each epoch `e` past gno.land's
+    current one, each over its own client) and relaying each fresh packet. It continues until a resend of the
+    current epoch's notice is answered with status 1 or 3. If an intermediate gno-side local client has failed,
+    gno.land recovers it in place (`NewRecoverClientRequest`: the same client id, a new trust generation). The
+    resent notice is then proven through it, so Ethereum's notice packets stay addressed to the same counterparty
+    id. A fresh gno.land local client applies only when Ethereum's emergency recovery created a new router client.
   - Each epoch keeps its own notice, so after consecutive replacements (A→B→C: epoch 2 over B, epoch 3 over C) each
     stays re-sendable on its own, and gno.land may skip ahead.
   - The ack and timeout callbacks handle notices and ignore anything else; they never revert.
@@ -130,7 +153,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   instance a target that already has an escrow) rolls the checkpoint back, and the decision is spent: outcomes proven
   before stay usable and cannot be voided (`test_r19_3_refusedKind10_keepsTheProofs`).
 - **An initial notice send can be refused** (for instance when the kind 10 is executed from inside another app's
-  receive callback, with the router locked). The epoch switch stands and the notice stays owed for
+  receive callback, with the router locked). The epoch switch stands and the notice is sent by
   `resendEpochNotice` (`test_epochNotice_refusedInitialSend_resendCompletes`).
 - **Vacancies.** Kind 3 never sets a seat to no key: a vacancy is spent at recording, so it can never land faster than
   a replacement (ADR §7.4).

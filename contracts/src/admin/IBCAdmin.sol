@@ -186,24 +186,30 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     uint64 private constant NOTICE_TIMEOUT = 23 hours;
 
     /// @notice Epoch `ep`'s notice (§7.12): `version u8 (1) ‖ epoch u32 ‖ clientId`, big-endian, the epoch's
-    /// client id as raw trailing bytes (no length: the payload's own length bounds it). Empty if none is owed.
+    /// client id as raw trailing bytes (no length: the payload's own length bounds it). Empty if none is recorded.
     function epochNotice(uint32 ep) public view returns (bytes memory) {
         S.Layout storage l = S.layout();
-        if (!l.notices[ep].owed) return "";
+        if (!l.notices[ep].recorded) return "";
         return abi.encodePacked(uint8(1), ep, bytes(l.notices[ep].client));
     }
 
-    /// @notice Sends epoch `ep`'s notice again, while gno.land has not acknowledged it (never relayed, an error
-    /// ack, timed out, or the router refused it). Permissionless; the same bytes every time. Every epoch keeps its
-    /// own notice: after consecutive replacements each one stays re-sendable.
+    /// @notice Sends epoch `ep`'s notice again, in a fresh packet over that epoch's own client (even one since
+    /// retired), at any time: before or after an acknowledgement, whatever the current epoch. Permissionless and
+    /// the same bytes every time: a notice states a fact and gno.land de-duplicates it. A gno.land left behind
+    /// catches up from resends of the intermediate epochs' notices (an acknowledgement, which a compromised
+    /// verifier could forge, never ends the ability to resend). Changes nothing but the notice's last sequence.
     function resendEpochNotice(uint32 ep) external {
-        S.Notice storage n = S.layout().notices[ep];
-        if (!n.owed || n.acked) revert NoNoticeOwed();
+        if (!S.layout().notices[ep].recorded) revert NoNotice();
         _sendNotice(ep);
     }
 
+    /// @notice Whether gno.land acknowledged epoch `ep`'s notice (status 1 or 3). Informational: resends stay open.
+    function epochNoticeAcked(uint32 ep) external view returns (bool) {
+        return S.layout().notices[ep].acked;
+    }
+
     /// @notice Sends the notice from `ibcgov` to gno.land's `gov` port over the epoch's client. A refusal by the
-    /// router (the client unusable for now) never undoes the epoch switch: the notice stays owed, for a resend.
+    /// router (the client unusable for now) never undoes the epoch switch: the notice stays recorded, for a resend.
     function _sendNotice(uint32 ep) private {
         S.Notice storage n = S.layout().notices[ep];
         IICS26RouterMsgs.MsgSendPacket memory m = IICS26RouterMsgs.MsgSendPacket({
@@ -217,21 +223,21 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         emit EpochNoticeSent(ep, n.client, seq);
     }
 
-    /// @notice A new epoch (kind 10, the emergency recovery): its own notice owed and sent over its new client.
+    /// @notice A new epoch (kind 10, the emergency recovery): its own notice recorded and sent over its new client.
     function _openNotice(S.Layout storage l) private {
         S.Notice storage n = l.notices[l.epoch];
-        (n.owed, n.client) = (true, l.govClient);
+        (n.recorded, n.client) = (true, l.govClient);
         _sendNotice(l.epoch);
     }
 
     /// @notice An acknowledgement of an epoch's notice (any of its sends: the bytes are the same). gno.land answers in
     /// IBCAdmin's own ack layout, `epoch u32 ‖ seq u64 (0) ‖ status u8 ‖ redispatch u8 (0)`: status 1 (switched)
-    /// or 3 (already switched) for that epoch ends it; anything else (eureka's universal error ack) leaves it owed,
-    /// for a resend. Acks of anything else are ignored, never reverted.
+    /// or 3 (already switched) for that epoch marks it acknowledged; anything else (eureka's universal error ack)
+    /// does not. An ack of an epoch already acknowledged, and acks of anything else, are ignored, never reverted.
     function onAcknowledgementPacket(IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata m) external {
         if (msg.sender != router) revert NotRouter(msg.sender);
         uint32 ep = _noticeEpoch(m.sourceClient, m.payload);
-        if (ep == 0) return;
+        if (ep == 0 || S.layout().notices[ep].acked) return;
         bytes calldata a = m.acknowledgement;
         // every field checked: this epoch, sequence 0, status 1 or 3, redispatch 0
         bool done = a.length == 14 && uint32(bytes4(a[0:4])) == ep && uint64(bytes8(a[4:12])) == 0 && a[13] == 0
@@ -240,7 +246,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         emit EpochNoticeAcknowledged(ep, m.sequence, done);
     }
 
-    /// @notice A timeout of an epoch's notice: it stays owed, for a resend.
+    /// @notice A timeout of an epoch's notice: resend it.
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata m) external {
         if (msg.sender != router) revert NotRouter(msg.sender);
         uint32 ep = _noticeEpoch(m.sourceClient, m.payload);
@@ -260,7 +266,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         ep = uint32(bytes4(p.value[1:5]));
         S.Notice storage n = S.layout().notices[ep];
         if (
-            !n.owed || keccak256(bytes(sourceClient)) != keccak256(bytes(n.client))
+            !n.recorded || keccak256(bytes(sourceClient)) != keccak256(bytes(n.client))
                 || keccak256(p.value) != keccak256(epochNotice(ep))
         ) return 0;
     }
