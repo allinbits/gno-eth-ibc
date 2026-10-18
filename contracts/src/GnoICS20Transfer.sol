@@ -269,10 +269,7 @@ contract GnoICS20Transfer is
         require(!_gno().retired[msg_.sourceClient], GnoClientRetired(msg_.sourceClient));
         // GNO: amounts the accounting holds in 96 bits, as receives: reservations, refunds and losses never overflow
         require(msg_.amount <= type(uint96).max, ICS20InvalidAmount(msg_.amount));
-        require(
-            !_gno().routes[GnoTransferStorage.routeHash(msg_.sourceClient)].closed, GnoRouteClosed(msg_.sourceClient)
-        );
-        bool burned; // GNO: a voucher returning to its source: never paused or limited
+        bool burned; // GNO: a voucher returning to its source: never paused, limited or closed (an exit)
         string memory fullDenomPath = _getICS20TransferStorage()._ibcERC20Denoms[msg_.denom];
         if (bytes(fullDenomPath).length == 0) {
             // if the denom is not mapped, it is a native token
@@ -814,12 +811,15 @@ contract GnoICS20Transfer is
         );
     }
 
-    /// @notice A token leaving through escrow (not a returning voucher): refused under a flag or an emergency
-    /// recovery of the route, without limits, or outside `sendMin`/`sendMax`.
+    /// @notice A token leaving through escrow (not a returning voucher): refused on a closed route, under a flag or
+    /// an emergency recovery of the route, without limits, or outside `sendMin`/`sendMax`.
     function _checkEscrowedSend(string calldata clientId, address token, uint256 amount) private view {
         GnoTransferStorage.Layout storage g = _gno();
         bytes32 route = GnoTransferStorage.routeHash(clientId);
         GnoTransferStorage.Route storage r = g.routes[route];
+        // a closed route escrows nothing new; a returning voucher (a burn, over the current client: a retired id
+        // is refused above) still exits, its refund, if any, waiting for the reopening
+        require(!r.closed, GnoRouteClosed(clientId));
         require(!r.recoveryBlocked, GnoRouteRecovering(clientId));
         require(!Guardians.anyFlag(g.keys, r.flags), GnoRoutePaused(clientId));
         GnoTransferStorage.TokenControls storage t = g.tokens[route][token];

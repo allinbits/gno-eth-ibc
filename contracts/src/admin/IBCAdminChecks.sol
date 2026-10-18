@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { IGuardians } from "../interfaces/IGuardians.sol";
-import { IGnoICS20ControlsTypes } from "../interfaces/IGnoICS20Controls.sol";
+import { IGnoICS20Controls, IGnoICS20ControlsTypes } from "../interfaces/IGnoICS20Controls.sol";
 import { IGnoLightClientStatus } from "../interfaces/IGnoLightClientStatus.sol";
 import { IGnoLightClientMsgs } from "../msgs/IGnoLightClientMsgs.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
@@ -169,6 +169,18 @@ contract IBCAdminChecks {
 
     /// @notice A recorded decision of a kind whose recording checks are its parameters alone (kinds 2, 5, 6, 7, 9,
     /// 10, 12 and 13): whether they are acceptable (it then waits for its delay; otherwise it is spent).
+    /// @notice Whether a kind 12 must wait: it pays a refund (an action 1 with a non-zero remainder) and the route's
+    /// refunds hold stands (any key's refunds flag, within its grace). Reverts on parameters it cannot decode (the
+    /// caller then treats the decision as not held).
+    function settleHeld(address ics20, bytes calldata p) external view returns (bool) {
+        (string memory clientId, IGnoICS20ControlsTypes.SettleItem[] memory items) =
+            abi.decode(p, (string, IGnoICS20ControlsTypes.SettleItem[]));
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].action == 1 && items[i].amount != 0) return IGnoICS20Controls(ics20).refundsHeld(clientId);
+        }
+        return false;
+    }
+
     function waitingParams(uint8 kind, bytes calldata p) external pure returns (bool) {
         if (kind == S.KIND_UNPAUSE) {
             (uint8 object, string memory clientId) = abi.decode(p, (uint8, string));

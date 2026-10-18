@@ -198,6 +198,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             GnoTransferStorage.noteWork(c, had);
         }
         uint8 action = it.action;
+        // the transport's notification already delivered to the sender (before any drop below): it stays final
+        bool delivered = g.noticeDone[clientHash][it.sequence];
         bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
         if (action == 1) {
@@ -235,7 +237,11 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         // one terminal notification per record: a settlement deciding another kind than the transport's
         // supersedes the transport's (never delivered after); `notifySettled` delivers the settlement's
         (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
-        if (transport != terminal) {
+        if (transport != terminal && delivered) {
+            // a delivered transport callback is final: no second, contradictory terminal callback ever follows
+            // (`notifySettled` refuses); the settlement is reported by GnoSettled alone, once
+            g.settledNoticeDone[clientHash][it.sequence] = true;
+        } else if (transport != terminal) {
             if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
             // a refund settled with nothing left to pay is due now; one still owed, once paid
             if (terminal == 1 || (action == 1 && rec.refunded == rec.amount)) {
@@ -300,7 +306,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
             // the notification is due: anyone delivers it by retryNotification
             GnoTransferStorage.releaseNotice(clientId, sequence);
             (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
-            if (transport != terminal) emit GnoNotificationDue(clientId, sequence);
+            if (transport != terminal && !g.settledNoticeDone[clientHash][sequence]) {
+                emit GnoNotificationDue(clientId, sequence);
+            }
             GnoTransferStorage.syncReserve(route, rec, reservedBefore);
         } else {
             emit GnoRefundParked(clientId, sequence, rec.token, left);

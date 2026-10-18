@@ -33,8 +33,8 @@ library GnoTransferStorage {
         /// Set by the route's first quarantine setting (the launch's): receive limits wait for it, and the
         /// transitions its client accepted since its trusted launch checkpoint count with that first duration.
         bool quarantineArmed;
-        /// Closed by a route replacement (kind 10 or the emergency recovery) until reopened by kind 13: no receive,
-        /// no send, no claim.
+        /// Closed by a route replacement (kind 10 or the emergency recovery) or a late loss until reopened by kind 13:
+        /// no receive, no escrowed send, no claim (a returning voucher still exits).
         bool closed;
         /// The deadline the transitions already seen set, each with the duration in force when it was accepted, and
         /// the latest transition seen (client and transition number) when a duration last changed.

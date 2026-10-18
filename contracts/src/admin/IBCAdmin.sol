@@ -23,6 +23,7 @@ import { IGnoLightClientMsgs as Msgs } from "../msgs/IGnoLightClientMsgs.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
 import { IBCAdminExec } from "./IBCAdminExec.sol";
+import { IBCAdminChecks } from "./IBCAdminChecks.sol";
 import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 import { IBCAdminLaunchCheck } from "./IBCAdminLaunchCheck.sol";
 
@@ -472,7 +473,13 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         // the execution runs in a frame of its own with the kind's fixed gas: whatever fails inside it (a refused
         // call, a revert, its own gas) fails deterministically and spends the decision; only a caller sending less
         // gas than the frame needs is refused before it, and the decision pends
-        _exec(l); // a foreign executor pends every decision (ForeignExec), never spends one
+        address x = _exec(l); // a foreign executor pends every decision (ForeignExec), never spends one
+        // a refund-paying kind 12 waits while the route's refunds hold stands (it stays pending, as on gno.land)
+        if (kind == S.KIND_SETTLE) {
+            (bool ok, bytes memory r) =
+                IBCAdminExec(x).checks().staticcall(abi.encodeCall(IBCAdminChecks.settleHeld, (ics20, params)));
+            if (ok && r.length == 32 && abi.decode(r, (bool))) revert Deferred();
+        }
         uint256 budget = S.execGas(kind);
         if (gasleft() < budget * 64 / 63 + 60_000) revert CallStarved();
         d.state = S.EXECUTED;

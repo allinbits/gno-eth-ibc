@@ -2766,4 +2766,124 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ctl.sendRecord(clientId, p[1].sequence).refunded, 100, "B paid");
         assertEq(ctl.reserved(clientId, address(usdc)), 0);
     }
+
+    // ============================================================= docs/design round 1 (design decisions B) ==
+
+    function checkRelaying(address relayer, bool allowRestricted) external pure {
+        _checkRelaying(relayer, allowRestricted);
+    }
+
+    /// @notice B1: eureka restricts relaying per function, never per port, so an allow-list would gate governance
+    /// delivery too; the deploy script refuses one unless the testing flag is set.
+    function test_d1_restrictedRelaying_refusedWithoutTheTestingFlag() public {
+        this.checkRelaying(address(0), false); // public: production
+        vm.expectRevert(
+            bytes(
+                "RELAYER_ADDRESS restricts governance delivery: leave it unset (testing: ALLOW_RESTRICTED_RELAYING=true)"
+            )
+        );
+        this.checkRelaying(address(0xBEEF), false);
+        this.checkRelaying(address(0xBEEF), true); // testing only
+    }
+
+    /// @notice B5: a forged success ack notified the sender contract (delivered); reconciliation later proves the
+    /// packet never arrived and action 1 refunds it. The delivered callback stays final: no second, contradictory
+    /// terminal callback (`notifySettled` refuses), the settlement is reported by GnoSettled, once.
+    function test_d5_deliveredForgedSuccess_thenRefund_noSecondCallback() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        _ack(pkt, bytes("{\"result\":\"AQ==\"}")); // forged success, delivered to the adapter
+        assertEq(adapter.successes(), 1);
+        assertEq(adapter.notices(), 1);
+        _retire();
+        _proveRefundable(pkt);
+        vm.expectEmit(true, true, false, true, address(ics20));
+        emit T.GnoSettled(clientId, pkt.sequence, 1, 100);
+        _settle(_item(pkt.sequence, 1, 100));
+        assertEq(ctl.sendRecord(clientId, pkt.sequence).refunded, 100, "refunded to the adapter");
+        assertEq(usdc.balanceOf(address(adapter)), 100);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, "", 0);
+        assertEq(adapter.notices(), 1, "no second terminal callback");
+    }
+
+    /// @notice B5's other side: a success notification the sender refused (never delivered) is replaced by the
+    /// settlement's refund notification, delivered once.
+    function test_d5_undeliveredForgedSuccess_thenRefund_oneCallback() public {
+        SenderAdapter adapter = new SenderAdapter(IICS20Transfer(address(ics20)), IERC20(address(usdc)), bob);
+        usdc.mint(address(adapter), 100);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        adapter.send(100, clientId);
+        IICS26RouterMsgs.Packet memory pkt = _sentPacket();
+        adapter.setRefuse(true);
+        _ack(pkt, bytes("{\"result\":\"AQ==\"}")); // forged success, refused by the adapter: kept
+        adapter.setRefuse(false);
+        assertEq(adapter.notices(), 0);
+        _retire();
+        _proveRefundable(pkt);
+        _settle(_item(pkt.sequence, 1, 100));
+        assertTrue(ctl.notifySettled(pkt, "", 0));
+        assertEq(adapter.notices(), 1, "the refund's notification, once");
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNoNotification.selector, clientId, pkt.sequence));
+        ctl.notifySettled(pkt, "", 0);
+    }
+
+    /// @notice B6: a refund-paying kind 12 waits (stays pending) while the route's refunds hold stands, then executes
+    /// once the hold clears; a kind 12 paying nothing is not held.
+    function test_d6_refundPayingSettlement_pendsUnderTheRefundsHold() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory a = _send(alice, address(usdc), 100, clientId);
+        IICS26RouterMsgs.Packet memory b = _send(alice, address(usdc), 50, clientId);
+        _retire();
+        _proveRefundable(a);
+        _proveDelivered(b);
+        uint64 pay = _decide(S.KIND_SETTLE, P.settle1(clientId, a.sequence, 1, 100));
+        uint64 none = _decide(S.KIND_SETTLE, P.settle1(clientId, b.sequence, 3, 0));
+        vm.prank(G[0]);
+        ctl.setRefundsFlag(clientId);
+        assertTrue(ctl.refundsHeld(clientId));
+        _skip(7 days);
+        vm.expectRevert(IIBCAdmin.Deferred.selector);
+        admin.execute(pay);
+        assertEq(_state(pay), S.PENDING, "held, still pending");
+        admin.execute(none); // pays nothing: not held
+        assertEq(_state(none), S.EXECUTED);
+        vm.prank(G[0]);
+        ctl.clearRefundsFlag(clientId);
+        for (uint256 k = 0; k < 2 && ctl.refundsHeld(clientId); k++) {
+            _skip(1 days);
+        }
+        assertFalse(ctl.refundsHeld(clientId));
+        uint256 before = usdc.balanceOf(alice);
+        admin.execute(pay);
+        assertEq(_state(pay), S.EXECUTED);
+        assertEq(usdc.balanceOf(alice), before + 100, "paid once the hold cleared");
+    }
+
+    /// @notice B8: a closed route still lets a gno.land voucher exit (a burn over the current client), while an
+    /// Ethereum-native send, which would escrow, is refused.
+    function test_d8_closedRoute_voucherBurnExits_nativeRefused() public {
+        assertTrue(_isSuccessAck(_gnotIn(100, bob)));
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        _retire();
+        assertTrue(ctl.routeClosed("gnoland-9"));
+        vm.prank(bob);
+        ugnot.approve(address(ics20), type(uint256).max);
+        uint256 supply = ugnot.totalSupply();
+        IICS26RouterMsgs.Packet memory pkt = _send(bob, address(ugnot), 40, "gnoland-9");
+        assertEq(pkt.sourceClient, "gnoland-9");
+        assertEq(ugnot.totalSupply(), supply - 40, "burned");
+        assertTrue(ctl.sendRecord("gnoland-9", pkt.sequence).burned);
+        usdc.mint(alice, 10);
+        vm.prank(alice);
+        usdc.approve(address(ics20), type(uint256).max);
+        _sendExpectRevert(
+            alice, address(usdc), 10, "gnoland-9", abi.encodeWithSelector(T.GnoRouteClosed.selector, "gnoland-9")
+        );
+    }
 }
