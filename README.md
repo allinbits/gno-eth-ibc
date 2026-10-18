@@ -42,7 +42,13 @@ make e2e-local     # local testnet + anvil: gno -> EVM transfers, end to end
 ```
 
 Against Sepolia (needs a funded key in `.env`: `DEPLOYER_PRIVATE_KEY`,
-`ETH_PRIVATE_KEY`, `DEPLOYER_ADDRESS`):
+`ETH_PRIVATE_KEY`, `DEPLOYER_ADDRESS`; and, off a local chain, the deployment
+settings `DeployGnoIBC` requires: `GUARDIANS` (4 comma-separated addresses),
+`WATCH_KEYS` (2) and `EXPECTED_LOCK` (the expected ugnot lock in base units, from which the
+launch limits derive). Relaying stays public: leave `RELAYER_ADDRESS` unset
+(a restricted deployment also needs `ALLOW_RESTRICTED_RELAYING=true`, for
+testing only). See [docs/controls.md](docs/controls.md#deployment) for the
+deployment, its checks and the other settings):
 
 ```sh
 make sepolia-setup   # fresh testnet, deploy on Sepolia, create gno's Ethereum client
