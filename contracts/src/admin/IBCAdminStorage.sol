@@ -81,6 +81,10 @@ library IBCAdminStorage {
     /// execution; with less than the floor left, the call is not made and the transaction reverts.
     uint256 internal constant RECORD_GAS = 1_000_000;
     uint256 internal constant RECORD_FLOOR = RECORD_GAS * 64 / 63 + 10_000;
+    /// @notice Kind 9's `bindings()` probe of the new executor (IBCAdmin's own hand-over path), and the gas an
+    /// execution must have left to start it: a caller sending less is refused (CallStarved) and the decision pends.
+    uint256 internal constant BIND_GAS = 100_000;
+    uint256 internal constant HANDOVER_FLOOR = BIND_GAS * 64 / 63 + 60_000;
 
     /// @notice 24 hours: the unpause delay and the dip's grace.
     uint64 internal constant DAY = 1 days;
@@ -238,7 +242,7 @@ library IBCAdminStorage {
     /// a caller sending less than the frame needs is refused before it (the decision pends).
     function execGas(uint8 kind) internal pure returns (uint256) {
         if (kind == KIND_SETTLE) return 7_000_000;
-        if (kind == KIND_UPGRADE || kind == KIND_HANDOVER) return 3_500_000;
+        if (kind == KIND_UPGRADE) return 3_500_000;
         if (kind == KIND_ROUTE || kind == KIND_CLIENT || kind == KIND_REOPEN) return 2_500_000;
         return 1_500_000;
     }
@@ -251,6 +255,34 @@ library IBCAdminStorage {
     /// the route replacement, conservatively too).
     function suspendedByRecovery(uint8 kind) internal pure returns (bool) {
         return kind == KIND_SEATS || (kind >= KIND_CLIENT && kind <= KIND_ROUTE);
+    }
+
+    /// @notice Kind 9's recording check (IBCAdmin's own, never the executor's): the parameters exactly the canonical
+    /// `abi.encode(address exec, bytes32 codeHash, bytes migrationCall)` with `exec` nonzero and `migrationCall`
+    /// empty, so 128 bytes. A hand-over only moves the pin: a non-empty migration call is spent ("migration"), and
+    /// the new executor performs any migration itself, through a later decision of its own kinds.
+    function handoverParams(bytes memory p) internal pure returns (uint8, string memory) {
+        if (p.length >= 128) {
+            (uint256 x,, uint256 off, uint256 n) = abi.decode(p, (uint256, bytes32, uint256, uint256));
+            if (off == 0x60 && n != 0) return (SPEND, "migration");
+            if (p.length == 128 && off == 0x60 && x != 0 && x >> 160 == 0) return (WAIT, "");
+        }
+        return (SPEND, "params");
+    }
+
+    /// @notice Whether `a` holds contract code, and not an EIP-7702 delegation designator.
+    function isCode(address a) internal view returns (bool) {
+        uint256 size;
+        bytes32 head;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            size := extcodesize(a)
+            let ptr := mload(0x40)
+            mstore(ptr, 0)
+            extcodecopy(a, ptr, 0, 3)
+            head := mload(ptr)
+        }
+        return size != 0 && bytes3(head) != 0xef0100;
     }
 
     // ---------------------------------------------------------------------------------------------- flags --

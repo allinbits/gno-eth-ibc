@@ -38,9 +38,6 @@ contract IBCAdminChecks {
         } else if (kind == S.KIND_ROLE) {
             (bool a, uint64 b, address c) = abi.decode(p, (bool, uint64, address));
             e = abi.encode(a, b, c);
-        } else if (kind == S.KIND_HANDOVER) {
-            (address a, bytes32 b, bytes memory c) = abi.decode(p, (address, bytes32, bytes));
-            e = abi.encode(a, b, c);
         } else if (kind == S.KIND_ROUTE) {
             (string memory a, string memory b, uint64 c) = abi.decode(p, (string, string, uint64));
             e = abi.encode(a, b, c);
@@ -211,10 +208,6 @@ contract IBCAdminChecks {
         if (kind == S.KIND_UPGRADE) {
             (address proxy, address impl,,) = abi.decode(p, (address, address, bytes32, bytes));
             return proxy != address(0) && impl != address(0);
-        }
-        if (kind == S.KIND_HANDOVER) {
-            (address x,,) = abi.decode(p, (address, bytes32, bytes));
-            return x != address(0);
         }
         if (kind == S.KIND_ROUTE) {
             (string memory oldId, string memory newId,) = abi.decode(p, (string, string, uint64));

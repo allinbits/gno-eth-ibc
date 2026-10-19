@@ -232,7 +232,6 @@ contract IBCAdminExec is IIBCAdmin {
             else IAccessManager(accessManager).revokeRole(roleId, account);
             return "";
         }
-        if (kind == S.KIND_HANDOVER) return _handover(p);
         if (kind == S.KIND_ROUTE) return _route(p);
         if (kind == S.KIND_SETTLE) {
             (string memory sid, IGnoICS20ControlsTypes.SettleItem[] memory items) =
@@ -460,38 +459,6 @@ contract IBCAdminExec is IIBCAdmin {
     /// @notice IBCAdmin's port on the router (IBCAdmin.PORT).
     string internal constant PORT = "ibcgov";
 
-    /// @notice Kind 9: the executor's code is the decision's and it is bound as this one; the code hash pin moves to
-    /// it atomically, then the optional one-time migration call runs in it, both as a self-step (`applyHandover`): a
-    /// failure rolls them back and spends the decision. No state or authority moves: both stay in IBCAdmin.
-    function _handover(bytes calldata p) private returns (string memory) {
-        (address x, bytes32 codeHash, bytes memory migration) = abi.decode(p, (address, bytes32, bytes));
-        if (!_codeIs(x, codeHash)) return "codehash";
-        (bool ok, bytes memory ret) = x.staticcall(abi.encodeCall(IBCAdminExec.bindings, ()));
-        if (!ok || ret.length != 96) return "bindings";
-        (address r, address am, address t) = abi.decode(ret, (address, address, address));
-        if (r != router || am != accessManager || t != ics20) return "bindings";
-        return _selfStep(abi.encodeCall(IBCAdminExec.applyHandover, (x, codeHash, migration))) ? "" : "migration";
-    }
-
-    /// @notice Kind 9's effect, in a frame of its own: the pin moves, then the migration call runs in the new
-    /// executor (CALL_GAS); its failure rolls the swap back and spends the decision.
-    function applyHandover(address x, bytes32 codeHash, bytes calldata migration) external delegated {
-        _selfOnly();
-        S.Layout storage l = S.layout();
-        l.exec = x;
-        l.execHash = codeHash;
-        emit ExecReplaced(x, codeHash);
-        if (migration.length != 0) {
-            (bool ok, bytes memory ret) = x.delegatecall{ gas: CALL_GAS }(migration);
-            if (!ok) {
-                // solhint-disable-next-line no-inline-assembly
-                assembly ("memory-safe") {
-                    revert(add(ret, 32), mload(ret))
-                }
-            }
-        }
-    }
-
     /// @notice Kind 10 `(oldClientId, newClientId, suspectFrom)`: `oldClientId` must be this epoch's client and
     /// `newClientId` a custom id a kind 6 enrolled; `suspectFrom` starts the suspected compromise interval; retires and
     /// freezes the old id, migrates the route, and opens the next epoch over the new id.
@@ -546,21 +513,6 @@ contract IBCAdminExec is IIBCAdmin {
     /// @notice Whether `target`'s code is the one the decision pins (false spends it: no code, an EIP-7702 delegation
     /// designator or another code hash; ADR §5.4: a decision that fails its checks at execution is never retried).
     function _codeIs(address target, bytes32 codeHash) private view returns (bool) {
-        return _isCode(target) && target.codehash == codeHash;
-    }
-
-    /// @notice Whether `a` holds contract code, and not an EIP-7702 delegation designator.
-    function _isCode(address a) private view returns (bool) {
-        uint256 size;
-        bytes32 head;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            size := extcodesize(a)
-            let ptr := mload(0x40)
-            mstore(ptr, 0)
-            extcodecopy(a, ptr, 0, 3)
-            head := mload(ptr)
-        }
-        return size != 0 && bytes3(head) != 0xef0100;
+        return S.isCode(target) && target.codehash == codeHash;
     }
 }

@@ -52,7 +52,7 @@ import { IBCAdminLaunchCheck } from "./IBCAdminLaunchCheck.sol";
 /// deferred while a flag, a hold or a conflict stands on IBCAdmin, except the guardian replacement (kind 3), which
 /// lands through flags and lands through a hold no sooner than day 21 of it; an unpause (kind 2) waits 24 hours and is
 /// spent under a hold of its object. The kinds' logic runs in IBCAdminExec, delegatecalled at a pinned code hash and
-/// replaced only by kind 9.
+/// replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor (`_handover`).
 
 /// @notice The transfer app's reentrancy lock, read by IBCAdmin.
 interface IGnoICS20Busy {
@@ -363,7 +363,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (S.isTombstoned(l, ep, seq)) return _close(ep, seq, d, S.CANCELLED, "");
         // while an emergency recovery is open, an authority change waits even where it would act at recording
         bool suspended = l.recovery.openedAt != 0 && S.suspendedByRecovery(kind);
-        (uint8 action, string memory reason) = _atRecording(l, kind, seq, d.params, suspended);
+        // kind 9 is IBCAdmin's own, never the executor's, so a broken executor can always be replaced
+        (uint8 action, string memory reason) =
+            kind == S.KIND_HANDOVER ? S.handoverParams(d.params) : _atRecording(l, kind, seq, d.params, suspended);
         if (action == S.DONE_NOW) return _close(ep, seq, d, S.EXECUTED, "");
         if (action == S.SPEND) return _close(ep, seq, d, S.SPENT, reason);
         d.state = S.PENDING;
@@ -478,6 +480,37 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             revert Deferred();
         }
         if (block.timestamp < matureAt) revert NotMature(matureAt);
+        string memory spent;
+        if (kind == S.KIND_HANDOVER) {
+            // IBCAdmin's own path, never through the executor (whatever its code or its pin): a broken executor is
+            // always replaceable
+            if (gasleft() < S.HANDOVER_FLOOR) revert CallStarved();
+            d.state = S.EXECUTED;
+            delete d.params;
+            spent = _handover(params);
+        } else {
+            spent = _run(l, d, kind, seq, params);
+        }
+        if (bytes(spent).length != 0) {
+            d.state = S.SPENT;
+            emit DecisionSpent(ep, seq, kind, spent);
+        } else {
+            emit DecisionExecuted(ep, seq, kind);
+            if (l.epoch != ep) _openNotice(l); // a kind 10: the new epoch's notice
+        }
+    }
+
+    /// @notice A kind other than 9 at execution, in the pinned executor.
+    function _run(
+        S.Layout storage l,
+        Decision storage d,
+        uint8 kind,
+        uint64 seq,
+        bytes memory params
+    )
+        private
+        returns (string memory)
+    {
         // the execution runs in a frame of its own with the kind's fixed gas: whatever fails inside it (a refused
         // call, a revert, its own gas) fails deterministically and spends the decision; only a caller sending less
         // gas than the frame needs is refused before it, and the decision pends
@@ -495,14 +528,41 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         (bool ok, bytes memory ret) = address(this).call{ gas: budget }(
             abi.encodeCall(this.selfDelegate, (abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))))
         );
-        string memory spent = ok ? abi.decode(abi.decode(ret, (bytes)), (string)) : "reverted";
-        if (bytes(spent).length != 0) {
-            d.state = S.SPENT;
-            emit DecisionSpent(ep, seq, kind, spent);
-        } else {
-            emit DecisionExecuted(ep, seq, kind);
-            if (l.epoch != ep) _openNotice(l); // a kind 10: the new epoch's notice
+        return ok ? abi.decode(abi.decode(ret, (bytes)), (string)) : "reverted";
+    }
+
+    /// @notice Kind 9 `(exec, codeHash, migrationCall)`, its migration call empty (IBCAdminStorage.handoverParams):
+    /// `exec`'s code is the decision's (contract code, not an EIP-7702 designator) and its `bindings()` answer, in
+    /// BIND_GAS, exactly this contract's router, AccessManager and transfer app; then the pin moves. No state or
+    /// authority moves: both stay here. A failed check spends the decision ("codehash", "bindings").
+    function _handover(bytes memory p) private returns (string memory) {
+        (address x, bytes32 h) = abi.decode(p, (address, bytes32));
+        if (!S.isCode(x) || x.codehash != h) return "codehash";
+        bytes4 sel = IBCAdminExec.bindings.selector;
+        uint256 bindGas = S.BIND_GAS;
+        bool ok;
+        uint256 n;
+        uint256 r;
+        uint256 am;
+        uint256 t;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, sel)
+            ok := staticcall(bindGas, x, ptr, 4, ptr, 96)
+            n := returndatasize()
+            r := mload(ptr)
+            am := mload(add(ptr, 32))
+            t := mload(add(ptr, 64))
         }
+        if (!ok || n != 96 || r != uint160(router) || am != uint160(accessManager) || t != uint160(ics20)) {
+            return "bindings";
+        }
+        S.Layout storage l = S.layout();
+        l.exec = x;
+        l.execHash = h;
+        emit ExecReplaced(x, h);
+        return "";
     }
 
     /// @notice A seat change's anchor: the start of the first hold standing at or after it was `due` (ADR §7.4, day 21
@@ -590,7 +650,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     }
 
     /// @notice Runs the executor as this contract from the executor itself, in a call frame of its own, so that a
-    /// step whose failure spends a decision (an upgrade with its after-checks, a hand-over's migration call) rolls
+    /// step whose failure spends a decision (an upgrade with its after-checks, a route replacement) rolls
     /// back whole. Only this contract may call it.
     function selfDelegate(bytes calldata call) external returns (bytes memory) {
         if (msg.sender != address(this)) revert NotSelf();

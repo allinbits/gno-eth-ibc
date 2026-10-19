@@ -253,6 +253,20 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertEq(ctl.quarantineSeconds(clientId), 1 days);
     }
 
+    /// @notice Kind 9, IBCAdmin's own path, is an authority change: it waits while a recovery is open.
+    function test_whileOpen_handOverSuspended() public {
+        IBCAdminExec next = new IBCAdminExec(address(router), d.accessManager, address(ics20));
+        uint64 seq = admin.lastSeq() + 1;
+        _recvGov(_env(seq, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")));
+        assertEq(admin.decision(admin.epoch(), seq).state, S.PENDING);
+        _openFrozen();
+        _skip(7 days);
+        vm.expectRevert(IIBCAdmin.Suspended.selector);
+        admin.execute(seq);
+        (address x,) = admin.exec();
+        assertEq(x, d.ibcAdminExec);
+    }
+
     function test_cancelledByGuardians_only() public {
         _openFrozen();
         vm.prank(G[0]);

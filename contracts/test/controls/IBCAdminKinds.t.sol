@@ -631,10 +631,7 @@ contract IBCAdminKindsTest is ControlsFixture {
 
     function test_kind9_handOver_swapsTheExecutor() public {
         IBCAdminExec next = new IBCAdminExec(address(router), d.accessManager, address(ics20));
-        uint64 seq = _decidePending(
-            S.KIND_HANDOVER,
-            P.handover(address(next), address(next).codehash, abi.encodeCall(IBCAdminExec.bindings, ()))
-        );
+        uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
         _executeAfterWeek(seq);
         (address x, bytes32 h) = admin.exec();
         assertEq(x, address(next));
