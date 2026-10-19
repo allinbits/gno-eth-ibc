@@ -106,12 +106,37 @@ contract SenderAdapter is IIBCSenderCallbacks {
 
     bytes32 public lastAck; // the hash of the last success ack announced
 
+    /// @notice Every terminal callback this sender took, per packet (source client, sequence), for the packets a test
+    /// primed: the count in the low 128 bits, the kinds (1 success, 2 refund) above, a marker in the top bit. Priming
+    /// first keeps the callback's own write cheap (the callback's gas is bounded); unprimed packets are not tracked.
+    mapping(bytes32 => uint256) internal history;
+    uint256 internal constant PRIMED = 1 << 255;
+
+    function prime(string calldata client, uint64 sequence) external {
+        history[keccak256(abi.encode(client, sequence))] = PRIMED;
+    }
+
+    function terminals(bytes32 k) external view returns (uint256) {
+        return uint128(history[k]);
+    }
+
+    function terminalKinds(bytes32 k) external view returns (uint256) {
+        return (history[k] >> 128) & 3;
+    }
+
+    function _terminal(string calldata client, uint64 sequence, uint8 kind) private {
+        bytes32 k = keccak256(abi.encode(client, sequence));
+        uint256 h = history[k];
+        if (h != 0) history[k] = (h + 1) | (uint256(kind) << 128);
+    }
+
     function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata cb) external {
         while (burn) { } // burns all the gas it is given
         require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
         _book();
         notices++;
+        _terminal(cb.sourceClient, cb.sequence, success ? 1 : 2);
         if (success) {
             successes++;
             lastAck = keccak256(cb.acknowledgement);
@@ -120,12 +145,13 @@ contract SenderAdapter is IIBCSenderCallbacks {
         }
     }
 
-    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {
+    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata cb) external {
         while (burn) { }
         require(msg.sender == address(ics20), "only the transfer app");
         require(!refuse, "refused");
         _book();
         notices++;
+        _terminal(cb.sourceClient, cb.sequence, 2);
         _forward();
     }
 

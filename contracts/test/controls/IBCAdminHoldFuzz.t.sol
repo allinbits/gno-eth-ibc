@@ -21,6 +21,12 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
         address[6] memory keys = [G[0], G[1], G[2], G[3], W[0], W[1]];
         bool settingsDone;
         bool seatsDone;
+        // the test's own record of every hold (start, and the first moment it was seen ended), independent of
+        // IBCAdmin's compressed history: the replacement's true anchor is the start of the first hold standing at or
+        // after its due time
+        uint64[64] memory gStart;
+        uint64[64] memory gEnd;
+        uint256 gn;
 
         for (uint256 step = 0; step < 60 && !(settingsDone && seatsDone); step++) {
             uint256 r = uint256(keccak256(abi.encode(seed, step)));
@@ -44,6 +50,16 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
             }
             IGuardians.Flag memory h = admin.hold();
             bool holdStands = h.blockNumber != 0;
+            if (gn != 0 && gEnd[gn - 1] == 0 && (!holdStands || h.time != gStart[gn - 1])) {
+                gEnd[gn - 1] = uint64(_now());
+            }
+            if (holdStands && (gn == 0 || gStart[gn - 1] != h.time)) gStart[gn++] = h.time;
+            // the earliest qualifying hold by the test's own record (its seen end can only be late, so this anchor
+            // can only be early: a safe lower bound)
+            uint64 lower;
+            for (uint256 k = 0; k < gn && lower == 0; k++) {
+                if (gEnd[k] == 0 || gEnd[k] >= recorded + 7 days) lower = gStart[k];
+            }
 
             if (!settingsDone) {
                 bool should = _now() >= recorded + 7 days && !flagged && !holdStands;
@@ -61,6 +77,9 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
                 // the anchor is the start of a hold: one standing at or after the due time (it may have begun before)
                 if (pinned != 0) assertLe(pinned, _now(), "anchored at a hold already started");
                 bool due = _now() >= recorded + 7 days;
+                // independently of IBCAdmin's anchor: under a hold, never before the true anchor plus 21 days
+                if (ok && holdStands) assertGe(_now(), uint256(lower) + 21 days, "never before the true anchor + 21");
+                if (pinned != 0) assertGe(pinned, lower, "never anchored before the first qualifying hold");
                 // lands exactly when due with no hold standing, or under a hold from its anchor plus 21 days
                 bool should = due && (!holdStands || (pinned != 0 && _now() >= uint256(pinned) + 21 days));
                 assertEq(ok, should, "a replacement lands exactly when due and unheld, or at its anchor plus 21 days");

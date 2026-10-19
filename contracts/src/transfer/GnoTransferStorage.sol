@@ -21,6 +21,9 @@ import { LeakyBucket } from "../lib/LeakyBucket.sol";
 /// the fork's state is append-only to a deployed ICS20Transfer proxy. GnoICS20Controls runs by delegatecall from
 /// GnoICS20Transfer, so both read the proxy's storage through this layout.
 library GnoTransferStorage {
+    /// @notice ADR §9: the most bytes a transfer packet's encoded payload value may have.
+    uint256 internal constant MAX_PAYLOAD = 262_144;
+
     /// @notice Grace of a route hold's dip (24 hours, §7.4).
     uint64 internal constant GRACE = 1 days;
 

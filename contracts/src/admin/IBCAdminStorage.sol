@@ -285,12 +285,13 @@ library IBCAdminStorage {
         if (n >= MAX_HOLDS) {
             // the two oldest merge into one spanning both, the earliest start kept
             if (l.holds[1].end > l.holds[0].end) l.holds[0].end = l.holds[1].end;
+            l.holds[0].merged = true;
             for (uint256 i = 1; i + 1 < n; i++) {
                 l.holds[i] = l.holds[i + 1];
             }
             l.holds.pop();
         }
-        l.holds.push(IGuardians.Hold(holdTime, end));
+        l.holds.push(IGuardians.Hold(holdTime, end, false));
         emit IIBCAdmin.HoldEnded(holdTime, end);
     }
 

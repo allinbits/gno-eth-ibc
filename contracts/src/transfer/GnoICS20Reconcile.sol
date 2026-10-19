@@ -254,6 +254,39 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     }
 
     /// @notice See IGnoICS20Controls.
+    function checkpointForReplacement(string calldata clientId) external delegated restricted nonReentrant {
+        GnoTransferStorage.Layout storage g = _g();
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        GnoTransferStorage.Route storage r = g.routes[keccak256(bytes(key))];
+        string memory current = bytes(g.currentOf[key]).length == 0 ? key : g.currentOf[key];
+        // the route's current verifier and its last transition, if it answers exactly (two uint64 words)
+        (bool ok, bytes memory ret) =
+            GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
+        address lc = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
+        if (lc != address(0)) (ok, ret) = lc.staticcall(abi.encodeCall(IGnoLightClientStatus.lastTransition, ()));
+        uint256 until;
+        if (lc != address(0) && ok && ret.length == 64) {
+            (uint256 id, uint256 time) = abi.decode(ret, (uint256, uint256));
+            ok = id <= type(uint64).max && time <= type(uint64).max;
+            if (ok) {
+                until = GnoTransferStorage.quarantineUntil(r, lc, uint64(id), uint64(time));
+                (r.seenClient, r.seenTransition) = (lc, uint64(id));
+            }
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            // the failed verifier cannot say when it last transitioned: assume it just did
+            until = r.quarantineDeadline;
+            uint256 fresh = block.timestamp + r.quarantineSeconds;
+            if (fresh > until) until = fresh;
+        }
+        r.quarantineDeadline = until > type(uint64).max ? type(uint64).max : uint64(until);
+        // outcomes proven through the old verifier are void
+        ++r.verifierGen;
+    }
+
+    /// @notice See IGnoICS20Controls.
     function prepareIncident(string calldata clientId, uint256 n) external delegated nonReentrant returns (uint256) {
         GnoTransferStorage.Layout storage g = _g();
         bytes32 clientHash = keccak256(bytes(clientId));
@@ -384,6 +417,8 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
 
     /// @notice See IGnoICS20Controls.
     function reopenRoute(string calldata clientId) external delegated restricted nonReentrant {
+        // named by the route's current client only (ADR §7.12), never a retired alias
+        require(!_g().retired[clientId], GnoBadRoute());
         GnoTransferStorage.Route storage r = _route(clientId);
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
         // every unresolved incident settled (constant work: the count is kept as records settle): its client's

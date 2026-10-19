@@ -64,7 +64,8 @@ setup() {
 		docker run --rm -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
 			-e DEPLOYER_PRIVATE_KEY -e GNO_TRUST_FILE=deployments/sepolia-trust.json \
 			-e GNO_COUNTERPARTY_CLIENT_ID="$GNO_CLIENT" -e DEPLOYMENTS_FILE="$out" \
-			-e GUARDIANS -e WATCH_KEYS -e EXPECTED_LOCK -e QUARANTINE_SECONDS -e PERMIT2 \
+			-e GUARDIANS -e WATCH_KEYS -e EXPECTED_LOCK -e QUARANTINE_SECONDS -e PERMIT2 -e LAUNCH_ACTIVE=true \
+			-e GNOT_MAX_PER_MESSAGE -e GNOT_DAY_CAP -e GNOT_REFUND_CAP \
 			-e RECOVERY_DELAY -e RECOVERY_THRESHOLD -e RECOVERY_CANCEL_THRESHOLD -e RECOVERY_SILENCE -e RECOVERY_HOLD_PERIOD \
 			--entrypoint forge "$FOUNDRY_IMAGE" script script/DeployGnoIBC.s.sol --rpc-url "$ETH_RPC_URL" \
 			--broadcast --slow --skip-simulation --gas-estimate-multiplier 130 "$@"

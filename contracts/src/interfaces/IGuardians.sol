@@ -24,6 +24,8 @@ interface IGuardians {
     struct Hold {
         uint64 start;
         uint64 end;
+        /// Two or more holds merged when the history overflowed: the interval may span gaps no hold covered.
+        bool merged;
     }
 
     error UnknownKey();

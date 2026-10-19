@@ -270,6 +270,39 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertEq(_state(seq), S.EXECUTED);
     }
 
+    /// @notice r26 #1 / design r3 #3: more than eight holds end before the first execution attempt, so the history
+    /// merges the two oldest (days 1 to 2, before the change was due, and the hold from day 20) into one interval that
+    /// spans the gap. A merged interval never anchors: the anchor is a genuine hold's start, never earlier than day 20,
+    /// so the change never lands before day 41.
+    function test_kind3_anchor_compressedHistory_neverEarlier() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.prank(G[0]);
+        admin.setFlag(); // stays set: each G[1] flag makes a hold
+        uint256[9] memory starts = [uint256(1), 20, 22, 24, 26, 28, 30, 32, 34];
+        for (uint256 k = 0; k < starts.length; k++) {
+            vm.warp(t0 + starts[k] * 1 days);
+            vm.prank(G[1]);
+            admin.setFlag();
+            vm.warp(t0 + starts[k] * 1 days + 1 hours);
+            vm.prank(G[1]);
+            admin.clearFlag();
+        }
+        vm.warp(t0 + 36 days);
+        vm.prank(G[1]);
+        admin.setFlag(); // a hold standing at the first attempt; the history now holds a merged interval
+        assertTrue(admin.holds()[0].merged, "compressed");
+        admin.execute(seq); // pins
+        uint64 anchor = admin.replacementAnchor(admin.epoch(), seq);
+        assertGe(anchor, t0 + 20 days, "never anchored on the merged interval");
+        vm.warp(t0 + 41 days - 1);
+        vm.expectRevert();
+        admin.execute(seq);
+        vm.warp(uint256(anchor) + 21 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+    }
+
     function test_kind3_otherSevenDayKindsDeferredByHold() public {
         uint64 seq = _decidePending(S.KIND_SETTINGS, P.settings(clientId, 1 days));
         vm.prank(G[0]);

@@ -59,6 +59,12 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
 
     function _permit2() internal virtual returns (address) { }
 
+    /// @notice The ugnot limits the deployment installs (the suites run an active route; `InactiveLaunchTest` the
+    /// production launch, zero).
+    function _gnotLimits() internal virtual returns (IGnoICS20ControlsTypes.Limits memory) {
+        return IGnoICS20ControlsTypes.Limits(GNOT_MAX, GNOT_DAY, GNOT_DAY, 0, 0);
+    }
+
     function setUp() public virtual {
         vm.warp(1_700_000_000);
         vm.roll(1000);
@@ -75,7 +81,7 @@ abstract contract ControlsFixture is Test, DeployGnoIBC {
         p.watch = W;
         p.clientState.chainId = "gno-test";
         p.expectedLock = 1_000_000e6;
-        p.gnotLimits = IGnoICS20ControlsTypes.Limits(GNOT_MAX, GNOT_DAY, GNOT_DAY, 0, 0);
+        p.gnotLimits = _gnotLimits();
         p.permit2 = _permit2();
         p.quarantineSeconds = 7 days;
         p.recovery = _recovery();

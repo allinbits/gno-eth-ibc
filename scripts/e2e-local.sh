@@ -75,7 +75,7 @@ step "deploying IBC on anvil"
 # automine leaves the overflow pending.
 docker run --rm --network "$NET" -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
 	-e DEPLOYER_PRIVATE_KEY -e GNO_TRUST_FILE=deployments/trust.json -e GNO_COUNTERPARTY_CLIENT_ID="$GNO_CLIENT" \
-	-e DEPLOYMENTS_FILE=deployments/local.json \
+	-e DEPLOYMENTS_FILE=deployments/local.json -e LAUNCH_ACTIVE=true \
 	--entrypoint forge "$FOUNDRY_IMAGE" script script/DeployGnoIBC.s.sol --rpc-url "http://$ANVIL:8545" --broadcast --slow \
 	2>&1 | grep -E 'ONCHAIN EXECUTION|Error|error|revert' || true
 DEP="$DEPLOY_DIR/local.json"

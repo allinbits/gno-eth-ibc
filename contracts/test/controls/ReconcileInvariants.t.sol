@@ -624,6 +624,7 @@ contract ReconcileHandler is Test {
                 packets.push(abi.decode(logs[i].data, (IICS26RouterMsgs.Packet)));
                 ghost[packets.length - 1] = Ghost(delivered, false, false, false, from, token, amount);
                 sentOver[packets.length - 1] = _live();
+                if (from == address(adapter)) adapter.prime(_live(), packets[packets.length - 1].sequence);
                 if (delivered) redeemable[token] += amount;
                 sentBy[from][token] += amount;
                 return true;
@@ -1602,6 +1603,100 @@ contract ReconcileHandler is Test {
             pending.push(keep[k]);
         }
         if (n != 0) ok["executePending"]++;
+    }
+
+    // ------------------------------------------------------------------------------- round 26 transitions --
+
+    /// @notice A contract sender's packet whose transport callback was delivered, then a settlement deciding the other
+    /// kind: a forged success notified, then an action 1 refund (`successFirst`); or a forged refund paid and notified,
+    /// then an action 4 (the packet was delivered). The delivered callback stays final: both notification paths are
+    /// tried and must refuse; the oracle checks one terminal callback per packet, independently.
+    function contradictoryNotices(bool successFirst) public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 62 || !_ensureOpen()) return;
+        // a refund is paid at once (and its notification delivered) only with nothing queued before it
+        for (uint256 d = 0; d < 20; d++) {
+            (uint64 head, uint64 tail) = ctl.refundQueue(_live(), tokens[0]);
+            if (head == tail) break;
+            _skip(1 days);
+            try ctl.claim(_live(), tokens[0], 20) { } catch { }
+        }
+        uint256 amount = 10;
+        ERC20Mock(tokens[0]).mint(address(adapter), amount);
+        minted[address(adapter)][tokens[0]] += amount;
+        _limits(tokens[0]);
+        vm.recordLogs();
+        try adapter.send(amount, _live()) { }
+        catch {
+            return;
+        }
+        if (!_record(!successFirst, address(adapter), tokens[0], amount)) return;
+        uint256 i = packets.length - 1;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        this.relay(i, true, false); // forged against the truth: a success for successFirst, an error ack otherwise
+        bytes32 k = keccak256(abi.encode(pkt.sourceClient, pkt.sequence));
+        if (adapter.terminals(k) != 1) return; // the transport callback must have been delivered
+        if (!_replace(true)) return;
+        for (uint256 c = 0; c + 1 < clients.length; c++) {
+            _prepare(clients[c], 1000);
+        }
+        _liveClient().setStatus(false, false);
+        if (!_prove(i, 0)) return;
+        T.SettleItem memory it = _action(i);
+        if (!_executeAll(_one(_decide(S.KIND_SETTLE, P.settle1(pkt.sourceClient, it.sequence, it.action, it.amount)))))
+        {
+            return;
+        }
+        try ctl.notifySettled(pkt, bytes("{\"result\":\"AQ==\"}"), 0) { } catch { }
+        try ctl.notifySettled(pkt, "", 0) { } catch { }
+        try ctl.retryNotification(pkt.sourceClient, pkt.sequence, _errorNotice(pkt), 0) { } catch { }
+        try ctl.retryNotification(pkt.sourceClient, pkt.sequence, _timeoutNotice(pkt), 0) { } catch { }
+        if (adapter.terminals(k) == 1) ok[successFirst ? "noticeSuccessThenRefund" : "noticeRefundThenSuccess"]++;
+        _checkpoint();
+    }
+
+    /// @notice A contract sender's forged success refused (kept, never delivered), its refund settled while the
+    /// incident is unprepared (parked), paid only after the reopening: the settlement's notification is delivered
+    /// once, then refused.
+    function delayedPayNotice() public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 61 || !_ensureOpen()) return;
+        if (!_replace(true) || !_reopen()) return;
+        uint256 amount = 10;
+        ERC20Mock(tokens[0]).mint(address(adapter), amount);
+        minted[address(adapter)][tokens[0]] += amount;
+        _limits(tokens[0]);
+        vm.recordLogs();
+        try adapter.send(amount, _live()) { }
+        catch {
+            return;
+        }
+        if (!_record(false, address(adapter), tokens[0], amount)) return;
+        uint256 i = packets.length - 1;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        adapter.setRefuse(true);
+        this.relay(i, true, false); // a forged success, refused: kept, not delivered
+        adapter.setRefuse(false);
+        bytes32 k = keccak256(abi.encode(pkt.sourceClient, pkt.sequence));
+        if (adapter.terminals(k) != 0 || !_replace(true)) return;
+        _liveClient().setStatus(false, false);
+        if (!_prove(i, 0)) return;
+        T.SettleItem memory it = _action(i);
+        if (!_executeAll(_one(_decide(S.KIND_SETTLE, P.settle1(pkt.sourceClient, it.sequence, it.action, it.amount)))))
+        {
+            return;
+        }
+        if (ctl.sendRecord(pkt.sourceClient, pkt.sequence).payment != T.Payment.Parked || !_reopenOnly()) return;
+        try ctl.claimParked(pkt.sourceClient, pkt.sequence, 300_000) { }
+        catch {
+            return;
+        }
+        try ctl.notifySettled(pkt, "", 0) { } catch { }
+        try ctl.notifySettled(pkt, "", 0) { } catch { }
+        if (adapter.terminals(k) == 1) ok["delayedPayNoticeOnce"]++;
+        _checkpoint();
     }
 
     // ------------------------------------------------------------------------------- round 25 transitions --
@@ -2633,7 +2728,7 @@ contract ReconcileHandler is Test {
     /// its own external call (`sweepStep`), so its memory is released before the next: a single frame holding every
     /// composite's allocations outgrew the EVM's 32 MiB memory limit and halted (out of gas, a bare revert).
     function sweep() external {
-        for (uint256 k = 0; k < 50; k++) {
+        for (uint256 k = 0; k < 53; k++) {
             this.sweepStep(k);
         }
     }
@@ -2915,6 +3010,9 @@ contract ReconcileHandler is Test {
                 if (_continue(true)) ok["continueReopen"]++;
             }
         }
+        if (k == 50 && ok["noticeSuccessThenRefund"] == 0) contradictoryNotices(true);
+        if (k == 51 && ok["noticeRefundThenSuccess"] == 0) contradictoryNotices(false);
+        if (k == 52 && ok["delayedPayNoticeOnce"] == 0) delayedPayNotice();
     }
 }
 
@@ -3163,6 +3261,39 @@ contract ReconcileInvariantsTest is ControlsFixture {
         );
         this.checkpoint();
         h.sweep();
+        this.checkpoint();
+    }
+
+    /// @notice r26 #6: both contradictory settlement directions and a refund paid late, each driven to completion;
+    /// the oracle's one-terminal-notification check holds after each.
+    function test_r26_6_contradictoryNotices_oneTerminalEach() public {
+        h.contradictoryNotices(true);
+        assertEq(h.ok("noticeSuccessThenRefund"), 1, "a delivered success, then a refund");
+        h.contradictoryNotices(false);
+        assertEq(h.ok("noticeRefundThenSuccess"), 1, "a delivered refund, then a delivery");
+        h.delayedPayNotice();
+        assertEq(h.ok("delayedPayNoticeOnce"), 1, "a refund paid late, notified once");
+        this.checkpoint();
+    }
+
+    /// @notice r26 #6, a corruption probe: a second, contradictory terminal callback reaching a contract sender
+    /// (simulated by calling it as the transfer app) fails the one-terminal-notification oracle at once.
+    function test_r26_6_secondTerminalCallback_failsAtOnce() public {
+        h.sendFromAdapter(10, false);
+        uint256 i = h.packetCount() - 1;
+        h.relay(i, true, false); // a forged success, delivered to the adapter
+        IICS26RouterMsgs.Packet memory pkt = h.packet(i);
+        SenderAdapter ad = SenderAdapter(h.adapterAddress());
+        assertEq(ad.terminals(keccak256(abi.encode(pkt.sourceClient, pkt.sequence))), 1);
+        this.checkpoint();
+        usdc.mint(address(ad), 10); // so its forward succeeds
+        vm.prank(address(ics20));
+        ad.onTimeoutPacket(
+            IIBCAppCallbacks.OnTimeoutPacketCallback(
+                pkt.sourceClient, pkt.destClient, pkt.sequence, pkt.payloads[0], address(0)
+            )
+        );
+        vm.expectRevert(bytes("one terminal notification per packet: 2 > 1"));
         this.checkpoint();
     }
 
@@ -3425,10 +3556,18 @@ contract ReconcileInvariantsTest is ControlsFixture {
             if (h.eligible(i)) f.eligibleUnpaid[t] += r;
             f.refundedAll[t] += rec.refunded;
             // each sender's refunds on its own: a refund paid to another party than the record's sender shows
-            if (sender == alice) f.refundedAlice[t] += rec.refunded;
-            else if (sender == _adapter()) f.refundedAdapter[t] += rec.refunded;
-            else if (sender == address(h.reentrant())) f.refundedReentrant[t] += rec.refunded;
-            else require(sender == bob && t == tn, "a sender the oracle does not track");
+            if (sender == alice) {
+                f.refundedAlice[t] += rec.refunded;
+            } else if (sender == _adapter()) {
+                f.refundedAdapter[t] += rec.refunded;
+                // one terminal notification per packet, from the sender's own callback history
+                bytes32 nk = keccak256(abi.encode(pkt.sourceClient, pkt.sequence));
+                assertLe(SenderAdapter(_adapter()).terminals(nk), 1, "one terminal notification per packet");
+            } else if (sender == address(h.reentrant())) {
+                f.refundedReentrant[t] += rec.refunded;
+            } else {
+                require(sender == bob && t == tn, "a sender the oracle does not track");
+            }
             if (t == tn) require(sender == bob, "only bob sends the voucher");
             // every record settled at most once, never refunded beyond its amount
             assertLe(h.settledCount(keccak256(abi.encode(pkt.sourceClient, pkt.sequence))), 1, "settled once");
@@ -3614,7 +3753,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[81] memory names = [
+        string[84] memory names = [
+            "noticeSuccessThenRefund",
+            "noticeRefundThenSuccess",
+            "delayedPayNoticeOnce",
             "settleHeldDeferred",
             "settleDeferredThenExecuted",
             "parkedAfterUnpreparedReopen",
@@ -3702,7 +3844,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[64] memory required = [
+        string[67] memory required = [
+            "noticeSuccessThenRefund",
+            "noticeRefundThenSuccess",
+            "delayedPayNoticeOnce",
             "settleHeldDeferred",
             "settleDeferredThenExecuted",
             "parkedAfterUnpreparedReopen",

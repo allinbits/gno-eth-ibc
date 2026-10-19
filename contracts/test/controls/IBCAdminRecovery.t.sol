@@ -15,6 +15,7 @@ import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
+import { IGnoLightClientStatus } from "../../src/interfaces/IGnoLightClientStatus.sol";
 import { StatusMock } from "../utils/ControlsMocks.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
@@ -459,6 +460,41 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         admin.approveRecovery(p);
         // a fresh custom id is accepted
         _approve(0, _proposal("gnoland-7"));
+    }
+
+    /// @notice Design r3 #2: the emergency recovery never depends on the failed verifier's `lastTransition()`. It
+    /// reverts after freezing: the recovery still executes, and the quarantine deadline is conservative (now plus the
+    /// route's duration, at least).
+    function test_d3_2_recovery_whenTheOldVerifierViewReverts() public {
+        _openFrozen();
+        _skip(DELAY + 1);
+        vm.mockCallRevert(address(lc), abi.encodeWithSelector(IGnoLightClientStatus.lastTransition.selector), "");
+        admin.executeRecovery();
+        assertEq(admin.govClient(), "gnoland-7");
+        assertGe(ctl.quarantineEnd("gnoland-7"), _now() + ctl.quarantineSeconds("gnoland-7"), "conservative");
+    }
+
+    /// @notice The same for a malformed answer (one word), and for kind 10: the replacement executes, conservatively.
+    function test_d3_2_kind10_whenTheOldVerifierViewIsMalformed() public {
+        MockLightClient next = new MockLightClient();
+        uint64 seq = admin.lastSeq() + 1;
+        _recvGov(
+            _env(
+                seq,
+                S.KIND_CLIENT,
+                P.client(1, "gnoland-2", "ethereum-2", _prefixOf(), address(next), address(next).codehash)
+            )
+        );
+        _recvGov(_env(seq + 1, S.KIND_ROUTE, P.route(clientId, "gnoland-2")));
+        _skip(7 days);
+        admin.execute(seq);
+        vm.mockCall(
+            address(lc), abi.encodeWithSelector(IGnoLightClientStatus.lastTransition.selector), abi.encode(uint256(1))
+        );
+        admin.execute(seq + 1);
+        assertEq(admin.decision(admin.epoch() - 1, seq + 1).state, S.EXECUTED);
+        assertEq(admin.govClient(), "gnoland-2");
+        assertGe(ctl.quarantineEnd("gnoland-2"), _now() + ctl.quarantineSeconds("gnoland-2"), "conservative");
     }
 
     function _prefixOf() internal pure returns (bytes[] memory prefix) {

@@ -514,7 +514,7 @@ contract IBCAdminExec is IIBCAdmin {
     /// migration and the epoch switch, all or nothing.
     function applyRoute(string calldata oldId, string calldata newId, uint64 suspectFrom) external delegated {
         _selfOnly();
-        IGnoICS20Controls(ics20).checkpointQuarantine(oldId);
+        IGnoICS20Controls(ics20).checkpointForReplacement(oldId);
         if (!_call(ics20, abi.encodeCall(IGnoICS20Controls.migrateRoute, (oldId, newId, suspectFrom)))) {
             revert AuthorityLost(ics20);
         }

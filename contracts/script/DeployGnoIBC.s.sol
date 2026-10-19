@@ -52,7 +52,11 @@ import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol
 ///   EXPECTED_LOCK               the ugnot lock expected on gno.land, in base units (required off a local chain): the
 ///                               launch day cap is min(100,000 GNOT, lock/10), the maximum per message
 ///                               min(25,000 GNOT, day cap), the refund cap the day cap (ADR §7.2, §9)
-///   GNOT_MAX_PER_MESSAGE, GNOT_DAY_CAP, GNOT_REFUND_CAP  optional lower ugnot launch limits, in base units
+///   GNOT_MAX_PER_MESSAGE, GNOT_DAY_CAP, GNOT_REFUND_CAP  optional lower ugnot activation limits, in base units.
+///                               The route launches with zero ugnot limits (inactive); the activation is a kind 4
+///                               from gno.land after IBCAdmin records gno.land's first decision, with these limits
+///   LAUNCH_ACTIVE               testing only (refused on mainnet): install the activation limits at launch, so test
+///                               networks transfer before gno.land binds
 ///   QUARANTINE_SECONDS          the route's quarantine after a validator-set transition; default 7 days
 ///   RECOVERY_DELAY              the emergency recovery's delay; 0 (default) deploys it disabled, else at least 30 days
 /// (§7.12). RECOVERY_THRESHOLD, RECOVERY_CANCEL_THRESHOLD, RECOVERY_SILENCE, RECOVERY_HOLD_PERIOD  its other settings
@@ -81,7 +85,11 @@ contract DeployGnoIBC is Script {
         address[2] watch;
         /// The ugnot lock expected on gno.land (base units): the launch limits derive from it (ADR §7.2, §9).
         uint256 expectedLock;
+        /// The ugnot limits the deployment installs: zero (inactive) from `_params`, until governance activates them.
         IGnoICS20ControlsTypes.Limits gnotLimits;
+        /// The limits the activation decision (a kind 4 from gno.land, after IBCAdmin records gno.land's first
+        /// decision) should set: derived from the expected lock, never above it.
+        IGnoICS20ControlsTypes.Limits activationLimits;
         uint64 quarantineSeconds;
         /// Permit2 for `sendTransferWithPermit2` (zero: none, as eureka's E2E deploy).
         address permit2;
@@ -124,6 +132,19 @@ contract DeployGnoIBC is Script {
         j.serialize("ibcAdminExec", d.ibcAdminExec);
         j.serialize("gnoChainId", p.clientState.chainId);
         j.serialize("counterpartyClientId", p.counterparty);
+        // the activating kind 4's parameters (P.limits encoding), for gno.land's governance
+        j.serialize(
+            "activationKind4Params",
+            abi.encode(
+                d.clientId,
+                d.ugnotVoucher,
+                p.activationLimits.maxPerMessage,
+                p.activationLimits.dayCap,
+                p.activationLimits.refundCap,
+                uint256(0),
+                uint256(0)
+            )
+        );
         j = j.serialize("clientId", d.clientId);
         vm.writeJson(j, out);
     }
@@ -157,12 +178,19 @@ contract DeployGnoIBC is Script {
         // the expected lock is required off a local chain: the launch caps derive from it
         p.expectedLock =
             block.chainid == 31_337 ? vm.envOr("EXPECTED_LOCK", 1_000_000 * GNOT) : vm.envUint("EXPECTED_LOCK");
-        p.gnotLimits = _launchLimits(
+        // the route launches inactive (ADR §5.4: zero limits until Ethereum records gno.land's first decision); the
+        // derived limits are what the activating kind 4 sets. LAUNCH_ACTIVE (testing only: it exposes value before
+        // gno.land binds) installs them at once
+        p.activationLimits = _launchLimits(
             p.expectedLock,
             vm.envOr("GNOT_MAX_PER_MESSAGE", uint256(0)),
             vm.envOr("GNOT_DAY_CAP", uint256(0)),
             vm.envOr("GNOT_REFUND_CAP", uint256(0))
         );
+        if (vm.envOr("LAUNCH_ACTIVE", false)) {
+            require(block.chainid != 1, "LAUNCH_ACTIVE is for test networks only");
+            p.gnotLimits = p.activationLimits;
+        }
         p.quarantineSeconds = _u64(vm.envOr("QUARANTINE_SECONDS", uint256(7 days)), "QUARANTINE_SECONDS");
         p.recovery = IIBCAdmin.RecoveryConfig({
             delay: _u64(vm.envOr("RECOVERY_DELAY", uint256(0)), "RECOVERY_DELAY"),
@@ -192,6 +220,18 @@ contract DeployGnoIBC is Script {
             relayer == address(0) || allowRestricted,
             "RELAYER_ADDRESS restricts governance delivery: leave it unset (testing: ALLOW_RESTRICTED_RELAYING=true)"
         );
+    }
+
+    function _within(
+        IGnoICS20ControlsTypes.Limits memory l,
+        IGnoICS20ControlsTypes.Limits memory most
+    )
+        internal
+        pure
+        returns (bool)
+    {
+        return l.dayCap <= most.dayCap && l.maxPerMessage <= most.maxPerMessage && l.maxPerMessage <= l.dayCap
+            && l.refundCap <= most.dayCap;
     }
 
     /// @notice The ugnot launch limits of ADR §9 for an expected lock: day cap min(100,000 GNOT, lock / 10), maximum
@@ -234,13 +274,9 @@ contract DeployGnoIBC is Script {
     }
 
     function _deploy(Params memory p) internal returns (Deployed memory d) {
-        // the launch limits never exceed what the expected lock allows (ADR §7.2, §9)
+        // the launch and activation limits never exceed what the expected lock allows (ADR §7.2, §9)
         IGnoICS20ControlsTypes.Limits memory most = _launchLimits(p.expectedLock, 0, 0, 0);
-        require(
-            p.gnotLimits.dayCap <= most.dayCap && p.gnotLimits.maxPerMessage <= most.maxPerMessage
-                && p.gnotLimits.maxPerMessage <= p.gnotLimits.dayCap && p.gnotLimits.refundCap <= most.dayCap,
-            "launch limits above the expected lock's"
-        );
+        require(_within(p.gnotLimits, most) && _within(p.activationLimits, most), "limits above the expected lock's");
         AccessManager am = new AccessManager(p.deployer);
         d.accessManager = address(am);
         // the router and its launch client in one transaction (RouterLauncher): no registration can come between
@@ -276,6 +312,12 @@ contract DeployGnoIBC is Script {
         // the quarantine armed first: receive limits (which enable receives) wait for it
         IGnoICS20Controls(d.ics20Transfer).setQuarantine(d.clientId, p.quarantineSeconds);
         IGnoICS20Controls(d.ics20Transfer).setLimits(d.clientId, d.ugnotVoucher, p.gnotLimits);
+        // read back: the installed limits are exactly the chosen ones
+        require(
+            keccak256(abi.encode(IGnoICS20Controls(d.ics20Transfer).limits(d.clientId, d.ugnotVoucher).limits))
+                == keccak256(abi.encode(p.gnotLimits)),
+            "installed ugnot limits differ from the chosen ones"
+        );
 
         d.ibcAdminExec = address(new IBCAdminExec(d.ics26Router, d.accessManager, d.ics20Transfer));
         d.ibcAdmin = address(

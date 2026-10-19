@@ -8,6 +8,8 @@
 #   ETH_RPC_URL=...  DEPLOYMENTS_FILE=deployments/<chain>.json  scripts/verify-codehashes.sh
 #   ETH_RPC_URL=...  DEPLOYMENTS_FILE=...  PENDING_SEQS=12,13  PENDING_HASHES=0x..,0x..  \
 #       PENDING_CANDIDATES=0x..,0x..  scripts/verify-codehashes.sh
+#   ETH_RPC_URL=...  DEPLOYMENTS_FILE=...  VOUCHERS=0x..,0x..  CLIENTS=0x..  scripts/verify-codehashes.sh
+#       (further registered vouchers, enrolled or attested verifiers: a recovery proposal's lightClient)
 #
 # Runs Foundry in Docker (the pinned image), from a clean build.
 set -euo pipefail
@@ -15,5 +17,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FOUNDRY_IMAGE="${FOUNDRY_IMAGE:-ghcr.io/foundry-rs/foundry:v1.7.1}"
 : "${ETH_RPC_URL:?ETH_RPC_URL}" "${DEPLOYMENTS_FILE:?DEPLOYMENTS_FILE (relative to contracts/)}"
 docker run --rm --network host -v "$ROOT":/work -v "$ROOT/.cache/svm":/home/foundry/.svm -w /work/contracts \
-	-e DEPLOYMENTS_FILE -e PENDING_SEQS -e PENDING_HASHES -e PENDING_CANDIDATES --entrypoint sh "$FOUNDRY_IMAGE" -c \
+	-e DEPLOYMENTS_FILE -e PENDING_SEQS -e PENDING_HASHES -e PENDING_CANDIDATES -e VOUCHERS -e CLIENTS \
+	--entrypoint sh "$FOUNDRY_IMAGE" -c \
 	"forge build --force >/dev/null && forge script script/VerifyCodehashes.s.sol --rpc-url '$ETH_RPC_URL'"

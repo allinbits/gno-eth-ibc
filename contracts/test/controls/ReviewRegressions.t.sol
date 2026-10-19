@@ -79,6 +79,126 @@ contract ReviewRegressionsTest is ControlsFixture {
         router.addClient("gnoland-9", IICS02ClientMsgs.CounterpartyInfo("ethereum-9", _prefix()), lc9);
         ctl.migrateRoute(clientId, "gnoland-9", type(uint64).max);
         vm.stopPrank();
+        retired9 = true;
+    }
+
+    /// @notice The route's current client id (kind 13 names it, never a retired alias).
+    function _cur() internal view returns (string memory) {
+        return retired9 ? "gnoland-9" : clientId;
+    }
+
+    bool internal retired9;
+
+    // ---------------------------------------------------------------- r26 #5: ADR §9's payload bound --
+
+    uint256 internal constant MAX_PAYLOAD = 262_144;
+
+    /// @notice A memo making the encoded payload value exactly `MAX_PAYLOAD` bytes (`extra` = 1: one byte more, which
+    /// pads to 32 more).
+    function _memo(address token, address sender, uint256 amount, uint256 extra) internal pure returns (string memory) {
+        IICS20TransferMsgs.FungibleTokenPacketData memory data = IICS20TransferMsgs.FungibleTokenPacketData({
+            denom: Strings.toHexString(token),
+            sender: Strings.toHexString(sender),
+            receiver: GNO_SENDER,
+            amount: amount,
+            memo: ""
+        });
+        uint256 base = abi.encode(data).length;
+        return string(new bytes(MAX_PAYLOAD - base + extra));
+    }
+
+    function _msg(uint256 amount, string memory memo)
+        internal
+        view
+        returns (IICS20TransferMsgs.SendTransferMsg memory)
+    {
+        return IICS20TransferMsgs.SendTransferMsg({
+            denom: address(usdc),
+            amount: amount,
+            receiver: GNO_SENDER,
+            sourceClient: clientId,
+            destPort: ICS20Lib.DEFAULT_PORT_ID,
+            timeoutTimestamp: uint64(_now() + 600),
+            memo: memo
+        });
+    }
+
+    function _tooLarge() internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(T.GnoPayloadTooLarge.selector, MAX_PAYLOAD + 32);
+    }
+
+    /// @notice Every send variant: a payload of exactly 262,144 bytes is sent, one byte of memo more is refused.
+    function test_r26_5_payloadBound_everySendVariant() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        // sendTransfer
+        vm.prank(alice);
+        uint64 seq = ics20.sendTransfer(_msg(10, _memo(address(usdc), alice, 10, 0)));
+        assertTrue(ctl.sendRecord(clientId, seq).commitment != bytes32(0));
+        vm.prank(alice);
+        vm.expectRevert(_tooLarge());
+        ics20.sendTransfer(_msg(10, _memo(address(usdc), alice, 10, 1)));
+        // sendTransferWithPermit2
+        address permit2 = ics20.getPermit2();
+        vm.prank(alice);
+        usdc.approve(permit2, type(uint256).max);
+        ISignatureTransfer.PermitTransferFrom memory permit =
+            ISignatureTransfer.PermitTransferFrom(ISignatureTransfer.TokenPermissions(address(usdc), 10), 0, 0);
+        vm.prank(alice);
+        ics20.sendTransferWithPermit2(_msg(10, _memo(address(usdc), alice, 10, 0)), permit, "");
+        vm.prank(alice);
+        vm.expectRevert(_tooLarge());
+        ics20.sendTransferWithPermit2(_msg(10, _memo(address(usdc), alice, 10, 1)), permit, "");
+        // sendTransferWithSender (the named sender is what the packet carries)
+        vm.prank(address(admin));
+        IAccessManager(d.accessManager).grantRole(IBCRolesLib.DELEGATE_SENDER_ROLE, alice, 0);
+        vm.prank(alice);
+        ics20.sendTransferWithSender(_msg(10, _memo(address(usdc), bob, 10, 0)), bob);
+        vm.prank(alice);
+        vm.expectRevert(_tooLarge());
+        ics20.sendTransferWithSender(_msg(10, _memo(address(usdc), bob, 10, 1)), bob);
+    }
+
+    /// @notice Receives: a payload above the bound is an error ack before any decoding; one at the bound is taken.
+    function test_r26_5_payloadBound_receive() public {
+        IICS20TransferMsgs.FungibleTokenPacketData memory data = IICS20TransferMsgs.FungibleTokenPacketData({
+            denom: "ugnot", sender: GNO_SENDER, receiver: Strings.toHexString(bob), amount: 5, memo: ""
+        });
+        uint256 base = abi.encode(data).length;
+        data.memo = string(new bytes(MAX_PAYLOAD - base));
+        bytes memory at = abi.encode(data);
+        assertEq(at.length, MAX_PAYLOAD);
+        assertTrue(
+            _isSuccessAck(
+                _recv(
+                    _packetFromGno(
+                        clientId, ICS20Lib.DEFAULT_PORT_ID, ICS20Lib.ICS20_VERSION, ICS20Lib.ICS20_ENCODING, at
+                    )
+                )
+            )
+        );
+        data.memo = string(new bytes(MAX_PAYLOAD - base + 1));
+        bytes memory over = abi.encode(data);
+        assertTrue(
+            _isErrorAck(
+                _recv(
+                    _packetFromGno(
+                        clientId, ICS20Lib.DEFAULT_PORT_ID, ICS20Lib.ICS20_VERSION, ICS20Lib.ICS20_ENCODING, over
+                    )
+                )
+            )
+        );
+        assertEq(ugnot.balanceOf(bob), 5);
+    }
+
+    /// @notice Docs r3 #12: kind 13 names the route's current client only; a retired alias is refused.
+    function test_r26_reopenByARetiredAlias_refused() public {
+        _retire();
+        vm.prank(address(admin));
+        vm.expectRevert(T.GnoBadRoute.selector);
+        ctl.reopenRoute(clientId);
+        vm.prank(address(admin));
+        ctl.reopenRoute("gnoland-9"); // the current client: nothing pending, it reopens
+        assertFalse(ctl.routeClosed("gnoland-9"));
     }
 
     function _settle(T.SettleItem[] memory items) internal {
@@ -145,14 +265,14 @@ contract ReviewRegressionsTest is ControlsFixture {
         ctl.settleRecords(clientId, _item(honest.sequence, 1, 0));
         // the forged refund's remainder is never paid: it leaves the queue without a payment
         vm.prank(address(admin));
-        ctl.reopenRoute(clientId);
+        ctl.reopenRoute(_cur());
         _skip(30 days);
         assertEq(ctl.claim(clientId, address(usdc), 10), 1);
         assertEq(usdc.balanceOf(alice), before + 700);
         assertEq(ctl.sendRecord(clientId, forged.sequence).refunded, 10);
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoNotClosed.selector, clientId));
-        ctl.reopenRoute(clientId);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoNotClosed.selector, _cur()));
+        ctl.reopenRoute(_cur());
     }
 
     function test_r1_settledRefund_neverCutShort_parkedInFull() public {
@@ -172,7 +292,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Parked));
         r.setBlocked(alice, false);
         vm.prank(address(admin));
-        ctl.reopenRoute(clientId);
+        ctl.reopenRoute(_cur());
         assertEq(ctl.claimParked(clientId, pkt.sequence, 0), 500);
         assertEq(r.balanceOf(alice), 1000);
     }
@@ -219,7 +339,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(uint8(ctl.sendRecord(clientId, pkt.sequence).payment), uint8(T.Payment.Claimed), "still settled");
         // nothing was queued for it either: reopened, the route pays nothing more
         vm.prank(address(admin));
-        ctl.reopenRoute(clientId);
+        ctl.reopenRoute(_cur());
         _skip(1 days);
         assertEq(ctl.claim(clientId, address(usdc), 10), 0);
         assertEq(usdc.balanceOf(alice), 1_000_000e6, "refunded once");
@@ -238,17 +358,17 @@ contract ReviewRegressionsTest is ControlsFixture {
         _proveDelivered(inFlight);
         assertEq(ctl.openRecords(clientId), 2);
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, clientId, 1));
-        ctl.reopenRoute(clientId);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, _cur(), 1));
+        ctl.reopenRoute(_cur());
         _settle(_item(forged.sequence, 4, 10)); // the forged refund: 10 lost
         vm.prank(address(admin));
-        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, clientId, 1));
-        ctl.reopenRoute(clientId);
+        vm.expectRevert(abi.encodeWithSelector(T.GnoIncidentsPending.selector, _cur(), 1));
+        ctl.reopenRoute(_cur());
         _settle(_item(inFlight.sequence, 3, 0));
         vm.expectEmit(true, true, false, true, address(ics20));
         emit T.GnoDeficitAccepted(clientId, address(usdc), 10);
         vm.prank(address(admin));
-        ctl.reopenRoute(clientId);
+        ctl.reopenRoute(_cur());
         assertEq(ctl.acceptedDeficit(clientId, address(usdc)), 10);
         assertEq(ctl.losses(clientId, address(usdc)), 10);
     }
@@ -279,7 +399,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         _settle(items);
         assertEq(ctl.reserved(clientId, address(r)), 100);
         vm.prank(address(admin));
-        ctl.reopenRoute(clientId); // the deficit is accepted
+        ctl.reopenRoute(_cur()); // the deficit is accepted
         // bob redeems his 200 vouchers: only what is not reserved can leave
         string memory back = string.concat("transfer/ethereum-9/", Strings.toHexString(address(r)));
         assertTrue(_isErrorAck(_transferIn("gnoland-9", back, 200, bob)), "would eat alice's refund");
@@ -664,7 +784,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         p.watch = W;
         p.expectedLock = 100_000e6;
         p.gnotLimits = T.Limits(25_000e6, 100_000e6, 100_000e6, 0, 0);
-        vm.expectRevert("launch limits above the expected lock's");
+        vm.expectRevert("limits above the expected lock's");
         this.deployWith(p);
     }
 
@@ -1694,7 +1814,7 @@ contract ReviewRegressionsTest is ControlsFixture {
         // kind 12: a settlement of a record of an id still in use (the call reverts)
         seqs[n++] = _decide(S.KIND_SETTLE, P.settle1(clientId, 1, 1, 1));
         // kind 13: reopening an open route (the call reverts)
-        seqs[n++] = _decide(S.KIND_REOPEN, P.reopen(clientId));
+        seqs[n++] = _decide(S.KIND_REOPEN, P.reopen(_cur()));
         _skip(7 days);
         admin.execute(seatFirst);
         for (uint256 i = 0; i < n; i++) {
@@ -1717,7 +1837,7 @@ contract ReviewRegressionsTest is ControlsFixture {
 
     /// @notice Round 6 #5: a caller sending less gas than a kind's frame needs leaves the decision pending.
     function test_r6_5_starvedCaller_leavesThePending() public {
-        uint64 seq = _decide(S.KIND_REOPEN, P.reopen(clientId));
+        uint64 seq = _decide(S.KIND_REOPEN, P.reopen(_cur()));
         _skip(7 days);
         (bool ok,) = address(admin).call{ gas: 1_000_000 }(abi.encodeCall(admin.execute, (seq)));
         assertFalse(ok);
@@ -2474,7 +2594,7 @@ contract ReviewRegressionsTest is ControlsFixture {
     function test_parkedShortfallRefunds_reopeningCompletes() public {
         (uint64 a, uint64 b) = _twinHidden(false);
         vm.prank(address(admin));
-        ctl.reopenRoute(clientId);
+        ctl.reopenRoute(_cur());
         assertFalse(ctl.routeClosed(clientId), "reopened with both refunds parked");
         assertEq(ctl.reserved(clientId, address(usdc)), 200, "still fully reserved");
         // 100 out of the escrow's 150 would leave the other refund's 100 short
@@ -2911,3 +3031,64 @@ contract ReviewRegressionsTest is ControlsFixture {
         );
     }
 }
+
+/// @notice Design r3 #4 (ADR §5.4): the production launch is inactive. The ugnot route carries zero limits, so
+/// nothing moves before gno.land binds; the activation is a kind 4 from gno.land, after IBCAdmin records gno.land's
+/// first decision.
+contract InactiveLaunchTest is ControlsFixture {
+    function _gnotLimits() internal pure override returns (T.Limits memory) {
+        return T.Limits(0, 0, 0, 0, 0);
+    }
+
+    function test_d3_4_inactiveUntilActivated() public {
+        assertTrue(admin.setupDone(), "finishSetup accepts zero launch limits");
+        assertEq(admin.lastSeq(), 0, "gno.land has not bound yet");
+        // receives refused (nothing minted), and an Ethereum-native send too (no limits for it)
+        assertTrue(_isErrorAck(_transferIn(clientId, "ugnot", 1, bob)));
+        assertEq(ugnot.totalSupply(), 0);
+        _sendExpectRevert(
+            alice,
+            address(usdc),
+            1,
+            clientId,
+            abi.encodeWithSelector(T.GnoLimitsNotSet.selector, clientId, address(usdc))
+        );
+        // the activation: gno.land's kind 4 (its first decision binds), executed after its 7 days
+        uint64 seq = admin.lastSeq() + 1;
+        assertEq(
+            _status(_recvGov(_env(seq, S.KIND_LIMITS, P.limits(clientId, address(ugnot), 1000, 5000, 5000, 0, 0)))),
+            S.STATUS_RECORDED
+        );
+        assertTrue(_isErrorAck(_transferIn(clientId, "ugnot", 1, bob)), "still inactive while the decision waits");
+        _skip(7 days + 1);
+        admin.execute(seq);
+        assertTrue(_isSuccessAck(_transferIn(clientId, "ugnot", 100, bob)), "active");
+        assertEq(ugnot.balanceOf(bob), 100);
+    }
+}
+
+/// @notice Design r3 #4 and r26 #4: the deploy script launches inactive, keeps the chosen (lowered) limits for the
+/// activation, and installs them at launch only with the testing flag.
+contract LaunchParamsTest is ControlsFixture {
+    function paramsLimits() external view returns (T.Limits memory launch, T.Limits memory activation) {
+        Params memory p = _params(address(this));
+        return (p.gnotLimits, p.activationLimits);
+    }
+
+    function test_r26_4_inactiveLaunch_loweredActivationLimits() public {
+        vm.setEnv("GNOT_MAX_PER_MESSAGE", "700");
+        vm.setEnv("GNOT_DAY_CAP", "1000");
+        vm.setEnv("GNOT_REFUND_CAP", "900");
+        (T.Limits memory launch, T.Limits memory activation) = this.paramsLimits();
+        assertEq(abi.encode(launch), abi.encode(T.Limits(0, 0, 0, 0, 0)), "launches inactive");
+        assertEq(abi.encode(activation), abi.encode(T.Limits(700, 1000, 900, 0, 0)), "the chosen, lowered limits");
+        vm.setEnv("LAUNCH_ACTIVE", "true");
+        (launch,) = this.paramsLimits();
+        assertEq(abi.encode(launch), abi.encode(T.Limits(700, 1000, 900, 0, 0)), "testing: active at launch");
+        vm.setEnv("LAUNCH_ACTIVE", "false");
+        vm.setEnv("GNOT_MAX_PER_MESSAGE", "0");
+        vm.setEnv("GNOT_DAY_CAP", "0");
+        vm.setEnv("GNOT_REFUND_CAP", "0");
+    }
+}
+

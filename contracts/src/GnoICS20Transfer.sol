@@ -297,6 +297,9 @@ contract GnoICS20Transfer is
             amount: msg_.amount,
             memo: msg_.memo
         });
+        // GNO: ADR §9's bound on the encoded payload value: gno.land refuses a larger packet before the app sees it
+        bytes memory value = abi.encode(packetData);
+        require(value.length <= GnoTransferStorage.MAX_PAYLOAD, GnoPayloadTooLarge(value.length));
 
         // GNO: the sequence is kept for the send record
         uint64 sequence = _getICS26Router()
@@ -309,7 +312,7 @@ contract GnoICS20Transfer is
                 destPort: ICS20Lib.DEFAULT_PORT_ID,
                 version: ICS20Lib.ICS20_VERSION,
                 encoding: ICS20Lib.ICS20_ENCODING,
-                value: abi.encode(packetData)
+                value: value
             })
             })
             );
@@ -374,6 +377,10 @@ contract GnoICS20Transfer is
             ICS20InvalidPort(ICS20Lib.DEFAULT_PORT_ID, msg_.payload.destPort)
         );
 
+        // GNO: ADR §9's payload bound, before any decoding
+        require(
+            msg_.payload.value.length <= GnoTransferStorage.MAX_PAYLOAD, GnoPayloadTooLarge(msg_.payload.value.length)
+        );
         // GNO: undecodable data is refused with a custom error (an error ack), never an empty revert
         IICS20TransferMsgs.FungibleTokenPacketData memory packetData;
         try this.gnoDecodePacketData(msg_.payload.value) returns (IICS20TransferMsgs.FungibleTokenPacketData memory d) {

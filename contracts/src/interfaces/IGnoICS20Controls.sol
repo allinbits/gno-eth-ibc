@@ -158,6 +158,8 @@ interface IGnoICS20ControlsTypes {
     error GnoQuarantineUnknown(string clientId);
     error GnoDenomNotRegistered(string denom);
     error GnoLimitsNotSet(string clientId, address token);
+    /// @notice A transfer packet's encoded payload value above ADR §9's 262,144 bytes (gno.land refuses it).
+    error GnoPayloadTooLarge(uint256 size);
     error GnoOverMaxPerMessage(address token, uint256 amount, uint256 maxPerMessage);
     error GnoOverDayCap(address token, uint256 amount, uint256 dayCap);
     error GnoSendAboveMax(address token, uint256 amount, uint256 sendMax);
@@ -219,6 +221,12 @@ interface IGnoICS20Controls is IGnoICS20ControlsTypes {
     /// @notice Stores the route's quarantine deadline so far (its current client's transitions): IBCAdmin calls it
     /// before any verifier swap (kind 6 migrate, kind 10, the emergency recovery), so a swap never drops it.
     function checkpointQuarantine(string calldata clientId) external;
+
+    /// @notice As `checkpointQuarantine`, for a route replacement (kind 10, the emergency recovery): it never depends
+    /// on the failing verifier. When its `lastTransition()` cannot be read (it reverts or answers malformed data), the
+    /// deadline becomes max(saved deadline, now + the route's quarantine), conservatively. Outcomes proven through the
+    /// old verifier are void either way. Only IBCAdmin.
+    function checkpointForReplacement(string calldata clientId) external;
     /// @notice Clears the route's flags and refunds flags set at a block before `beforeBlock`; refused while either
     /// set holds (IGuardians.HoldStands).
     function unpauseRoute(string calldata clientId, uint64 beforeBlock) external returns (uint256 cleared);

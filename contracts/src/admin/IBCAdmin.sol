@@ -512,7 +512,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         a = standing;
         for (uint256 i = 0; i < l.holds.length; i++) {
             IGuardians.Hold memory h = l.holds[i];
-            if (h.end >= due && h.start < a) a = h.start;
+            // a merged interval may span a gap no hold covered: never an anchor (a later genuine hold's start is
+            // used instead, never earlier than the true anchor)
+            if (!h.merged && h.end >= due && h.start < a) a = h.start;
         }
     }
 
