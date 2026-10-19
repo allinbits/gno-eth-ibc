@@ -121,7 +121,8 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 - App ack: `epoch u32 ‖ seq u64 ‖ status u8 ‖ redispatch u8` (14 bytes); status 1 recorded, 2 buffered,
   3 duplicate, 4 conflict, 5 spent. A cancel beyond the window is acknowledged `status 2, redispatch 1`.
 - A conflict (other bytes at a recorded or buffered number) keeps the first bytes and sets IBCAdmin's conflict
-  flag, which defers every 7-day decision. The flag's block is refreshed on every conflict, and a kind 2 unpause
+  flag, which defers every 7-day decision except a seat change (kind 3, which only a hold delays, by its anchor
+  rule). The flag's block is refreshed on every conflict, and a kind 2 unpause
   clears it only when the latest conflict came strictly before the unpause was recorded. Guardian flags work the
   same way: setting one again refreshes its block. Hold and dip moments keep their first block, but only to measure
   how long a hold has lasted; no unpause is compared against them.
@@ -470,6 +471,16 @@ one incident is never counted by another; nothing is counted on the live client.
   - **no** `sendRecord` there, while eureka's `prevSequenceSends[sourceClient]` (in `IBCStoreUpgradeable`'s ERC-7201
     storage: the last allocated sequence) satisfies `prevSequenceSends ≥ seq`, so no send can ever take that
     sequence: forged at once;
+  - no `sendRecord` there while the transfer app has **retired** that client id (`isRetired(sourceClient)` on the
+    transfer proxy, an `eth_call` at the pinned block, or the storage word `retired[sourceClient]`: in the
+    `gno.storage.GnoICS20Transfer` namespace, base `0xf3bec7e430c885c7577ab512690266d2e153034fd4fd64588d19040d96496100`,
+    the mapping's slot is the base plus 10, so the word is `keccak256(bytes(sourceClient) ‖ uint256(0xf3bec7e4…9649610a))`):
+    forged at once, whatever the sequence counter or the timeout says. Retirement is permanent: the only write is
+    `migrateRoute` setting it true (kind 10, the emergency recovery), nothing clears it, and every send over a
+    retired id is refused (`GnoClientRetired`), so no transfer can ever write a record there again; IBCAdmin's
+    notice resends over retired ids write no transfer record. A kind 7 upgrade could only change this with new,
+    governed and verified code. So a replacement of the route ends such hostage cases: retire the client the
+    forged receive names, then resolve them by this path;
   - no `sendRecord` there once the finalized timestamp has reached the packet's timeout (a forged packet may carry
     a timeout years ahead, so this path alone is not enough).
 
@@ -805,7 +816,8 @@ executor is refused on chain already: through a proxy its `bindings()` answer ze
 bindings are right but whose code is not a build of its source.
 
 **Live code that fails after execution** cannot be cancelled (kind 1 acts only on pending decisions). An IBCAdmin
-hold defers every 7-day decision, the repair's included, so the order matters:
+hold defers every 7-day decision, the repair's included (a seat change only until its anchor plus 21 days), so the
+order matters:
 1. **Cancel unsafe pending decisions** (kind 1): every pending decision that relies on the failed code or would
    install unverified code.
 2. **Keep the transfers contained.** Guardians set the route flags on every route (`setRouteFlag`: receives and
@@ -814,7 +826,7 @@ hold defers every 7-day decision, the repair's included, so the order matters:
    on IBCAdmin: route flags defer no governance, but **refunds flags defer every refund-paying kind 12** (it stays
    pending); they last while the guardians keep them (kind 2 clears them only when no hold of theirs stands).
 3. **Clear the administrative flags and wait out the hold.** IBCAdmin flags (`setFlag`) defer every 7-day
-   decision, so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
+   decision but a seat change (kind 3), so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
    after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days.
 4. **Execute the verified repair**, each candidate verified as pending (`verifyPending`) before it matures:
    - a failed transfer-app, router or beacon implementation: a kind 7 back to the last verified implementation
@@ -965,8 +977,8 @@ is armed, and the deploy script sets the quarantine first (`test_r19_2_transitio
 
 `contracts/test/controls/` drives the real `ICS26Router` (mock light client) through the full deployment of
 `DeployGnoIBC`: `GnoICS20Transfer.t.sol`, `IBCAdminDelivery.t.sol`, `IBCAdminKinds.t.sol`,
-`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (the ten
-review rounds' regressions, `test_r…` to `test_r10_…`), `CodePinning.t.sol` (the delegate codehashes and the build
+`IBCAdminRecovery.t.sol`, `IBCAdminHoldFuzz.t.sol`, `Integration.t.sol`, `ReviewRegressions.t.sol` (every
+review round's regressions, named by round and finding, `test_r…`, and the design rounds', `test_d…`), `CodePinning.t.sol` (the delegate codehashes and the build
 verification), `ReconcileInvariants.t.sol` (invariant tests of the
 reconciliation state machine against a ghost model: every packet's truth chosen when sent, relays honest or forged
 against it, honest proofs, governance through IBCAdmin.execute; replacements also while closed or reopening,
