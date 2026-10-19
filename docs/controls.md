@@ -23,7 +23,7 @@ The controls are safe under these assumptions; each is detailed where its rule i
 | Contract | File | What it is |
 |---|---|---|
 | `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); its changes are marked `GNO:`, except the `nonReentrant` modifiers added to entry points that upstream leaves without one (`pause`, `unpause`, `setCustomERC20`, `upgradeEscrowTo`, `upgradeIBCERC20To`), which carry no marker (a diff against `lib/solidity-ibc-eureka/contracts/ICS20Transfer.sol` lists every change). Deployed as the ICS20 proxy's first implementation (`DeployGnoIBC`); later versions are installed only by kind 7 (the proxy's UUPS upgrade). Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
-| `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim`, views, and `ackHook` (the fork's ack/timeout settlement, reachable only through the fork's own call: a consume-once transient flag). Runs only by delegatecall from `GnoICS20Transfer`'s `fallback` (EIP-170 keeps them apart); its address is an immutable of the fork's implementation. |
+| `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim`, views, and `ackHook` (the fork's ack/timeout settlement, reachable only through the fork's own call: a consume-once transient flag). Runs only by delegatecall from the fork: through `GnoICS20Transfer`'s `fallback` for ordinary calls, and through a direct delegatecall from the fork's `_ackHook` for the ack and timeout settlement (EIP-170 keeps them apart); its address is an immutable of the fork's implementation. |
 | `GnoICS20Reconcile` | `contracts/src/transfer/GnoICS20Reconcile.sol` | Reconciliation: `claimParked`, `settleRecords` (kind 12), `reopenRoute` and `continueReopen` (kind 13). Reached through `GnoICS20Controls`' fallback; its address is an immutable of the controls. |
 | `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
 | `GnoTransferStorage` | `contracts/src/transfer/GnoTransferStorage.sol` | The fork's ERC-7201 layout (`gno.storage.GnoICS20Transfer`) and the route-key helpers both halves use. |
@@ -143,7 +143,8 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
     acknowledged is ignored, and nothing ever clears the mark. gno.land answers a notice it recorded as proven but
     has not applied (an advance of more than one epoch), a competing transition and every other refusal with the
     universal error ack.
-  - **A recorded notice is always re-sendable.** `resendEpochNotice(epoch)` works for any epoch whose notice was
+  - **A recorded notice is always re-sendable** (a send the router refuses, from inside its lock, is reported with
+    sequence 0 and the call can simply be repeated). `resendEpochNotice(epoch)` works for any epoch whose notice was
     recorded (every epoch a kind 10 or the emergency recovery opened; never the launch epoch), at any time: before
     or after an acknowledgement, and whatever the current epoch. It is permissionless: a notice states a fact and
     gno.land de-duplicates it. An acknowledgement never closes it, because a compromised Ethereum-side gno.land
@@ -510,7 +511,7 @@ one incident is never counted by another; nothing is counted on the live client.
   disables recovery; otherwise at least 30 days, `MIN_RECOVERY_DELAY`; launch value 0 unless `RECOVERY_DELAY` is set),
   `threshold` (approvals, `RECOVERY_THRESHOLD`, launch 3, 3 or 4 when recovery is enabled), `cancelThreshold` (cancel
   votes, `RECOVERY_CANCEL_THRESHOLD`, launch 3; when enabled at least 3 and **at most `threshold`**, so the guardians
-  who can open a proposal can always close it; the constructor and the deploy script refuse anything else,
+  who can open a proposal can always close it, as long as they still hold their seats; the constructor and the deploy script refuse anything else,
   `test_m1_cancelThreshold_atMostTheApprovalThreshold`), `silence` (launch 30 days,
   `RECOVERY_SILENCE`; 0 disables that criterion) and `holdPeriod` (launch 14 days, `RECOVERY_HOLD_PERIOD`; 0 disables
   it). A proposal (`RecoveryProposal`) names `newClientId`, `counterpartyClientId`, `merklePrefix` (canonical:
@@ -587,7 +588,8 @@ token or sender hook called in), the executor's code the pinned one (`ForeignExe
 its route's refunds hold (`Deferred`), and enough gas left for the kind's frame: at least floor(frame × 64 / 63) +
 60,000 at that point, after the checks before it (`CallStarved`). The frame budgets in the table below are therefore
 not sufficient transaction gas limits. Each of these execution checks reverts and leaves the decision **pending**: calling `execute` again with enough
-gas retries it. Recording starvation is different. Recording has its own 1M frame (`RECORD_GAS`) and floor,
+gas retries it. One exception does not revert: a seat change (kind 3) whose first held execution pins its anchor
+returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording has its own 1M frame (`RECORD_GAS`) and floor,
 1M × 64 / 63 + 10,000; with less gas the delivery reverts `ExecutionStarved` and the recording is rolled back, but
 the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
 envelope that was never recorded is retried by a source-side redispatch, in a fresh packet from gno.land; work

@@ -16,7 +16,7 @@ The other halves live in two branches:
 ```
 gno.land (3 secp256k1 validators)                    Ethereum (Sepolia)
   r/aib/ibc/core ── client ethereum-1  <──────────>  ICS26Router ── client-0 = GnoLightClient
-  r/aib/ibc/apps/transfer (ICS20)                     ICS20Transfer (ICS20, GnoVoucher vouchers)
+  r/aib/ibc/apps/transfer (ICS20)                     GnoICS20Transfer (ICS20 fork + controls, GnoVoucher)
   p/aib/ibc/lightclient/ethereum                      contracts/src/GnoLightClient.sol
       sync committee + BLS (gno native)                   tm2 commits: sha256 + ecrecover
       MPT storage proofs                                  ICS23 B+tree + multistore proofs
