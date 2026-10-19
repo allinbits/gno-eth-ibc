@@ -2014,6 +2014,45 @@ contract ReconcileHandler is Test {
         if (_reconcile(0, true) && ctl.routeClosed(_live())) _reopen();
     }
 
+    /// @notice A loss booking needs no proof: a kind 12 action 5 for a forged receive of a retired client, recorded
+    /// while the route's verifier is sound, executes after that verifier froze or expired; the loss is booked exactly
+    /// once, and a replay of the same item is spent with every loss unchanged.
+    function lossAfterVerifierFault(uint256 amount, bool expire) external {
+        calls++;
+        _ratchet();
+        if (clients.length >= 64 || !_ensureOpen()) return;
+        // a delivered send first: the escrow then holds what the forged receive releases
+        if (!_send(alice, tokens[0], 60, true)) return;
+        this.relay(packets.length - 1, false, false);
+        uint256 before = receives.length;
+        this.receive_(0, amount % 50 + 1, true);
+        if (receives.length == before) return;
+        Receive memory r = receives[before];
+        if (!_replace(true) || !ctl.isRetired(r.client) || ctl.lossBooked(r.client, r.sequence, 2)) return;
+        uint256 l = ctl.losses(_live(), r.token);
+        uint64 s = _decide(S.KIND_SETTLE, P.settle1(r.client, r.sequence, 5, r.amount));
+        if (s == 0) return;
+        if (expire) _liveClient().setStatus(false, true);
+        else _liveClient().setStatus(true, false);
+        _executeAll(_one(s));
+        uint8 state = admin.decision(admin.epoch(), s).state;
+        assertTrue(state != S.SPENT, "an action 5 spent by a verifier fault");
+        if (state != S.EXECUTED) return; // deferred by a hold: pending
+        assertEq(ctl.losses(_live(), r.token), l + r.amount, "the loss booked once");
+        assertTrue(ctl.lossBooked(r.client, r.sequence, 2), "booked");
+        ok[expire ? "lossAfterExpire" : "lossAfterFreeze"]++;
+        // the replay, with the verifier sound again: spent, nothing booked again
+        _liveClient().setStatus(false, false);
+        uint64 again = _decide(S.KIND_SETTLE, P.settle1(r.client, r.sequence, 5, r.amount));
+        if (again == 0) return;
+        _executeAll(_one(again));
+        uint8 st = admin.decision(admin.epoch(), again).state;
+        assertTrue(st != S.EXECUTED, "a replayed action 5 executed");
+        assertEq(ctl.losses(_live(), r.token), l + r.amount, "a replay books nothing");
+        if (st == S.SPENT) ok["lossReplayRefused"]++;
+        _ensureOpen();
+    }
+
     /// @notice Authority changes between an emergency recovery's approval and its execution are suspended.
     function recoverWithAuthorityAttempts() external {
         calls++;
@@ -2858,7 +2897,7 @@ contract ReconcileHandler is Test {
     /// its own external call (`sweepStep`), so its memory is released before the next: a single frame holding every
     /// composite's allocations outgrew the EVM's 32 MiB memory limit and halted (out of gas, a bare revert).
     function sweep() external {
-        for (uint256 k = 0; k < 55; k++) {
+        for (uint256 k = 0; k < 57; k++) {
             this.sweepStep(k);
         }
     }
@@ -3145,6 +3184,10 @@ contract ReconcileHandler is Test {
         if (k == 54 && ok["staleSuccessRetryRefused"] == 0) staleSuccessRetry(true);
         if (k == 53 && ok["successRetryOnce"] == 0) successRetry();
         if (k == 52 && ok["delayedPayNoticeOnce"] == 0) delayedPayNotice();
+        if (k == 55 && (ok["lossAfterFreeze"] == 0 || ok["lossReplayRefused"] == 0)) {
+            this.lossAfterVerifierFault(7, false);
+        }
+        if (k == 56 && ok["lossAfterExpire"] == 0) this.lossAfterVerifierFault(8, true);
     }
 }
 
@@ -3982,7 +4025,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[86] memory names = [
+        string[89] memory names = [
+            "lossAfterFreeze",
+            "lossAfterExpire",
+            "lossReplayRefused",
             "staleSuccessRetryRefused",
             "successRetryOnce",
             "noticeSuccessThenRefund",
@@ -4075,7 +4121,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[69] memory required = [
+        string[72] memory required = [
+            "lossAfterFreeze",
+            "lossAfterExpire",
+            "lossReplayRefused",
             "staleSuccessRetryRefused",
             "successRetryOnce",
             "noticeSuccessThenRefund",

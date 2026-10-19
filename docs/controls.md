@@ -447,7 +447,8 @@ one incident is never counted by another; nothing is counted on the live client.
   reopening completes, and the refund is paid by `claimParked` once the backing returns
   (`test_parkedShortfallRefunds_reopeningCompletes`, `test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment`).
 - **A failed executor can always be replaced.** Kind 9 is IBCAdmin's own: IBCAdmin records and executes it
-  itself and never delegatecalls the installed executor for it, at recording or at execution, so an executor that
+  itself and never delegatecalls the installed executor for it, at recording or at execution, and its execution
+  skips the executor pin check (`ForeignExec`) that every executor-dispatched kind has, so an executor that
   reverts everything, refuses kind 9 or no longer matches its pin is still replaced
   (`test_kind9_replacesAnExecutorThatRevertsEverything`, `test_kind9_replacesAnExecutorThatRefusesKind9`,
   `test_kind9_replacesAForeignExecutor`). It keeps the envelope, sequence binding, 7-day delay, deferral by flags,
@@ -628,16 +629,23 @@ one incident is never counted by another; nothing is counted on the live client.
 
 `IBCAdmin.execute` checks, before anything runs: the decision pending, not suspended by an open recovery, not
 deferred by flags or holds, mature, the transfer app not busy (`Busy`: a transfer-app entry point is running, so a
-token or sender hook called in), the executor's code the pinned one (`ForeignExec`), a refund-paying kind 12 not under
-its route's refunds hold (`Deferred`), and enough gas left for the kind's frame: at least floor(frame × 64 / 63) +
-60,000 at that point, after the checks before it (`CallStarved`). The frame budgets in the table below are therefore
+token or sender hook called in), for every kind dispatched through the executor (all but kind 9) the executor's code
+the pinned one (`ForeignExec`), a refund-paying kind 12 not under its route's refunds hold (`Deferred`), and enough
+gas left for the kind's frame: at least floor(frame × 64 / 63) + 60,000 at that point, after the checks before it
+(`CallStarved`). Kind 9, IBCAdmin's own path, skips the executor pin check (a foreign executor is what it may
+replace) and has its own floor of 161,587 gas (`CallStarved`); it keeps every other check: sequencing, cancellation,
+recovery suspension, deferral and maturity. The frame budgets in the table below are therefore
 not sufficient transaction gas limits. Each of these execution checks reverts and leaves the decision **pending**: calling `execute` again with enough
 gas retries it. One exception does not revert: a seat change (kind 3) whose first held execution pins its anchor
-returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording has its own 1M frame (`RECORD_GAS`) and floor,
-1M × 64 / 63 + 10,000; with less gas the delivery reverts `ExecutionStarved` and the recording is rolled back, but
+returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording through the executor (`_atRecording`, every kind 2 to 13 but kind 9)
+has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 10,000; with less gas the delivery reverts
+`ExecutionStarved` and the recording is rolled back, but
 the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
 envelope that was never recorded is retried by a source-side redispatch, in a fresh packet from gno.land; work
-already buffered on Ethereum is recorded by `drain()` called with enough gas. A tombstoned pending decision is the exception: `execute` cancels it
+already buffered on Ethereum is recorded by `drain()` called with enough gas (a drained decision of an executor kind
+goes through the same frame and floor). A cancel (kind 1), an unknown kind or undecodable envelope (spent), a
+tombstoned decision (cancelled) and kind 9 (its parameter check, IBCAdminStorage.handoverParams) are recorded inline,
+with no executor frame and no `ExecutionStarved` floor. A tombstoned pending decision is the exception: `execute` cancels it
 (`CANCELLED`, its parameters deleted, `DecisionCancelled`) and returns.
 
 **A pending decision has no execution expiry.** `execute` checks a minimum maturity and no maximum age, so a recorded
