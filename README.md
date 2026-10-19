@@ -65,7 +65,9 @@ deployment and its checks). Optional settings:
   `RECOVERY_SILENCE` (default 30 days) and
   `RECOVERY_HOLD_PERIOD` (default 14 days), zero disabling either criterion.
   The recovery is fixed at deployment: enabling it is a pre-deployment
-  decision, with no later governed enablement.
+  decision, with no later governed enablement. With it disabled, a channel
+  loss with no repair already recorded can strand the escrow's backing for
+  good (see docs/controls.md).
 - `PERMIT2`: the chain's Permit2 contract, fixed at deployment; unset, only
   allowance-based sends work (`sendTransferWithPermit2` is unavailable).
 

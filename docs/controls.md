@@ -28,7 +28,7 @@ The controls are safe under these assumptions; each is detailed where its rule i
 | `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
 | `GnoTransferStorage` | `contracts/src/transfer/GnoTransferStorage.sol` | The fork's ERC-7201 layout (`gno.storage.GnoICS20Transfer`) and the route-key helpers both halves use. |
 | `IBCAdmin` | `contracts/src/admin/IBCAdmin.sol` | Permanent, immutable IBC app on port `ibcgov`: the §5.4 delivery protocol, the decision ledger, flags on itself, execution scheduling, recovery entry points, `finishSetup`. Holds `ADMIN_ROLE`. |
-| `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: every kind at recording and at execution. Delegatecalled at a pinned code hash; replaced only by kind 9. |
+| `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: kinds 2 to 13 at recording and at execution (kind 1, the cancel, is handled by IBCAdmin itself: its tombstones are applied on arrival). Delegatecalled at a pinned code hash; replaced only by kind 9. |
 | `IBCAdminRecovery` | `contracts/src/admin/IBCAdminRecovery.sol` | The optional emergency route replacement (§7.12). Deployed by the executor (so pinned with it) and delegatecalled by IBCAdmin. |
 | `IBCAdminStorage` | `contracts/src/admin/IBCAdminStorage.sol` | IBCAdmin's ERC-7201 layout (`gno.storage.IBCAdmin`), constants, tombstones, hold history. |
 | `IBCAdminChecks` | `contracts/src/admin/IBCAdminChecks.sol` | The executor's stateless checks (a view contract it deploys): canonical parameters per kind, gno.land denoms and counterparties, and whether a light client may verify for gno.land (code, chain id, neither frozen nor expired, a last transition), every status view failing closed. |
@@ -226,14 +226,14 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | E7 4 guardian + 2 watch seats, flags, holds (two guardian flags), 24 h hold end, unpause clears earlier flags, refused under a hold | `Guardians`; per route in the fork, on IBCAdmin itself |
 | a replaced key's flags die on every flag set, and stay dead if the key returns (seat generations) | `Guardians.Keys.gen`, `setKeys`, `standing` |
 | E7 route flags block receives and Ethereum-native sends only | `_checkReceiveRoute`, `_checkEscrowedSend` |
-| E9 live-epoch quarantine, anchor-independent; fail closed where it is read: a client whose `lastTransition()` is missing or reverts refuses receives and quarantine changes (`GnoQuarantineUnknown`). The exact-length check (precisely two uint64 words, 64 bytes) is made by the quarantine checkpoints and changes (`GnoICS20Controls._lastTransition`) and by installation (`IBCAdminChecks.transitionKnown`), which refuse anything else; a receive reads it with a typed call, which accepts a longer answer whose first two words decode. **A route replacement never depends on the failing verifier** (`checkpointForReplacement`, kind 10 and the emergency recovery): when its `lastTransition()` reverts or answers malformed data, the checkpoint keeps the saved deadline and imposes max(saved deadline, now + the route's quarantine), then voids the old verifier's outcomes and the replacement proceeds (`test_d3_2_recovery_whenTheOldVerifierViewReverts`, `test_d3_2_kind10_whenTheOldVerifierViewIsMalformed`); a kind 6 verifier swap keeps the strict read (a swap of a verifier that cannot answer is spent: replace the route instead). Two paths do not read it: a receive on a route whose quarantine duration and saved deadline are both zero, and the route's first quarantine setting (which arms the route without a checkpoint); a duration applies to transitions accepted after it, a started quarantine keeps its deadline; transitions told apart by number; a duration change reads the route's current client, whichever id names it; the deadline of a started quarantine is checkpointed before any verifier swap (kind 6 op 2) or route replacement (kind 10), so the new client cannot end it early; governance not quarantined | `GnoLightClient._isLiveTransition`, `lastTransition`; `GnoTransferStorage.quarantineUntil`; `GnoICS20Controls.setQuarantine` settles; never checked by IBCAdmin |
+| E9 live-epoch quarantine, anchor-independent; fail closed where it is read: a client whose `lastTransition()` is missing or reverts refuses receives and quarantine changes (`GnoQuarantineUnknown`). The exact-length check (precisely two uint64 words, 64 bytes) is made by the quarantine checkpoints and changes (`GnoICS20Controls._lastTransition`) and by installation (`IBCAdminChecks.transitionKnown`), which refuse anything else; a receive reads it with a typed call, which accepts a longer answer whose first two words decode. **A route replacement never depends on the failing verifier** (`checkpointForReplacement`, kind 10 and the emergency recovery): its `lastTransition()` is read in isolation, with a fixed 100,000-gas cap (a GnoLightClient answers with two storage reads, a few thousand gas; the cap leaves the replacement's frame nearly whole) and only the first 64 bytes of the answer copied; when it reverts, burns its gas or answers anything but exactly two uint64 words, the checkpoint keeps the saved deadline and imposes max(saved deadline, now + the route's quarantine), then voids the old verifier's outcomes and the replacement proceeds (`test_d3_2_recovery_whenTheOldVerifierViewReverts`, `test_d3_2_kind10_whenTheOldVerifierViewIsMalformed`, and for a gas-burning or 4,000-byte view `test_r27_2_kind10_*`, `test_r27_2_recovery_*`). The old client's status probes for recovery eligibility (`isFrozen`, `isExpired`, through `IBCAdminChecks.flag`) are isolated the same way (100,000 gas, one word copied): a failing view answers nothing, and the silence and hold criteria still apply; a kind 6 verifier swap keeps the strict read (a swap of a verifier that cannot answer is spent: replace the route instead). Two paths do not read it: a receive on a route whose quarantine duration and saved deadline are both zero, and the route's first quarantine setting (which arms the route without a checkpoint); a duration applies to transitions accepted after it, a started quarantine keeps its deadline; transitions told apart by number; a duration change reads the route's current client, whichever id names it; the deadline of a started quarantine is checkpointed before any verifier swap (kind 6 op 2) or route replacement (kind 10), so the new client cannot end it early; governance not quarantined | `GnoLightClient._isLiveTransition`, `lastTransition`; `GnoTransferStorage.quarantineUntil`; `GnoICS20Controls.setQuarantine` settles; never checked by IBCAdmin |
 | §5.4 envelope, acks, statuses, window W = 64, drain D = 8 (every delivery and `drain()`), duplicates, conflicts | `IBCAdmin.onRecvPacket`, `_deliver`, `_record`, `_drain` |
 | §5.4 cancels anywhere: tombstones on arrival of the ranges as given, merged with every stored range they touch; at most 64 stored ranges per epoch, past which a new range merges with the nearest stored one, cancelling the numbers in the gap too; a cancel carries 1 to 16 ranges by its grammar, but the 1024-byte envelope makes 14 the effective maximum (15 ranges take 1,038 bytes: an oversize envelope, spent); a cancel beyond the window is bound to its hash and acked `status 2, redispatch 1`, and a malformed one beyond the window is an error ack | `IBCAdmin._deliver`, `_parseCancel`, `_tombstone`; `IBCAdminStorage.addTombstone` |
 | §5.4 epochs: another epoch refused, everything keyed by (epoch, seq) | `IBCAdmin.onRecvPacket`; `IBCAdminStorage.Layout` |
 | §5.4 unknown kind / bad params recorded and spent; a decision's parameters must be exactly the canonical `abi.encode` of its tuple (decoded, re-encoded and compared: trailing data, offsets or padding otherwise are spent at recording); a decision failing its checks at execution spent (no code, another code hash, a refused call, failed after-checks, rolled back) | `IBCAdmin._record`, `execute`; `IBCAdminExec.atRecording`, `_codeIs`, `_call`, `_selfStep` |
 | no one spends a decision by starving it of gas: recording, refusable calls and self-steps run with fixed budgets and floors | `IBCAdmin._atRecording`; `IBCAdminExec._call`, `_selfStep` |
 | §5.4 kind delays: cancel / kind 4 tightening / kind 8 revoke / kind 11 lengthening at recording; unpause 24 h; others 7 d | `IBCAdminExec.atRecording`, `IBCAdmin.execute`, `_delay` |
-| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days. The anchor is the start of the first hold standing at or after the seat change was due (its 7 days passed), even one that began before: the earliest start of the standing hold and of every recorded hold that ended at or after the due time, so a hold that ended before the change was due never counts, and one nobody observed still does (gno.land anchors at the hold standing at its first deferring `Execute`, which can only make its wait longer). The first `execute` that finds a hold standing pins it (`replacementAnchor`, `ReplacementAnchored`) and returns without reverting, since a revert would undo the pin; the decision stays pending. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold from day 1, standing when the change is due, → day 22, day 21 of the hold (`test_kind3_throughAHold_noSoonerThanDay21`). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both, marked `merged`: a merged interval may span a gap no hold covered, so it **never** supplies an anchor; a later genuine hold's start (or the standing hold's) is used instead, never earlier than the true anchor (`test_kind3_anchor_compressedHistory_neverEarlier`; the hold fuzz checks every execution against its own, uncompressed record of the holds) | `IBCAdmin.execute`, `_anchor`, `replacementAnchor`; `IBCAdminStorage.hold`, `noteHoldEnd` |
+| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days. The anchor is the start of the first hold standing at or after the seat change was due (its 7 days passed), even one that began before: the earliest start of the standing hold and of every recorded hold that ended at or after the due time, so a hold that ended before the change was due never counts, and one nobody observed still does (gno.land anchors at the hold standing at its first deferring `Execute`; both rules avoid an anchor earlier than the ideal one, while history compression and observation timing can make either chain's wait the longer). A hold's end is exclusive: one whose dip grace expires exactly at the due time had ended then and never anchors (`test_kind3_anchor_holdEndingExactlyAtDue_neverCounts`, `testFuzz_anchorAtTheDueBoundary`). The first `execute` that finds a hold standing pins it (`replacementAnchor`, `ReplacementAnchored`) and returns without reverting, since a revert would undo the pin; the decision stays pending. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold from day 1, standing when the change is due, → day 22, day 21 of the hold (`test_kind3_throughAHold_noSoonerThanDay21`). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both, marked `merged`: a merged interval may span a gap no hold covered, so it **never** supplies an anchor; a later genuine hold's start (or the standing hold's) is used instead, never earlier than the true anchor (`test_kind3_anchor_compressedHistory_neverEarlier`; the hold fuzz checks every execution against its own, uncompressed record of the holds) | `IBCAdmin.execute`, `_anchor`, `replacementAnchor`; `IBCAdminStorage.hold`, `noteHoldEnd` |
 | §7.4 unpause spent under a hold of its object (a route: its flags or refunds flags); kind 2's parameters need a non-empty client id for object 1 (a route) and an empty one for object 2 (IBCAdmin), spent at recording otherwise | `IBCAdminExec._unpause` |
 | kind 3 replaces 1 to 4 pairs of distinct, valid seats with distinct resulting keys (spent at recording otherwise), at most 2 guardian seats, never a current key; both key copies follow; a replaced seat loses its recovery approval | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule; an older decision maturing later never overwrites a newer setting (kinds 4, 11). Bounds (spent otherwise): a non-zero token, `dayCap` and `refundCap` at most 2^128 − 1 (`LeakyBucket.MAX_CAP`), and `sendMin <= sendMax` when `sendMax` is set. A zero `dayCap` refuses every receive, a zero `maxPerMessage` too, and a zero `refundCap` queues every refund; kind 11's quarantine is at most 365 days | `IBCAdminExec._validLimits`, `_loosens`; `IBCAdminStorage.supersede` |
@@ -314,9 +314,13 @@ bounds (constant work whatever the number of incidents).
     to it per (sender, token), what it sent and the refunds of its own records; only bob sends the voucher. Probes
     that move a paid refund to another party, with every total unchanged, fail it at once
     (`test_r23_reentrantRefundRedirected_failsAtOnce`, `test_r23_adapterRefundRedirectedToOwner_failsAtOnce`).
-4d. **One terminal notification per packet.** Each contract sender's packet is told its outcome at most once: the
-    sender adapter keeps its own per-packet callback history (count and kinds), and the oracle checks it
-    independently of the controls' notification bookkeeping. The campaign forces both contradictory directions (a
+4d. **One terminal notification per packet, of the right kind.** Each contract sender's packet (the adapter's and
+    the re-entrant sender's) is told its outcome at most once, with a kind its outcomes allow (the transport's as
+    relayed, or the settlement's: action 1 a refund, 2 to 4 a success), and a refund only once paid in full: each
+    sender keeps its own per-packet callback history (count and kinds), and the oracle checks it independently of
+    the controls' notification bookkeeping. `successRetry` drives a refused success retried before settlement (once,
+    a second retry refused), then reconciled; a wrong-kind probe (a paid refund announced as a success) fails at once
+    (`test_r27_4_successRetry_andWrongKind`). The campaign forces both contradictory directions (a
     delivered forged success then an action 1 refund, `noticeSuccessThenRefund`; a delivered refund notification then
     an action 4, `noticeRefundThenSuccess`), trying both notification paths after the settlement, and a refund paid
     late after an unprepared reopening (`delayedPayNoticeOnce`: delivered once, then refused). A corruption probe that
@@ -395,7 +399,7 @@ bounds (constant work whatever the number of incidents).
 
 | Event | Precondition | Effect |
 |---|---|---|
-| replacement (kind 10, emergency recovery) | the old id is the route's current client; the new id fresh | a new *replacement* incident covering the old id (suspect range from `suspectFrom`); the route closes; a reopening under way is aborted (its incidents back to *open*); earlier incidents, their records, reservations and counters untouched. Allowed while the route is closed |
+| replacement (kind 10, emergency recovery) | the old id is the route's current client; the new id fresh (its own route key, if it had one, is abandoned: the new client aliases the old route, whose flags, limits and quarantine govern from then on; flags set under the candidate's own id do not carry over, so operators flag the existing route) | a new *replacement* incident covering the old id (suspect range from `suspectFrom`); the route closes; a reopening under way is aborted (its incidents back to *open*); earlier incidents, their records, reservations and counters untouched. Allowed while the route is closed |
 | ack or timeout | a record of the client | appended to the client's processed list; counted as suspect only if the client is retired |
 | delivery or drain of a governance decision | the transfer app not busy (a delivery from inside a hook reverts whole with no data, so the router writes nothing and the packet is relayed again later; `drain()` records nothing) | the decision recorded; one acting at recording (kind 4 or 11 tightening) applies |
 | kind 12 on a retired client's records | its incident not *reopening*; the outcome proven by the active verifier | the record settled once; its client's open and suspect counts follow |
@@ -445,9 +449,13 @@ one incident is never counted by another; nothing is counted on the live client.
   verifier of gno.land is not the only risk: gno.land's suspect receive entitlements (vouchers or releases it paid
   for packets Ethereum supposedly sent) must be reconciled too. Before kind 13 reopens a route, and before the
   containment is cleared, operators enumerate gno.land's suspect receive entitlements for the incident and
-  authenticate each against Ethereum's permanently retained `sendRecord(clientId, sequence)` commitment (a forged
-  receive has none, or another), read from an **independently trusted Ethereum node** (not the possibly compromised
-  light client or a single third-party RPC). Every forged entitlement is voided or settled on gno.land first.
+  authenticate each against Ethereum's permanently retained `sendRecord(clientId, sequence)` commitment, read from
+  an **independently authenticated finalized state** (an independently trusted node, never the possibly compromised
+  light client or a single third-party RPC), with `eth_call` and `eth_getProof` pinned to that finalized block,
+  never "latest". A matching commitment is genuine. Absence or a mismatch is conclusive only once that finalized
+  state's timestamp has reached the packet's timeout (a send could still be committed until then); before that the
+  entitlement stays unresolved and containment stays in place. Every forged entitlement is voided or settled on
+  gno.land first.
   Ethereum's kind 13 checks only its own incident counters and cannot see these entitlements; when the evidence is
   unavailable, the route stays closed.
 - **Cross-chain loss ownership: the payout chain is authoritative.** A loss is identified by its packet (the
@@ -476,6 +484,11 @@ one incident is never counted by another; nothing is counted on the live client.
   a shortfall outside the one reconciliation recognizes, and the invariants do not hold for that token. A token
   that pauses or blacklists only makes refunds park (`claimParked` retries them). gno.land vouchers are the bridge's
   own code (kind 5, code-hash pinned).
+- **Recovery disabled means stranded backing after a channel loss.** With recovery disabled (the default), an
+  ordinary channel loss (the epoch client frozen or expired, governance unable to reach Ethereum) leaves no path to
+  a new route unless a suitable repair (a kind 6 client and a kind 10) was already recorded before the loss: the
+  frozen or expired client refuses every proof, so refunds and redemptions on the route stop, and the escrow's
+  backing can become permanently stranded. A fresh deployment cannot recover it.
 - **Emergency recovery.** Configured once, at deployment (`RecoveryConfig`, `recoveryConfig()`), and fixed: no
   governed decision enables, disables or retunes it later (IBCAdmin is immutable). **Whether to enable it is a
   pre-deployment decision**, taken with the guardian set the deployment installs; a deployment with recovery
@@ -576,7 +589,7 @@ refused, or anything reverting inside it (its own gas included) **spends** the d
 | 7 upgrade | 3.5M | transfer beacon getters; self-step: `upgradeToAndCall` (2M), version probes, authority, binding and beacon reads | `codehash`, `params`, `migration call`, `nested upgrade`, `upgrade`; a revert | same; `test_r5_2…`, `test_r4_1…` |
 | 8 role | 1.5M | AccessManager `grantRole`/`revokeRole` | `role` (validated at recording too); a revert | — (no failure reachable after recording) |
 | 9 hand-over | 3.5M | executor `bindings()`; self-step: the migration call (2M) | `codehash`, `bindings`, `migration`; a revert | `test_r6_5_deterministicFailures_spendEveryKind` |
-| 10 route | 2.5M | transfer `checkpointQuarantine`, `migrateRoute` (refusable); router `migrateClient` (freeze) | `client`, `route`; a revert | same |
+| 10 route | 2.5M | transfer `checkpointForReplacement` (the old verifier's view capped), `migrateRoute` (refusable); router `migrateClient` (freeze) | `client`, `route`; a revert | same |
 | 11 settings | 1.5M | transfer `setQuarantine` | `params`, `superseded`; a revert | same |
 | 12 settle | 7M | transfer `settleRecords` (6M, refusable): proofs' verifier, token and escrow calls (each payment 200,000 gas) | `settle`; a revert | same; `test_r6_3…` |
 | 13 reopen | 2.5M | transfer `reopenRoute` (refusable) | `route`; a revert | same |
@@ -596,7 +609,8 @@ a cancel beyond the window, commitment-only send records, and kinds 12 and 13. W
    every kind 3.
 4. **Kind 2 on a route clears both its pause flags and its refunds flags** set before the decision, and is spent
    while either flag set holds.
-5. **Kind 10 is also suspended while an emergency recovery is open** (the ADR lists kinds 3 and 6–9).
+5. *Historical, now in the ADR:* kind 10 is also suspended while an emergency recovery is open (the amended ADR
+   lists it too).
 6. **Limits are required for escrowed sends** of an Ethereum-native token, and a token's first limits setting always
    waits 7 days.
 7. **Undecodable parameters are spent at recording** (all kinds are decoded then).
@@ -612,7 +626,7 @@ a cancel beyond the window, commitment-only send records, and kinds 12 and 13. W
     nothing.
 12. **Seat generations**: a flag stores, besides its block, time and key, the generation of the key that set it, so
     a key removed and restored in the same block cannot revive its earlier flags.
-13. **A proven non-receipt waits for the packet's timeout.** The ADR counts a non-receipt as refundable because the
+13. *Historical, now in the ADR:* **a proven non-receipt waits for the packet's timeout.** The original ADR counted a non-receipt as refundable because the
     destination's old client is frozen; Ethereum cannot prove that freeze, so `proveOutcome` takes a non-receipt
     only at a proof height whose destination time (the replacement client's, returned with the proof) reaches the
     packet's timeout (eureka caps timeouts at one day), as the amended §5.4 has it.
@@ -687,7 +701,20 @@ voucher fails through the wrapper): every item below. **Manual** until tooling c
 - **one release per run**: the verifier rebuilds every artifact from the one checkout it runs in, so the live code and
   a candidate of a different release (another source, compiler or settings) cannot both match in the same run. Verify
   the live system from a checkout of the release it runs, and each pending candidate from a checkout of the release
-  it installs, each build reproducible from its tagged source.
+  it installs with `CANDIDATES_ONLY=true` (pending decisions and the listed vouchers and clients only, never the live
+  code), each build reproducible from its tagged source (`scripts/test-verify-wrapper.sh` checks this with two
+  builds);
+- **storage-layout compatibility** before every kind 7 or kind 9: a matching build says nothing of compatibility.
+  Review by hand that the candidate keeps every existing storage layout it touches (the fork's, the controls'
+  namespace, eureka's ICS20Transfer namespace, IBCAdmin's), changing them only by appending, as the ADR requires;
+- **verifier admission** (kind 6, kind 10's target, a recovery proposal's client): the verifier must freeze
+  irreversibly, with no in-place trust reset (no path that unfreezes it, recovers it in place or restores trust in
+  earlier roots). Outcomes record the verifier's address and the route's generation, which detect swaps and
+  replacements but not a reset inside an unchanged verifier: an outcome proven against a poisoned root would survive
+  an in-place recovery and could settle. GnoLightClient meets this requirement (it has no unfreeze or recovery
+  path). Any other verifier type must be shown to meet it before it is admitted, a manual check, and its meeting
+  it is a trust assumption of the controls (the alternative, a monotonic trust generation every reset advances and
+  outcomes record, has no interface here).
 
 It covers:
 
@@ -754,8 +781,13 @@ hold defers every 7-day decision, the repair's included, so the order matters:
    - a failed transfer-app, router or beacon implementation: a kind 7 back to the last verified implementation
      (named in the previous `verifyLive` run), or to a fixed build;
    - a failed executor: a kind 9 hand-over to a verified executor;
-   - a failed voucher: none can be swapped (kind 5 registers a denom once); stop the denom's flows with the route
-     flags and limits (kind 4 to zero caps, applied at recording), and treat its balances as at risk;
+   - a failed voucher: none can be swapped (kind 5 registers a denom once). On Ethereum, the route flags and zero
+     caps (kind 4, applied at recording) stop **ingress only** (receives); returning-voucher burns bypass both, so
+     a defect that mints unbacked vouchers can still be burned into gno.land release claims with genuine Ethereum
+     send records. Containment therefore also needs **gno.land's** `credits` and `payouts` flags on the route;
+     then reconcile the affected gno.land receive entitlements (the authentication of a send record does not reveal
+     unbacked vouchers: their supply must be audited against the escrowed backing), and clear containment only after
+     a repair or the denom's retirement. Stopping the burns on Ethereum needs a governed code change (kind 7);
    - a failed verifier: a kind 10 route replacement (or the emergency recovery, if enabled at deployment), with
      `suspectFrom` covering the time it ran, whenever its history may need reconciliation: kind 6 migrates a
      client in place, with no incident, no retirement and no `suspectFrom`, and kind 12 settles only a retired
