@@ -22,7 +22,7 @@ The controls are safe under these assumptions; each is detailed where its rule i
 
 | Contract | File | What it is |
 |---|---|---|
-| `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); its changes are marked `GNO:`, except the `nonReentrant` modifiers added to entry points (e.g. `sendTransfer`, `setCustomERC20`), which carry no marker (a diff against `lib/solidity-ibc-eureka/contracts/ICS20Transfer.sol` lists every change). Deployed as the ICS20 proxy's first implementation (`DeployGnoIBC`); later versions are installed only by kind 7 (the proxy's UUPS upgrade). Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
+| `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); its changes are marked `GNO:`, except the `nonReentrant` modifiers added to entry points that upstream leaves without one (`pause`, `unpause`, `setCustomERC20`, `upgradeEscrowTo`, `upgradeIBCERC20To`), which carry no marker (a diff against `lib/solidity-ibc-eureka/contracts/ICS20Transfer.sol` lists every change). Deployed as the ICS20 proxy's first implementation (`DeployGnoIBC`); later versions are installed only by kind 7 (the proxy's UUPS upgrade). Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
 | `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim`, views, and `ackHook` (the fork's ack/timeout settlement, reachable only through the fork's own call: a consume-once transient flag). Runs only by delegatecall from `GnoICS20Transfer`'s `fallback` (EIP-170 keeps them apart); its address is an immutable of the fork's implementation. |
 | `GnoICS20Reconcile` | `contracts/src/transfer/GnoICS20Reconcile.sol` | Reconciliation: `claimParked`, `settleRecords` (kind 12), `reopenRoute` and `continueReopen` (kind 13). Reached through `GnoICS20Controls`' fallback; its address is an immutable of the controls. |
 | `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
@@ -186,7 +186,8 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
     id. A fresh gno.land local client applies only when Ethereum's emergency recovery created a new router client.
   - Each epoch keeps its own notice, so after consecutive replacements (A→B→C: epoch 2 over B, epoch 3 over C) each
     stays re-sendable on its own, and gno.land may skip ahead.
-  - The ack and timeout callbacks handle notices and ignore anything else; they never revert.
+  - The ack and timeout callbacks handle notices and ignore anything else; called by the router they never revert,
+    and any other caller is refused (`NotRouter`).
   - Example (`epochNotice` in the vectors file): epoch 2 over `gnoland-2` is `0x0100000002676e6f6c616e642d32`; the
     switched ack is `0x0000000200000000000000000100`, the duplicate ack `0x0000000200000000000000000300`.
 - **Route identity.** Every replacement path (kind 6 add or migrate, kind 10, the emergency recovery) requires the
@@ -585,9 +586,12 @@ deferred by flags or holds, mature, the transfer app not busy (`Busy`: a transfe
 token or sender hook called in), the executor's code the pinned one (`ForeignExec`), a refund-paying kind 12 not under
 its route's refunds hold (`Deferred`), and enough gas left for the kind's frame: at least floor(frame × 64 / 63) +
 60,000 at that point, after the checks before it (`CallStarved`). The frame budgets in the table below are therefore
-not sufficient transaction gas limits. Recording has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 +
-10,000 (`ExecutionStarved`, an error ack: the packet is relayed again with more gas). Each of these
-reverts and leaves the decision **pending**. A tombstoned pending decision is the exception: `execute` cancels it
+not sufficient transaction gas limits. Each of these execution checks reverts and leaves the decision **pending**: calling `execute` again with enough
+gas retries it. Recording starvation is different. Recording has its own 1M frame (`RECORD_GAS`) and floor,
+1M × 64 / 63 + 10,000; with less gas the delivery reverts `ExecutionStarved` and the recording is rolled back, but
+the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
+envelope that was never recorded is retried by a source-side redispatch, in a fresh packet from gno.land; work
+already buffered on Ethereum is recorded by `drain()` called with enough gas. A tombstoned pending decision is the exception: `execute` cancels it
 (`CANCELLED`, its parameters deleted, `DecisionCancelled`) and returns.
 
 **A pending decision has no execution expiry.** `execute` checks a minimum maturity and no maximum age, so a recorded
