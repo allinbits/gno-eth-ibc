@@ -119,6 +119,9 @@ interface IIBCAdmin {
     event RecoveryOpened(bytes32 indexed proposal, uint64 executableAt);
     event RecoveryCancelVote(bytes32 indexed proposal, address indexed guardian, uint256 votes);
     event RecoveryCancelled(bytes32 indexed proposal);
+    /// @notice A cancellation closed the recovery but the transfer app refused to lift the route's recovery block:
+    /// the route stays blocked until `clearRecoveryBlock` succeeds.
+    event RecoveryBlockKept(bytes32 indexed proposal);
     event RecoveryExecuted(bytes32 indexed proposal, string newClientId);
     event SetupDone();
     /// @notice The epoch notice sent over the new client (§7.12); `sequence` zero: the router refused it, resend.

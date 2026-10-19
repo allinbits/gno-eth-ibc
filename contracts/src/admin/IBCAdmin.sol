@@ -26,6 +26,7 @@ import { IBCAdminExec } from "./IBCAdminExec.sol";
 import { IBCAdminChecks } from "./IBCAdminChecks.sol";
 import { IBCAdminRecovery } from "./IBCAdminRecovery.sol";
 import { IBCAdminLaunchCheck } from "./IBCAdminLaunchCheck.sol";
+import { IBCAdminNative } from "./IBCAdminNative.sol";
 
 /// @title IBCAdmin: the permanent governance app on port `ibcgov` (gno.land's `gov`)
 /// @notice Plain code, never behind a proxy, so immutable from its deployment; router ports can never be registered
@@ -52,7 +53,7 @@ import { IBCAdminLaunchCheck } from "./IBCAdminLaunchCheck.sol";
 /// deferred while a flag, a hold or a conflict stands on IBCAdmin, except the guardian replacement (kind 3), which
 /// lands through flags and lands through a hold no sooner than day 21 of it; an unpause (kind 2) waits 24 hours and is
 /// spent under a hold of its object. The kinds' logic runs in IBCAdminExec, delegatecalled at a pinned code hash and
-/// replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor (`_handover`).
+/// replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor (IBCAdminNative).
 
 /// @notice The transfer app's reentrancy lock, read by IBCAdmin.
 interface IGnoICS20Busy {
@@ -94,6 +95,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     address public immutable deployer;
     /// @notice `finishSetup`'s launch checks (11 to 15), deployed by this contract's constructor.
     address public immutable launchCheck;
+    /// @notice IBCAdmin's own executor-independent code (kind 9, recovery cancellation), deployed in the constructor
+    /// and delegatecalled at this fixed address: part of IBCAdmin's immutable code.
+    address public immutable native;
 
     uint64 internal immutable _recoveryDelay;
     uint8 internal immutable _recoveryThreshold;
@@ -124,6 +128,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         ics20 = c.ics20;
         deployer = msg.sender;
         launchCheck = address(new IBCAdminLaunchCheck());
+        native = address(new IBCAdminNative());
         (_recoveryDelay, _recoveryThreshold, _recoveryCancelThreshold, _recoverySilence, _recoveryHoldPeriod) =
         (rc.delay, rc.threshold, rc.cancelThreshold, rc.silence, rc.holdPeriod);
 
@@ -487,7 +492,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             if (gasleft() < S.HANDOVER_FLOOR) revert CallStarved();
             d.state = S.EXECUTED;
             delete d.params;
-            spent = _handover(params);
+            spent = abi.decode(
+                _native(abi.encodeCall(IBCAdminNative.handover, (params, router, accessManager, ics20))), (string)
+            );
         } else {
             spent = _run(l, d, kind, seq, params);
         }
@@ -529,40 +536,6 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             abi.encodeCall(this.selfDelegate, (abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))))
         );
         return ok ? abi.decode(abi.decode(ret, (bytes)), (string)) : "reverted";
-    }
-
-    /// @notice Kind 9 `(exec, codeHash, migrationCall)`, its migration call empty (IBCAdminStorage.handoverParams):
-    /// `exec`'s code is the decision's (contract code, not an EIP-7702 designator) and its `bindings()` answer, in
-    /// BIND_GAS, exactly this contract's router, AccessManager and transfer app; then the pin moves. No state or
-    /// authority moves: both stay here. A failed check spends the decision ("codehash", "bindings").
-    function _handover(bytes memory p) private returns (string memory) {
-        (address x, bytes32 h) = abi.decode(p, (address, bytes32));
-        if (!S.isCode(x) || x.codehash != h) return "codehash";
-        bytes4 sel = IBCAdminExec.bindings.selector;
-        uint256 bindGas = S.BIND_GAS;
-        bool ok;
-        uint256 n;
-        uint256 r;
-        uint256 am;
-        uint256 t;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            let ptr := mload(0x40)
-            mstore(ptr, sel)
-            ok := staticcall(bindGas, x, ptr, 4, ptr, 96)
-            n := returndatasize()
-            r := mload(ptr)
-            am := mload(add(ptr, 32))
-            t := mload(add(ptr, 64))
-        }
-        if (!ok || n != 96 || r != uint160(router) || am != uint160(accessManager) || t != uint160(ics20)) {
-            return "bindings";
-        }
-        S.Layout storage l = S.layout();
-        l.exec = x;
-        l.execHash = h;
-        emit ExecReplaced(x, h);
-        return "";
     }
 
     /// @notice A seat change's anchor: the start of the first hold standing at or after it was `due` (ADR §7.4, day 21
@@ -633,10 +606,16 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         _delegateRecovery(abi.encodeCall(IBCAdminRecovery.approveRecovery, (msg.sender, abi.encode(p), c)));
     }
 
-    /// @notice A guardian withdraws its approval, or votes to cancel the open proposal.
+    /// @notice A guardian withdraws its approval, or votes to cancel the open proposal; at the cancel threshold the
+    /// recovery closes. IBCAdmin's own path (IBCAdminNative), never through the executor or its recovery module.
     function cancelRecovery() external {
-        RecoveryConfig memory c = _recoveryConfig();
-        _delegateRecovery(abi.encodeCall(IBCAdminRecovery.cancelRecovery, (msg.sender, c)));
+        if (_recoveryDelay == 0) revert RecoveryDisabled();
+        _native(abi.encodeCall(IBCAdminNative.cancelRecovery, (msg.sender, _recoveryCancelThreshold, ics20)));
+    }
+
+    /// @notice Lifts a recovery block a cancellation left standing (`RecoveryBlockKept`). Permissionless.
+    function clearRecoveryBlock() external {
+        _native(abi.encodeCall(IBCAdminNative.clearRecoveryBlock, (ics20)));
     }
 
     /// @notice Executes the open proposal after its delay. Permissionless.
@@ -690,18 +669,22 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         address m = x.recoveryModule();
         // the module the pinned executor deployed, its code still the recorded one
         if (m.codehash != x.RECOVERY_HASH()) revert ForeignExec();
-        (bool ok, bytes memory ret) = m.delegatecall(call);
-        if (!ok) {
-            // solhint-disable-next-line no-inline-assembly
-            assembly ("memory-safe") {
-                revert(add(ret, 32), mload(ret))
-            }
-        }
+        _delegateTo(m, call);
+    }
+
+    /// @notice Runs IBCAdmin's own executor-independent code (IBCAdminNative, fixed at construction) as this contract.
+    function _native(bytes memory call) private returns (bytes memory) {
+        return _delegateTo(native, call);
     }
 
     /// @notice Runs the executor's code as this contract; a revert there reverts here with its own reason.
     function _delegate(S.Layout storage l, bytes memory call) private returns (bytes memory) {
-        (bool ok, bytes memory ret) = _exec(l).delegatecall(call);
+        return _delegateTo(_exec(l), call);
+    }
+
+    /// @notice Runs `target`'s code as this contract; a revert there reverts here with its own reason.
+    function _delegateTo(address target, bytes memory call) private returns (bytes memory) {
+        (bool ok, bytes memory ret) = target.delegatecall(call);
         if (!ok) {
             // solhint-disable-next-line no-inline-assembly
             assembly ("memory-safe") {

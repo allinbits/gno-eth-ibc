@@ -152,11 +152,15 @@ abstract contract CodeVerifier is Script {
         IIBCAdmin.RecoveryConfig memory rc = a.recoveryConfig();
         bytes memory config =
             abi.encode(IBCAdminConfigLike(router, am, ics20, exec, a.govClient(), a.gnoChainId(), seats, watch, rc));
-        // its constructor deploys the launch check at its first nonce
-        address[] memory created = new address[](1);
+        // its constructor deploys the launch check and its executor-independent code (IBCAdminNative), from its
+        // first nonce: both are part of IBCAdmin's immutable code and come out of the rebuild at their addresses
+        address[] memory created = new address[](2);
         created[0] = _word(ibcAdmin, "launchCheck()");
+        created[1] = _word(ibcAdmin, "native()");
         ok = rebuilds(ibcAdmin, "IBCAdmin.sol:IBCAdmin", config, a.deployer(), 1, created);
-        console2.log(ok ? "ok      " : "MISMATCH", "IBCAdmin.sol:IBCAdmin", ibcAdmin);
+        console2.log(
+            ok ? "ok      " : "MISMATCH", "IBCAdmin.sol:IBCAdmin (its launch check and IBCAdminNative)", ibcAdmin
+        );
         console2.log("  deployer", a.deployer());
         console2.log("  recovery delay, threshold, cancel threshold", rc.delay, rc.threshold, rc.cancelThreshold);
         console2.log("  recovery silence, hold period", rc.silence, rc.holdPeriod);
@@ -203,26 +207,54 @@ abstract contract CodeVerifier is Script {
     /// @notice The launch's pinned code beyond the delegate graphs: the epoch client's verifier and the ugnot voucher
     /// registered for it (`transfer/<client>/ugnot`).
     function verifyLaunch(address ibcAdmin) public returns (bool all) {
-        (address router,, address ics20) = _system(ibcAdmin);
-        string memory client = IBCAdminLike(ibcAdmin).govClient();
-        all = verifyLightClient(IRouterLike(router).getClient(client));
-        (bool ok, bytes memory ret) = ics20.staticcall(
-            abi.encodeWithSignature("ibcERC20Contract(string)", string.concat("transfer/", client, "/ugnot"))
-        );
-        address voucher = ok && ret.length >= 32 ? abi.decode(ret, (address)) : address(0);
-        all = voucher != address(0) && verifyVoucher(voucher, ics20) && all;
+        all = verifyComponent(ibcAdmin, "launchClient");
+        all = verifyComponent(ibcAdmin, "launchVoucher") && all;
     }
 
     /// @notice What runs now, from the chain alone: the transfer proxy's and the router proxy's live implementations,
     /// the escrow and voucher beacons' implementations, IBCAdmin and its installed executor, each graph complete.
+    /// All from one checkout: for a deployment whose components come from different releases (kind 7 and kind 9
+    /// replace them one at a time), check each with `verifyComponent` from its own release's checkout instead.
     function verifyLive(address ibcAdmin) public returns (bool all) {
+        all = true;
+        string[6] memory live = ["transfer", "router", "escrow", "ibcerc20", "admin", "exec"];
+        for (uint256 i = 0; i < live.length; i++) {
+            all = verifyComponent(ibcAdmin, live[i]) && all;
+        }
+    }
+
+    /// @notice One deployed component, read from the chain and rebuilt from this checkout (the deployment manifest
+    /// names the release each one comes from, docs/controls.md):
+    /// - `transfer`: the transfer proxy's live implementation and its three modules (one kind 7 installs them
+    /// together); - `router`: the router proxy's live implementation;
+    /// - `escrow`, `ibcerc20`: the escrow and voucher beacons' implementations;
+    /// - `admin`: IBCAdmin with the launch check and IBCAdminNative it deploys (immutable: always its launch release);
+    /// - `exec`: IBCAdmin's installed executor and its four modules (one kind 9 installs them together);
+    /// - `launchClient`, `launchVoucher`: the epoch client's verifier and its ugnot voucher.
+    /// Reverts on an unknown name.
+    function verifyComponent(address ibcAdmin, string memory name) public returns (bool) {
         (address router, address am, address ics20) = _system(ibcAdmin);
-        all = verifyTransfer(implementationOf(ics20));
-        all = _check(implementationOf(router), "ICS26Router.sol:ICS26Router", "") && all;
-        all = _check(_word(_word(ics20, "getEscrowBeacon()"), "implementation()"), "Escrow.sol:Escrow", "") && all;
-        all = _check(_word(_word(ics20, "getIBCERC20Beacon()"), "implementation()"), "IBCERC20.sol:IBCERC20", "") && all;
-        all = verifyAdmin(ibcAdmin) && all;
-        all = verifyExec(_word(ibcAdmin, "exec()"), router, am, ics20) && all;
+        bytes32 n = keccak256(bytes(name));
+        if (n == keccak256("transfer")) return verifyTransfer(implementationOf(ics20));
+        if (n == keccak256("router")) return _check(implementationOf(router), "ICS26Router.sol:ICS26Router", "");
+        if (n == keccak256("escrow")) {
+            return _check(_word(_word(ics20, "getEscrowBeacon()"), "implementation()"), "Escrow.sol:Escrow", "");
+        }
+        if (n == keccak256("ibcerc20")) {
+            return _check(_word(_word(ics20, "getIBCERC20Beacon()"), "implementation()"), "IBCERC20.sol:IBCERC20", "");
+        }
+        if (n == keccak256("admin")) return verifyAdmin(ibcAdmin);
+        if (n == keccak256("exec")) return verifyExec(_word(ibcAdmin, "exec()"), router, am, ics20);
+        string memory client = IBCAdminLike(ibcAdmin).govClient();
+        if (n == keccak256("launchClient")) return verifyLightClient(IRouterLike(router).getClient(client));
+        if (n == keccak256("launchVoucher")) {
+            (bool ok, bytes memory ret) = ics20.staticcall(
+                abi.encodeWithSignature("ibcERC20Contract(string)", string.concat("transfer/", client, "/ugnot"))
+            );
+            address voucher = ok && ret.length >= 32 ? abi.decode(ret, (address)) : address(0);
+            return voucher != address(0) && verifyVoucher(voucher, ics20);
+        }
+        revert(string.concat("unknown component ", name));
     }
 
     /// @notice A pending kind 7 or kind 9 decision of the current epoch, before it matures: it must be the expected

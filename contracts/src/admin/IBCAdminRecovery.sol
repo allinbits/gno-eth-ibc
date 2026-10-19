@@ -112,28 +112,6 @@ contract IBCAdminRecovery is IIBCAdmin {
         return answered && value;
     }
 
-    /// @notice Before a proposal opens, a guardian withdraws its approval; once open, it votes to cancel, and
-    /// `cancelThreshold` votes close it (receives resume, the suspended kinds may run again).
-    function cancelRecovery(address guardian, RecoveryConfig calldata c) external delegated {
-        uint256 seat = _guardianSeat(guardian);
-        S.Layout storage l = S.layout();
-        S.Recovery storage r = l.recovery;
-        if (r.openedAt == 0) {
-            r.approved[seat] = bytes32(0);
-            return;
-        }
-        r.cancels |= uint8(1 << seat);
-        uint256 n;
-        for (uint256 i = 0; i < Guardians.SEATS; i++) {
-            if (r.cancels & (1 << i) != 0) n++;
-        }
-        emit RecoveryCancelVote(r.proposal, guardian, n);
-        if (n < c.cancelThreshold) return;
-        emit RecoveryCancelled(r.proposal);
-        _closeRecovery(r);
-        IGnoICS20Controls(ics20).setRecoveryBlock(l.govClient, false);
-    }
-
     function _closeRecovery(S.Recovery storage r) private {
         r.proposal = bytes32(0);
         r.openedAt = 0;

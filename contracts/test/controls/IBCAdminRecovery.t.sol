@@ -10,7 +10,17 @@ import { IAccessManager } from "@openzeppelin-contracts/access/manager/IAccessMa
 import { IBCRolesLib } from "@eureka/utils/IBCRolesLib.sol";
 
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
-import { IGnoICS20ControlsTypes, IGnoICS20ControlsTypes as T } from "../../src/interfaces/IGnoICS20Controls.sol";
+import {
+    IGnoICS20Controls,
+    IGnoICS20ControlsTypes,
+    IGnoICS20ControlsTypes as T
+} from "../../src/interfaces/IGnoICS20Controls.sol";
+import { IBCAdminNative } from "../../src/admin/IBCAdminNative.sol";
+import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
+import { GnoICS20Controls } from "../../src/transfer/GnoICS20Controls.sol";
+import { GnoICS20Reconcile } from "../../src/transfer/GnoICS20Reconcile.sol";
+import { GnoICS20Evidence } from "../../src/transfer/GnoICS20Evidence.sol";
+import { RevertingExec } from "./HandOver.t.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
@@ -573,6 +583,145 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         prefix = new bytes[](2);
         prefix[0] = "main";
         prefix[1] = "/pv/vm:gno.land/r/aib/ibc/core:";
+    }
+
+    // ------------------------------------------------------------------------- native cancellation (IBCAdminNative) --
+
+    function _cancel(uint256 seat) internal {
+        vm.prank(G[seat]);
+        admin.cancelRecovery();
+    }
+
+    function _decideAndExecute(uint8 kind, bytes memory params) internal returns (uint64 seq) {
+        seq = admin.lastSeq() + 1;
+        assertEq(_status(_recvGov(_env(seq, kind, params))), S.STATUS_RECORDED, "recorded");
+        _skip(7 days);
+        admin.execute(seq);
+    }
+
+    /// @notice An executor that reverts every recovery call after a recovery opened: the open recovery could never
+    /// execute, and it suspends kind 9. The guardians' cancellation is IBCAdmin's own, so it still closes the
+    /// recovery, and kind 9 then replaces the executor.
+    function test_native_cancel_withABrokenExecutor_thenKind9Replaces() public {
+        _openFrozen();
+        vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
+        _skip(DELAY);
+        vm.expectRevert(IIBCAdmin.ForeignExec.selector);
+        admin.executeRecovery(); // the executor's path is broken
+        _cancel(0);
+        _cancel(1);
+        assertTrue(_openedAt() != 0, "two votes of three");
+        _cancel(2);
+        (bytes32 proposal, uint64 openedAt, uint8 cancels, bytes32[4] memory approved) = admin.recovery();
+        assertEq(proposal, bytes32(0));
+        assertEq(openedAt, 0);
+        assertEq(cancels, 0);
+        for (uint256 i = 0; i < 4; i++) {
+            assertEq(approved[i], bytes32(0), "approvals cleared");
+        }
+        assertFalse(ctl.recoveryBlocked(clientId), "receives resume");
+        IBCAdminExec next = new IBCAdminExec(address(router), d.accessManager, address(ics20));
+        uint64 seq = _decideAndExecute(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
+        assertEq(admin.decision(admin.epoch(), seq).state, S.EXECUTED);
+        (address x,) = admin.exec();
+        assertEq(x, address(next));
+    }
+
+    /// @notice The cancellation's semantics: a vote per seat (a repeated vote counts once), guardian seats only, the
+    /// threshold exact, approvals withdrawn before a proposal opens.
+    function test_native_cancel_semantics() public {
+        IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-7");
+        lc.setStatus(true, false);
+        _approve(0, p);
+        _cancel(0); // before it opens: a withdrawal
+        (,,, bytes32[4] memory approved) = admin.recovery();
+        assertEq(approved[0], bytes32(0), "withdrawn");
+        _approve(0, p);
+        _approve(1, p);
+        _approve(2, p);
+        bytes32 h = keccak256(abi.encode(p));
+        assertTrue(_openedAt() != 0);
+        vm.expectEmit(true, true, false, true, address(admin));
+        emit IIBCAdmin.RecoveryCancelVote(h, G[1], 1);
+        _cancel(1);
+        vm.expectEmit(true, true, false, true, address(admin));
+        emit IIBCAdmin.RecoveryCancelVote(h, G[1], 1);
+        _cancel(1); // again: still one vote
+        vm.prank(W[1]);
+        vm.expectRevert(IIBCAdmin.NotGuardian.selector);
+        admin.cancelRecovery();
+        _cancel(3);
+        (,, uint8 cancels,) = admin.recovery();
+        assertEq(cancels, (1 << 1) | (1 << 3));
+        assertTrue(_openedAt() != 0, "below the threshold");
+        vm.expectEmit(true, false, false, false, address(admin));
+        emit IIBCAdmin.RecoveryCancelled(h);
+        _cancel(0);
+        assertEq(_openedAt(), 0);
+        assertFalse(ctl.recoveryBlocked(clientId));
+    }
+
+    /// @notice A caller cannot starve the unblock on purpose: below its budget the closing vote reverts.
+    function test_native_cancel_starvedCaller_reverts() public {
+        _openFrozen();
+        _cancel(0);
+        _cancel(1);
+        vm.prank(G[2]);
+        vm.expectRevert(IIBCAdmin.CallStarved.selector);
+        admin.cancelRecovery{ gas: 200_000 }();
+        assertTrue(_openedAt() != 0);
+        assertTrue(ctl.recoveryBlocked(clientId));
+    }
+
+    /// @notice A transfer app that refuses `setRecoveryBlock`: the cancellation still closes the recovery and lifts
+    /// the suspension; the route stays blocked (`RecoveryBlockKept`). A kind 7 then repairs the app, and anyone lifts
+    /// the block (`clearRecoveryBlock`). (The refusal is a mocked revert at the transfer proxy; clearing the mock
+    /// stands for the repaired code answering.)
+    function test_native_cancel_transferAppRefuses_blockKept_thenRepaired() public {
+        _openFrozen();
+        bytes32 h = keccak256(abi.encode(_proposal("gnoland-7")));
+        vm.mockCallRevert(address(ics20), abi.encodeWithSelector(IGnoICS20Controls.setRecoveryBlock.selector), "broken");
+        _cancel(0);
+        _cancel(1);
+        vm.expectEmit(true, false, false, false, address(admin));
+        emit IIBCAdmin.RecoveryBlockKept(h);
+        _cancel(2);
+        assertEq(_openedAt(), 0, "closed");
+        assertTrue(ctl.recoveryBlocked(clientId), "the route stays blocked");
+        vm.expectRevert(); // the app still refuses
+        admin.clearRecoveryBlock();
+        // the suspension is lifted: a kind 7 repairs the transfer app
+        lc.setStatus(false, false);
+        GnoICS20Controls controls =
+            new GnoICS20Controls(address(new GnoICS20Reconcile(address(new GnoICS20Evidence()))));
+        address fork = address(new GnoICS20Transfer(address(controls)));
+        uint64 s = _decideAndExecute(S.KIND_UPGRADE, P.upgrade(address(ics20), fork, fork.codehash, ""));
+        assertEq(admin.decision(admin.epoch(), s).state, S.EXECUTED, "kind 7");
+        vm.clearMockedCalls();
+        vm.prank(bob); // anyone
+        admin.clearRecoveryBlock();
+        assertFalse(ctl.recoveryBlocked(clientId), "lifted");
+        assertTrue(_isSuccessAck(_gnotIn(1, bob)));
+    }
+
+    function test_clearRecoveryBlock_refusedWhileOpen_noopOtherwise() public {
+        admin.clearRecoveryBlock(); // nothing to lift
+        assertFalse(ctl.recoveryBlocked(clientId));
+        _openFrozen();
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.clearRecoveryBlock();
+        assertTrue(ctl.recoveryBlocked(clientId));
+    }
+
+    /// @notice IBCAdminNative acts only as IBCAdmin: called at its own address, it refuses.
+    function test_native_refusesDirectCalls() public {
+        IBCAdminNative n = IBCAdminNative(admin.native());
+        vm.expectRevert(IIBCAdmin.NotDelegated.selector);
+        n.cancelRecovery(G[0], 3, address(ics20));
+        vm.expectRevert(IIBCAdmin.NotDelegated.selector);
+        n.clearRecoveryBlock(address(ics20));
+        vm.expectRevert(IIBCAdmin.NotDelegated.selector);
+        n.handover("", address(router), d.accessManager, address(ics20));
     }
 }
 

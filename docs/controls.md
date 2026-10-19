@@ -29,7 +29,8 @@ The controls are safe under these assumptions; each is detailed where its rule i
 | `GnoTransferStorage` | `contracts/src/transfer/GnoTransferStorage.sol` | The fork's ERC-7201 layout (`gno.storage.GnoICS20Transfer`) and the route-key helpers both halves use. |
 | `IBCAdmin` | `contracts/src/admin/IBCAdmin.sol` | Permanent, immutable IBC app on port `ibcgov`: the §5.4 delivery protocol, the decision ledger, flags on itself, execution scheduling, recovery entry points, `finishSetup`. Holds `ADMIN_ROLE`. |
 | `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: kinds 2 to 13 at recording and at execution (kind 1, the cancel, is handled by IBCAdmin itself: its tombstones are applied on arrival). Delegatecalled at a pinned code hash; replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor. |
-| `IBCAdminRecovery` | `contracts/src/admin/IBCAdminRecovery.sol` | The optional emergency route replacement (§7.12). Deployed by the executor (so pinned with it) and delegatecalled by IBCAdmin. |
+| `IBCAdminNative` | `contracts/src/admin/IBCAdminNative.sol` | IBCAdmin's own executor-independent code: kind 9's execution (the hand-over), the guardians' cancellation of an open emergency recovery, and `clearRecoveryBlock`. Part of IBCAdmin's **immutable** code: IBCAdmin deploys it in its constructor and delegatecalls it at that address, never replaceable (no pointer to it is stored, so no decision can redirect it, and since Cancun SELFDESTRUCT no longer removes code, so the address always holds the code IBCAdmin was built with); called at its own address it refuses (`NotDelegated`). |
+| `IBCAdminRecovery` | `contracts/src/admin/IBCAdminRecovery.sol` | The optional emergency route replacement (§7.12): approval and execution. Deployed by the executor (so pinned with it) and delegatecalled by IBCAdmin. Cancellation is IBCAdmin's own (`IBCAdminNative`). |
 | `IBCAdminStorage` | `contracts/src/admin/IBCAdminStorage.sol` | IBCAdmin's ERC-7201 layout (`gno.storage.IBCAdmin`), constants, tombstones, hold history. |
 | `IBCAdminChecks` | `contracts/src/admin/IBCAdminChecks.sol` | The executor's stateless checks (a view contract it deploys): canonical parameters per kind, gno.land denoms and counterparties, and whether a light client may verify for gno.land (code, chain id, neither frozen nor expired, a last transition), every status view failing closed. |
 | `IBCAdminSetupCheck` | `contracts/src/admin/IBCAdminSetupCheck.sol` | `finishSetup`'s numbered check list (a view contract the executor calls). |
@@ -218,7 +219,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | E6 default deny: a gno denom without a registered voucher (and limits) is refused, no IBCERC20 ever created | `onRecvPacket` (`GnoDenomNotRegistered`, `GnoLimitsNotSet`); `_getOrCreateIBCERC20` removed |
 | E6 expected refusals revert with non-empty custom errors (router → error ack) | `IGnoICS20ControlsTypes` errors |
 | E6 send limits for escrowed (Ethereum-native) tokens only (`sendMax`/`sendMin`, 0 = unset); returning vouchers (burns over the current, non-retired client) never limited, paused or blocked by a closed route or an open recovery: an exit, whose refund, if any, waits for the route's reopening; an escrowed send is refused on a closed route (`GnoRouteClosed`) and while a recovery is open (`GnoRouteRecovering`) | `_checkEscrowedSend`, skipped when `burned` (`test_d8_closedRoute_voucherBurnExits_nativeRefused`) |
-| ADR §9 payload bound: a transfer packet's encoded payload value is at most 262,144 bytes, checked on every send (the shared send path, before `sendPacket`) and on every receive before any decoding (`GnoPayloadTooLarge`; a receive above it is an error ack) | `GnoICS20Transfer._sendTransferFromEscrowWithSender`, `onRecvPacket` (`test_r26_5_payloadBound_everySendVariant`, `test_r26_5_payloadBound_receive`) |
+| ADR §9 payload bound: a transfer packet's encoded payload value is at most 262,144 bytes, checked on every send (the shared send path, before `sendPacket`) and on every receive before any decoding (`GnoPayloadTooLarge`; a receive above it is an error ack). A packet carries **exactly one payload**: the router refuses any other count on receive, acknowledgement and timeout with `IBCMultiPayloadPacketNotSupported` before the app runs, so the transaction reverts and no error ack is written. A send's timeout must be **strictly in the future** (`timeoutTimestamp > block.timestamp`, else `IBCInvalidTimeoutTimestamp`) and at most one day ahead (`MAX_TIMEOUT_DURATION`, else `IBCInvalidTimeoutDuration`) | `GnoICS20Transfer._sendTransferFromEscrowWithSender`, `onRecvPacket` (`test_r26_5_payloadBound_everySendVariant`, `test_r26_5_payloadBound_receive`) |
 | E6/§7.13 send record in every send variant after `sendPacket` returns the sequence (`sendTransfer`, `…WithPermit2`, `…WithSender`) | `_recordSend` (all three go through `_sendTransferFromEscrowWithSender`) |
 | §7.13 records hold the router's commitment, not the packet bytes (bytes in `SendPacket`, authenticated against it); an ack or timeout without a record is refused (`GnoNoSendRecord`; none can exist on a fresh deployment) | `_recordSend`; `GnoICS20Controls.ackHook` |
 | §7.13 ack/timeout attach outcome, local processing block and payment state | `GnoICS20Controls.ackHook` |
@@ -446,10 +447,12 @@ one incident is never counted by another; nothing is counted on the live client.
   the batch. Its record is settled and therefore closed, so it never blocks kind 13. The accepted-deficit
   reopening completes, and the refund is paid by `claimParked` once the backing returns
   (`test_parkedShortfallRefunds_reopeningCompletes`, `test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment`).
-- **A failed executor can always be replaced.** Kind 9 is IBCAdmin's own: IBCAdmin records and executes it
-  itself and never delegatecalls the installed executor for it, at recording or at execution, and its execution
-  skips the executor pin check (`ForeignExec`) that every executor-dispatched kind has, so an executor that
-  reverts everything, refuses kind 9 or no longer matches its pin is still replaced
+- **A failed executor can always be replaced**: at any time, and during an emergency recovery once the guardians
+  have cancelled it (kind 9 is suspended while one is open, and the cancellation is IBCAdmin's own, so it works
+  whatever the executor does). Kind 9 is IBCAdmin's own: IBCAdmin records and executes it itself (its execution in
+  `IBCAdminNative`, IBCAdmin's immutable code) and never delegatecalls the installed executor for it, at recording
+  or at execution, and its execution skips the executor pin check (`ForeignExec`) that every executor-dispatched
+  kind has, so an executor that reverts everything, refuses kind 9 or no longer matches its pin is still replaced
   (`test_kind9_replacesAnExecutorThatRevertsEverything`, `test_kind9_replacesAnExecutorThatRefusesKind9`,
   `test_kind9_replacesAForeignExecutor`). It keeps the envelope, sequence binding, 7-day delay, deferral by flags,
   holds and conflicts, suspension while a recovery is open, cancellation by kind 1 and spent-on-refusal of every
@@ -584,7 +587,17 @@ one incident is never counted by another; nothing is counted on the live client.
     IBCAdmin has stood for at least `holdPeriod` since it started. Opening sets `openedAt`, blocks the route's receives
     and escrowed sends, and suspends kinds 3, 6–10.
   - **Before execution**, a guardian withdraws its approval (before opening) or votes to cancel (after);
-    `cancelThreshold` votes close the proposal and unblock the route.
+    `cancelThreshold` votes close the proposal: the proposal, the votes and every approval cleared, the suspended
+    kinds free to run again. Cancellation is **IBCAdmin's own** (`IBCAdminNative`), never through the executor or
+    its recovery module, so a broken executor cannot keep a recovery, and the suspension of kind 9 with it,
+    standing (`test_native_cancel_withABrokenExecutor_thenKind9Replaces`). The closing vote then lifts the route's
+    recovery block **best effort**: `setRecoveryBlock(govClient, false)` with 200,000 gas in a try/catch (below that
+    budget plus a margin the vote reverts `CallStarved`, so no caller starves it on purpose). If the transfer app
+    refuses, the recovery still closes and the suspension is lifted, but the route stays blocked (the safe
+    direction: receives and escrowed sends stay stopped), with `RecoveryBlockKept`. A kind 7 then repairs the
+    transfer app, and anyone lifts the block with `clearRecoveryBlock()` (permissionless; refused while a recovery
+    is open, a no-op with no block standing, reverting while the app still refuses;
+    `test_native_cancel_transferAppRefuses_blockKept_thenRepaired`).
   - **Execution** (`executeRecovery`, permissionless): at least `delay` after `openedAt`, and the proposal's client
     still usable (as at approval). Eligibility is **not** checked again. Any failure reverts the whole call: the
     proposal stays open and the route stays blocked, so anyone retries once the cause is gone (a client that froze
@@ -643,9 +656,10 @@ has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 10,000; with less
 the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
 envelope that was never recorded is retried by a source-side redispatch, in a fresh packet from gno.land; work
 already buffered on Ethereum is recorded by `drain()` called with enough gas (a drained decision of an executor kind
-goes through the same frame and floor). A cancel (kind 1), an unknown kind or undecodable envelope (spent), a
+goes through the same frame and floor). A cancel (kind 1), an unknown kind, an oversize envelope or a malformed cancel marked bad (spent), a
 tombstoned decision (cancelled) and kind 9 (its parameter check, IBCAdminStorage.handoverParams) are recorded inline,
-with no executor frame and no `ExecutionStarved` floor. A tombstoned pending decision is the exception: `execute` cancels it
+with no executor frame and no `ExecutionStarved` floor. An envelope whose header cannot be read is not recorded at all: it is refused
+(`Undecodable`, an error ack) before delivery and consumes no governance sequence. A tombstoned pending decision is the exception: `execute` cancels it
 (`CANCELLED`, its parameters deleted, `DecisionCancelled`) and returns.
 
 **A pending decision has no execution expiry.** `execute` checks a minimum maturity and no maximum age, so a recorded
@@ -762,25 +776,30 @@ against its constructor relationship:
 - every recorded code hash is that dependency's live code hash.
 
 An executor is rebuilt from its creation nonce, so the four modules it deploys come out at their recorded addresses,
-and they are compared too. IBCAdmin's deployer and recovery settings are configuration values with no relationship to
+and they are compared too. IBCAdmin is rebuilt the same way from its own creation nonce, so the launch check and
+`IBCAdminNative` it deploys come out at their addresses and are compared with it. IBCAdmin's deployer and recovery settings are configuration values with no relationship to
 check; the verifier prints them, for comparison with the deployment plan. Every rebuild is rolled back.
 
 **Status of the coverage.** Implemented in `script/CodeVerifier.sol` and run by `scripts/verify-codehashes.sh`
-(tested in `CodePinning.t.sol` and `DeploymentRace.t.sol`), which forwards `PENDING_*`, `VOUCHERS` and `CLIENTS` into
-Docker (`scripts/test-verify-wrapper.sh` deploys on a throwaway anvil and checks that a mismatching extra client or
-voucher fails through the wrapper): every item below. **Manual** until tooling covers it:
+(tested in `CodePinning.t.sol` and `DeploymentRace.t.sol`), which forwards `PENDING_*`, `VOUCHERS`, `CLIENTS`,
+`CANDIDATES_ONLY` and `COMPONENTS` into Docker (`scripts/test-verify-wrapper.sh` deploys on a throwaway anvil and
+checks that a mismatching extra client or voucher fails through the wrapper, and that the per-component mode verifies
+exactly the components of the checkout's release): every item below. **Manual** until tooling covers it:
 - running it at all (no watcher triggers it, T5 is unbuilt);
 - collecting the pending decisions' hashes and candidates and a recovery proposal's `lightClient` (from gno.land's
   envelopes and the approval transactions);
 - checking a verifier of any type other than GnoLightClient against its own source (`verifyLaunch` rebuilds the epoch
-  client as a GnoLightClient, so after such a verifier is installed, run the other checks without it and verify that
-  verifier by hand);
-- **one release per run**: the verifier rebuilds every artifact from the one checkout it runs in, so the live code and
-  a candidate of a different release (another source, compiler or settings) cannot both match in the same run. Verify
-  the live system from a checkout of the release it runs, and each pending candidate from a checkout of the release
-  it installs with `CANDIDATES_ONLY=true` (pending decisions and the listed vouchers and clients only, never the live
-  code), each build reproducible from its tagged source (`scripts/test-verify-wrapper.sh` checks this with two
-  builds);
+  client as a GnoLightClient, so after such a verifier is installed, run the other checks without it, naming every
+  component but `launchClient` in `COMPONENTS`, and verify that verifier by hand);
+- **one release per run, and a deployment manifest across releases**: the verifier rebuilds every artifact from the
+  one checkout it runs in (that checkout's source and compiler settings). Kind 7 and kind 9 replace components one
+  at a time, so a live deployment can hold components of different releases, or of one source built with different
+  compiler settings, and a run of `verifyLive` from any single checkout then fails on whatever that checkout did not
+  build. The release of each component is therefore kept in a **deployment manifest** (below), and the live system
+  is verified per component (`COMPONENTS`), each from its own release's checkout. A pending candidate is verified
+  from a checkout of the release it installs with `CANDIDATES_ONLY=true` (pending decisions and the listed vouchers
+  and clients only, never the live code), each build reproducible from its tagged source
+  (`scripts/test-verify-wrapper.sh` checks both modes with two builds);
 - **storage-layout compatibility** before every kind 7 or kind 9: a matching build says nothing of compatibility.
   Review by hand that the candidate keeps every existing storage layout it touches (the fork's, the controls'
   namespace, eureka's ICS20Transfer namespace, IBCAdmin's), changing them only by appending, as the ADR requires;
@@ -795,7 +814,7 @@ voucher fails through the wrapper): every item below. **Manual** until tooling c
 
 It covers:
 
-- **What runs now** (`verifyLive`), read from the chain and never from the deployment file, which goes stale after
+- **What runs now** (`verifyLive`, or one component at a time with `verifyComponent` through `COMPONENTS`), read from the chain and never from the deployment file, which goes stale after
   any kind 7 or 9: the transfer proxy's and the router proxy's live ERC-1967 implementation slots, the escrow and
   voucher beacons' implementations, IBCAdmin, and the executor IBCAdmin has installed, each delegate graph complete.
 - **The launch's other pinned code** (`verifyLaunch`): the epoch client's verifier (a GnoLightClient, which has no
@@ -810,6 +829,33 @@ It covers:
   kind 6 installed or an emergency recovery proposal attests (its `lightClient`, read from the approval's calldata or
   the `RecoveryApproved` transaction: IBCAdmin stores the encoded proposal in `recovery.params[hash]`, but its public
   `recovery()` view exposes only the hashes and the voting state), each rebuilt from its source.
+
+**The deployment manifest (manual).** A file kept with the deployment (for example
+`deployments/<chain>.manifest.json`, beside the deploy script's output, which records only addresses at launch),
+with one entry per deployed component: its name as `COMPONENTS` takes it (`transfer`, `router`, `escrow`,
+`ibcerc20`, `admin` (IBCAdmin with the launch check and `IBCAdminNative` it deploys, always its launch release),
+`exec`, `launchClient`, `launchVoucher`; and one entry per further voucher or verifier, checked
+through `VOUCHERS` or `CLIENTS`), its address (for `transfer` and `exec`, the implementation or executor and each
+module), its **source revision** (a tagged commit), its **compiler settings** (solc version, optimizer and runs,
+`via_ir`, EVM version, `bytecode_hash`: the release's `foundry.toml`), its **constructor bindings** (the
+dependencies and recorded hashes the rebuild uses) and its **expected runtime code hash**. No tool reads it yet:
+it is the operators' record, and its entries are compared with the chain by hand (`cast codehash`) and by the
+verifier, as follows.
+
+- **Verify the live system per release.** Group the manifest's components by source revision and settings; for each
+  group, from a clean checkout of that revision, run `COMPONENTS=<its components> scripts/verify-codehashes.sh`
+  (with that group's `VOUCHERS` and `CLIENTS`). The live system is verified when every component of the manifest
+  passes in the run of its own release, every component's live code hash equals the manifest's, and nothing runs
+  on chain that the manifest does not list (the live implementation slots, beacon implementations and installed
+  executor are read from the chain, so a component installed outside the manifest fails its own run). A release
+  whose checkout predates `COMPONENTS` is verified by hand: rebuild its components from that checkout and compare
+  their runtime code, immutables aside, with the chain's, the manual form of the same check.
+- **After a partial upgrade** (an executed kind 7 or kind 9): update the entries of the component it replaced (the
+  candidate's release, settings, bindings and code hash, already verified as pending), leave every other entry
+  unchanged, and verify the live system per release again.
+- **After a rollback** (a kind 7 back to an earlier implementation, or a kind 9 back to an earlier executor): the
+  entry returns to the earlier release's values, which the run of that release's checkout must confirm; an earlier
+  build is never assumed to be the one the manifest last named for it.
 
 A rebuild compares the deployed bytes with the build's, so any proxy or other code indirection fails it, whatever
 its target. A verifier of another type than GnoLightClient is not covered by the tool: its operator checks by hand
@@ -857,7 +903,7 @@ order matters:
    after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days.
 4. **Execute the verified repair**, each candidate verified as pending (`verifyPending`) before it matures:
    - a failed transfer-app, router or beacon implementation: a kind 7 back to the last verified implementation
-     (named in the previous `verifyLive` run) only if it meets the current requirements (for the transfer app, a
+     (the one the deployment manifest last recorded and its release's run verified) only if it meets the current requirements (for the transfer app, a
      controls version at least the running one's, and a compatible storage layout: kind 7 refuses an older
      controls version), otherwise to a compatible fixed build;
    - a failed executor: a kind 9 hand-over to a verified executor;
@@ -877,8 +923,10 @@ order matters:
    enroll a target client (kind 6 op 1), replace the route (kind 10) with a `suspectFrom` covering the fault's
    time, prepare the incident (`prepareIncident`), then settle (kind 12) and reopen (kind 13). Before settling: the refunds flags are cleared first
    (their owners), since they defer every refund-paying settlement, while the route flags keep receives and escrowed
-   sends stopped. Then lift the route flags (owners clear their own; kind 2 for the rest) once `verifyLive` passes
-   again.
+   sends stopped. Then lift the route flags (owners clear their own; kind 2 for the rest) once the live system verifies
+   again: the manifest updated for every repair, and every component passing the per-release verification from
+   its own release's checkout (a single `verifyLive` run suffices only while every component comes from one
+   release).
 
 ### Calls to candidate code before installation
 

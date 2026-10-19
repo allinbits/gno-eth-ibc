@@ -10,8 +10,12 @@ import { CodeVerifier } from "./CodeVerifier.sol";
 ///   chain: the transfer and router proxies' live implementation slots, the escrow and voucher beacons'
 ///   implementations, IBCAdmin's installed executor, and each delegate graph from there.
 /// - The launch's verifier and ugnot voucher (`verifyLaunch`).
-/// - CANDIDATES_ONLY=true skips the two above: run it from the candidate release's checkout, and the live checks from
-///   the running release's checkout.
+/// - COMPONENTS (comma-separated, optional): only these deployed components instead of the two above (names in
+///   `CodeVerifier.verifyComponent`: transfer, router, escrow, ibcerc20, admin, exec, launchClient, launchVoucher).
+///   A deployment whose components come from different releases is verified once per release, each run from that
+///   release's checkout naming the components the deployment manifest attributes to it.
+/// - CANDIDATES_ONLY=true skips the live checks altogether: run it from the candidate release's checkout, and the live
+///   checks from the running releases' checkouts.
 /// - PENDING_SEQS, PENDING_HASHES, PENDING_CANDIDATES (comma-separated, the same length; optional): each recorded
 ///   kind 5, 6, 7 or 9 decision of the current epoch, the hash gno.land's envelope must have, and the voucher,
 ///   verifier, implementation or executor it must install. Each candidate's whole graph is checked.
@@ -27,7 +31,16 @@ contract VerifyCodehashes is CodeVerifier {
         address admin = json.readAddress(".ibcAdmin");
         // CANDIDATES_ONLY: a candidate of another release is checked from its own release's checkout, where the live
         // code (of the release that runs) cannot match: only the pending decisions and the listed contracts
-        if (!vm.envOr("CANDIDATES_ONLY", false)) {
+        string[] memory components = vm.envOr("COMPONENTS", ",", new string[](0));
+        if (vm.envOr("CANDIDATES_ONLY", false)) {
+            require(components.length == 0, "COMPONENTS and CANDIDATES_ONLY together");
+        } else if (components.length != 0) {
+            for (uint256 i = 0; i < components.length; i++) {
+                require(
+                    verifyComponent(admin, components[i]), string.concat(components[i], " does not match the build")
+                );
+            }
+        } else {
             require(verifyLive(admin), "live code does not match the build");
             require(verifyLaunch(admin), "the launch verifier or voucher does not match the build");
         }
