@@ -507,14 +507,14 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice A seat change's anchor: the start of the first hold standing at or after it was `due` (ADR §7.4, day 21
     /// of the hold, even one that began before `due`): the earliest start of the standing hold and of every recorded
-    /// hold that ended at or after `due`.
+    /// hold that ended after `due` (a hold's end is exclusive: one ending at `due` no longer stood then).
     function _anchor(S.Layout storage l, uint64 due, uint64 standing) private view returns (uint64 a) {
         a = standing;
         for (uint256 i = 0; i < l.holds.length; i++) {
             IGuardians.Hold memory h = l.holds[i];
             // a merged interval may span a gap no hold covered: never an anchor (a later genuine hold's start is
             // used instead, never earlier than the true anchor)
-            if (!h.merged && h.end >= due && h.start < a) a = h.start;
+            if (!h.merged && h.end > due && h.start < a) a = h.start; // `end` is exclusive: ended by `due`
         }
     }
 

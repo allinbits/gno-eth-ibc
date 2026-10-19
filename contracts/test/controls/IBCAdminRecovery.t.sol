@@ -497,6 +497,64 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         assertGe(ctl.quarantineEnd("gnoland-2"), _now() + ctl.quarantineSeconds("gnoland-2"), "conservative");
     }
 
+    /// @notice r27 #2 / design r4 #2: the old verifier's views burn all the gas they are given (`burn`) or answer
+    /// 4,000 bytes (`!burn`). Its probes are capped (100,000 gas, 64 bytes copied), so the emergency recovery (opened
+    /// by silence, the status probe failing closed) and kind 10 still complete, conservatively.
+    function _breakOldVerifier(bool burn) internal {
+        vm.etch(address(lc), burn ? type(GasBurner).runtimeCode : type(LongAnswer).runtimeCode);
+    }
+
+    function _recoveryWithABrokenOldVerifier(bool burn) internal {
+        _breakOldVerifier(burn);
+        _skip(30 days); // eligible by silence; the status probes answer nothing, cheaply
+        IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-7");
+        for (uint256 g = 0; g < 3; g++) {
+            vm.prank(G[g]);
+            admin.approveRecovery{ gas: 3_000_000 }(p); // the eligibility probes of the old client are capped
+        }
+        assertTrue(_openedAt() != 0, "opened");
+        _skip(DELAY + 1);
+        admin.executeRecovery{ gas: 3_000_000 }();
+        assertEq(admin.govClient(), "gnoland-7");
+        assertGe(ctl.quarantineEnd("gnoland-7"), _now() + ctl.quarantineSeconds("gnoland-7"), "conservative");
+    }
+
+    function test_r27_2_recovery_gasBurningOldView() public {
+        _recoveryWithABrokenOldVerifier(true);
+    }
+
+    function test_r27_2_recovery_oversizedOldView() public {
+        _recoveryWithABrokenOldVerifier(false);
+    }
+
+    function _kind10WithABrokenOldVerifier(bool burn) internal {
+        MockLightClient next = new MockLightClient();
+        uint64 seq = admin.lastSeq() + 1;
+        _recvGov(
+            _env(
+                seq,
+                S.KIND_CLIENT,
+                P.client(1, "gnoland-2", "ethereum-2", _prefixOf(), address(next), address(next).codehash)
+            )
+        );
+        _recvGov(_env(seq + 1, S.KIND_ROUTE, P.route(clientId, "gnoland-2")));
+        _skip(7 days);
+        admin.execute(seq);
+        _breakOldVerifier(burn);
+        admin.execute(seq + 1);
+        assertEq(admin.decision(admin.epoch() - 1, seq + 1).state, S.EXECUTED, "executed, not spent");
+        assertEq(admin.govClient(), "gnoland-2");
+        assertGe(ctl.quarantineEnd("gnoland-2"), _now() + ctl.quarantineSeconds("gnoland-2"), "conservative");
+    }
+
+    function test_r27_2_kind10_gasBurningOldView() public {
+        _kind10WithABrokenOldVerifier(true);
+    }
+
+    function test_r27_2_kind10_oversizedOldView() public {
+        _kind10WithABrokenOldVerifier(false);
+    }
+
     function _prefixOf() internal pure returns (bytes[] memory prefix) {
         prefix = new bytes[](2);
         prefix[0] = "main";
@@ -542,3 +600,21 @@ contract IBCAdminRecoveryUnboundTest is ControlsFixture {
         assertTrue(openedAt != 0, "opens once bound");
     }
 }
+
+/// @notice A verifier whose every call burns all the gas it is given.
+contract GasBurner {
+    fallback() external {
+        while (true) { }
+    }
+}
+
+/// @notice A verifier whose every call answers 4,000 bytes.
+contract LongAnswer {
+    fallback() external {
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            return(0, 4000)
+        }
+    }
+}
+

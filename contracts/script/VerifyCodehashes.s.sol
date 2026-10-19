@@ -10,6 +10,8 @@ import { CodeVerifier } from "./CodeVerifier.sol";
 ///   chain: the transfer and router proxies' live implementation slots, the escrow and voucher beacons'
 ///   implementations, IBCAdmin's installed executor, and each delegate graph from there.
 /// - The launch's verifier and ugnot voucher (`verifyLaunch`).
+/// - CANDIDATES_ONLY=true skips the two above: run it from the candidate release's checkout, and the live checks from
+///   the running release's checkout.
 /// - PENDING_SEQS, PENDING_HASHES, PENDING_CANDIDATES (comma-separated, the same length; optional): each recorded
 ///   kind 5, 6, 7 or 9 decision of the current epoch, the hash gno.land's envelope must have, and the voucher,
 ///   verifier, implementation or executor it must install. Each candidate's whole graph is checked.
@@ -23,8 +25,12 @@ contract VerifyCodehashes is CodeVerifier {
     function run() external {
         string memory json = vm.readFile(vm.envString("DEPLOYMENTS_FILE"));
         address admin = json.readAddress(".ibcAdmin");
-        require(verifyLive(admin), "live code does not match the build");
-        require(verifyLaunch(admin), "the launch verifier or voucher does not match the build");
+        // CANDIDATES_ONLY: a candidate of another release is checked from its own release's checkout, where the live
+        // code (of the release that runs) cannot match: only the pending decisions and the listed contracts
+        if (!vm.envOr("CANDIDATES_ONLY", false)) {
+            require(verifyLive(admin), "live code does not match the build");
+            require(verifyLaunch(admin), "the launch verifier or voucher does not match the build");
+        }
         (,, address ics20) = _system(admin);
         address[] memory vouchers = vm.envOr("VOUCHERS", ",", new address[](0));
         for (uint256 i = 0; i < vouchers.length; i++) {

@@ -11,7 +11,7 @@ import { ControlsFixture } from "./ControlsFixture.sol";
 /// has matured and no flag or hold stands; the replacement never before its 7 days, and under a hold never before
 /// its anchor plus 21 days: the start of the first hold standing once it was due, pinned, never reset by later holds.
 contract IBCAdminHoldFuzzTest is ControlsFixture {
-    /// forge-config: default.fuzz.runs = 128
+    /// forge-config: default.fuzz.runs = 256
     function testFuzz_holdStateMachine(uint256 seed) public {
         uint64 settings = admin.lastSeq() + 1;
         _recvGov(_env(settings, S.KIND_SETTINGS, P.settings(clientId, 1 days)));
@@ -27,6 +27,7 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
         uint64[64] memory gStart;
         uint64[64] memory gEnd;
         uint256 gn;
+        uint64 dipStart; // when the standing hold fell below two guardian flags (its grace runs from then)
 
         for (uint256 step = 0; step < 60 && !(settingsDone && seatsDone); step++) {
             uint256 r = uint256(keccak256(abi.encode(seed, step)));
@@ -38,6 +39,9 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
                 (bool done,) = address(admin)
                     .call(op == 0 ? abi.encodeCall(admin.setFlag, ()) : abi.encodeCall(admin.clearFlag, ()));
                 done;
+            } else if ((r >> 24) % 8 == 0 && _now() < recorded + 6 days) {
+                // the boundaries: a flag cleared now starts a dip whose grace ends exactly when the change is due
+                vm.warp(recorded + 6 days);
             } else {
                 uint256[4] memory dts = [uint256(1 hours), 12 hours, 1 days, 3 days];
                 _skip(dts[(r >> 16) % 4]);
@@ -50,15 +54,27 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
             }
             IGuardians.Flag memory h = admin.hold();
             bool holdStands = h.blockNumber != 0;
+            // the exact end (exclusive): a dip's grace ends it 24 hours after the dip started (observed at the step
+            // that cleared the flag, with no time passing); any other end is the moment it is observed
             if (gn != 0 && gEnd[gn - 1] == 0 && (!holdStands || h.time != gStart[gn - 1])) {
-                gEnd[gn - 1] = uint64(_now());
+                gEnd[gn - 1] =
+                    dipStart != 0 && _now() >= uint256(dipStart) + 1 days ? dipStart + 1 days : uint64(_now());
+                dipStart = 0;
             }
             if (holdStands && (gn == 0 || gStart[gn - 1] != h.time)) gStart[gn++] = h.time;
+            {
+                uint256 gFlags;
+                for (uint256 i = 0; i < 4; i++) {
+                    if (f[i].blockNumber != 0) gFlags++;
+                }
+                if (holdStands && gFlags < 2 && dipStart == 0) dipStart = uint64(_now());
+                if (gFlags >= 2) dipStart = 0;
+            }
             // the earliest qualifying hold by the test's own record (its seen end can only be late, so this anchor
             // can only be early: a safe lower bound)
             uint64 lower;
             for (uint256 k = 0; k < gn && lower == 0; k++) {
-                if (gEnd[k] == 0 || gEnd[k] >= recorded + 7 days) lower = gStart[k];
+                if (gEnd[k] == 0 || gEnd[k] > recorded + 7 days) lower = gStart[k];
             }
 
             if (!settingsDone) {
@@ -87,4 +103,34 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
             }
         }
     }
+
+    /// @notice The anchor at the due-time boundary, against an independent model: a hold from day 1 whose dip starts
+    /// around day 6 (two hours either side, the exact point included), so its exclusive end falls just before, at or
+    /// just after the due time (day 7); a new hold from day 20. The anchor is day 1 only if the first hold still
+    /// stood after the due time, else day 20.
+    /// forge-config: default.fuzz.runs = 64
+    function testFuzz_anchorAtTheDueBoundary(uint256 x) public {
+        uint256 t0 = _now();
+        uint64 seq = admin.lastSeq() + 1;
+        _recvGov(_env(seq, S.KIND_SEATS, P.seat1(3, makeAddr("fresh"))));
+        uint256 due = t0 + 7 days;
+        uint256 clearAt = t0 + 6 days + (x % 5) * 1 hours - 2 hours;
+        vm.warp(t0 + 1 days);
+        vm.prank(G[0]);
+        admin.setFlag();
+        vm.prank(G[1]);
+        admin.setFlag();
+        vm.warp(clearAt);
+        vm.prank(G[1]);
+        admin.clearFlag();
+        vm.warp(t0 + 20 days);
+        vm.prank(G[1]);
+        admin.setFlag();
+        vm.warp(t0 + 22 days);
+        admin.execute(seq);
+        uint256 end = clearAt + 1 days; // the first hold's exclusive end
+        uint256 expected = end > due ? t0 + 1 days : t0 + 20 days;
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), expected, "the anchor at the due-time boundary");
+    }
 }
+

@@ -253,6 +253,9 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         emit GnoSettled(clientId, it.sequence, action, it.amount);
     }
 
+    /// @notice The gas a replacement gives the failing verifier's `lastTransition()` view.
+    uint256 internal constant PROBE_GAS = 100_000;
+
     /// @notice See IGnoICS20Controls.
     function checkpointForReplacement(string calldata clientId) external delegated restricted nonReentrant {
         GnoTransferStorage.Layout storage g = _g();
@@ -263,17 +266,30 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         (bool ok, bytes memory ret) =
             GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
         address lc = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
-        if (lc != address(0)) (ok, ret) = lc.staticcall(abi.encodeCall(IGnoLightClientStatus.lastTransition, ()));
-        uint256 until;
-        if (lc != address(0) && ok && ret.length == 64) {
-            (uint256 id, uint256 time) = abi.decode(ret, (uint256, uint256));
-            ok = id <= type(uint64).max && time <= type(uint64).max;
-            if (ok) {
-                until = GnoTransferStorage.quarantineUntil(r, lc, uint64(id), uint64(time));
-                (r.seenClient, r.seenTransition) = (lc, uint64(id));
+        // the failing verifier's view, isolated: a fixed gas cap (PROBE_GAS: a GnoLightClient answers with two
+        // storage reads, a few thousand gas; the cap leaves the replacement's frame almost whole whatever the view
+        // burns) and only the first 64 bytes of its answer copied, never more
+        uint256 id;
+        uint256 time;
+        uint256 size;
+        ok = false;
+        if (lc != address(0)) {
+            bytes4 sel = IGnoLightClientStatus.lastTransition.selector;
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                let p := mload(0x40)
+                mstore(p, sel)
+                ok := staticcall(PROBE_GAS, lc, p, 4, p, 64)
+                size := returndatasize()
+                id := mload(p)
+                time := mload(add(p, 32))
             }
-        } else {
-            ok = false;
+        }
+        ok = ok && size == 64 && id <= type(uint64).max && time <= type(uint64).max;
+        uint256 until;
+        if (ok) {
+            until = GnoTransferStorage.quarantineUntil(r, lc, uint64(id), uint64(time));
+            (r.seenClient, r.seenTransition) = (lc, uint64(id));
         }
         if (!ok) {
             // the failed verifier cannot say when it last transitioned: assume it just did

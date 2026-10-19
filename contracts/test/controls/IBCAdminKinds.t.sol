@@ -270,6 +270,31 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertEq(_state(seq), S.EXECUTED);
     }
 
+    /// @notice r27 #1, the exact boundary: a hold whose dip grace expires exactly when the change is due (day 7) has
+    /// ended then (its end is exclusive) and never anchors; re-flagged on day 20, the change lands on day 41.
+    function test_kind3_anchor_holdEndingExactlyAtDue_neverCounts() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.warp(t0 + 1 days);
+        _hold();
+        vm.warp(t0 + 6 days);
+        vm.prank(G[1]);
+        admin.clearFlag(); // the dip: the hold ends 24 hours later, exactly on day 7
+        vm.warp(t0 + 20 days);
+        vm.prank(G[1]);
+        admin.setFlag(); // a new hold from day 20 (the first one's end is recorded now)
+        assertEq(admin.holds()[0].end, t0 + 7 days, "the first hold ended exactly at the due time");
+        vm.warp(t0 + 22 days);
+        admin.execute(seq);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
+        vm.warp(t0 + 41 days - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 41 days));
+        admin.execute(seq);
+        vm.warp(t0 + 41 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+    }
+
     /// @notice r26 #1 / design r3 #3: more than eight holds end before the first execution attempt, so the history
     /// merges the two oldest (days 1 to 2, before the change was due, and the hold from day 20) into one interval that
     /// spans the gap. A merged interval never anchors: the anchor is a genuine hold's start, never earlier than day 20,

@@ -364,6 +364,27 @@ contract ReentrantSender is IIBCSenderCallbacks {
         );
     }
 
+    /// @notice Per-packet terminal callbacks, as SenderAdapter keeps them (primed packets only).
+    mapping(bytes32 => uint256) internal history;
+
+    function prime(string calldata client, uint64 sequence) external {
+        history[keccak256(abi.encode(client, sequence))] = 1 << 255;
+    }
+
+    function terminals(bytes32 k) external view returns (uint256) {
+        return uint128(history[k]);
+    }
+
+    function terminalKinds(bytes32 k) external view returns (uint256) {
+        return (history[k] >> 128) & 3;
+    }
+
+    function _terminal(string calldata client, uint64 sequence, uint8 kind) private {
+        bytes32 k = keccak256(abi.encode(client, sequence));
+        uint256 h = history[k];
+        if (h != 0) history[k] = (h + 1) | (uint256(kind) << 128);
+    }
+
     function _reenter() private {
         callbacks++;
         try IGnoICS20Controls(address(ics20)).claim("client-0", address(token), 1) {
@@ -373,11 +394,13 @@ contract ReentrantSender is IIBCSenderCallbacks {
         }
     }
 
-    function onAckPacket(bool, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata) external {
+    function onAckPacket(bool success, IIBCAppCallbacks.OnAcknowledgementPacketCallback calldata cb) external {
+        _terminal(cb.sourceClient, cb.sequence, success ? 1 : 2);
         _reenter();
     }
 
-    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata) external {
+    function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata cb) external {
+        _terminal(cb.sourceClient, cb.sequence, 2);
         _reenter();
     }
 

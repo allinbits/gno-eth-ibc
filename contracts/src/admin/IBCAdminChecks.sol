@@ -98,10 +98,21 @@ contract IBCAdminChecks {
     /// @notice A boolean status view, strictly: answered only by a successful call returning exactly one word that
     /// is 0 or 1.
     function flag(address lc, bytes4 selector) public view returns (bool answered, bool value) {
-        (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSelector(selector));
-        if (!ok || ret.length != 32) return (false, false);
-        uint256 w = abi.decode(ret, (uint256));
-        if (w > 1) return (false, false);
+        // isolated: a fixed gas cap (a status view is a storage read) and only the first word of the answer copied,
+        // so a verifier whose view burns its gas or answers at length cannot starve the caller (recovery eligibility
+        // reads the old, possibly failing, client this way)
+        bool ok;
+        uint256 size;
+        uint256 w;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            let p := mload(0x40)
+            mstore(p, selector)
+            ok := staticcall(100000, lc, p, 4, p, 32)
+            size := returndatasize()
+            w := mload(p)
+        }
+        if (!ok || size != 32 || w > 1) return (false, false);
         return (true, w == 1);
     }
 
