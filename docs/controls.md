@@ -22,7 +22,7 @@ The controls are safe under these assumptions; each is detailed where its rule i
 
 | Contract | File | What it is |
 |---|---|---|
-| `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); every change is marked `GNO:`. Deployed as the ICS20 proxy's first implementation (`DeployGnoIBC`); later versions are installed only by kind 7 (the proxy's UUPS upgrade). Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
+| `GnoICS20Transfer` | `contracts/src/GnoICS20Transfer.sol` | Minimal fork of eureka v3.0.2 `ICS20Transfer` (MIT); its changes are marked `GNO:`, except the `nonReentrant` modifiers added to entry points (e.g. `sendTransfer`, `setCustomERC20`), which carry no marker (a diff against `lib/solidity-ibc-eureka/contracts/ICS20Transfer.sol` lists every change). Deployed as the ICS20 proxy's first implementation (`DeployGnoIBC`); later versions are installed only by kind 7 (the proxy's UUPS upgrade). Hot path of the controls: receive checks and limits, send checks and send records, refunds (paid, metered, queued, held). |
 | `GnoICS20Controls` | `contracts/src/transfer/GnoICS20Controls.sol` | The controls' governance setters, guardian flags, `claim`, views, and `ackHook` (the fork's ack/timeout settlement, reachable only through the fork's own call: a consume-once transient flag). Runs only by delegatecall from `GnoICS20Transfer`'s `fallback` (EIP-170 keeps them apart); its address is an immutable of the fork's implementation. |
 | `GnoICS20Reconcile` | `contracts/src/transfer/GnoICS20Reconcile.sol` | Reconciliation: `claimParked`, `settleRecords` (kind 12), `reopenRoute` and `continueReopen` (kind 13). Reached through `GnoICS20Controls`' fallback; its address is an immutable of the controls. |
 | `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
@@ -77,13 +77,13 @@ attribution terms extend to works that use those files.
 - **`gno.storage.IBCAdmin`** (`IBCAdminStorage.Layout`): epoch, last seq, epoch client, last record time, conflict
   flag, executor and its code hash, decisions and tombstones keyed by epoch, guardian keys and flags, hold history,
   recovery state, `setupDone`, the decision that last set each setting (`appliedSeq`), gno.land's chain id, the client
-  ids kind 6 added (`enrolled`, the only ids kind 10 may move a route to).
+  ids kind 6 added (`enrolled`, the only ids kind 10 may move a route to), each epoch's notice, and each pending seat change's anchor (`seatAnchor`).
 
 ## Roles (AccessManager)
 
 | Function | Role | Holder after the setup |
 |---|---|---|
-| the fork's, the controls', the reconciliation and evidence modules' state-changing entry points (sends, packet callbacks, claims, guardian flags, governed setters, settlement and reopening, proofs, notifications, `setCustomERC20`, the beacon upgrades) acquire one shared transient reentrancy lock; `gnoBusy()` reads it. The transfer proxy's UUPS upgrade (`_authorizeUpgrade`) only refuses while the lock is held and does not acquire it; initializers and eureka's `multicall` wrapper hold no enclosing lock (each inner call takes its own) | the lock | — |
+| the fork's, the controls', the reconciliation and evidence modules' state-changing entry points (sends, packet callbacks, claims, guardian flags, governed setters, settlement and reopening, proofs, notifications, `setCustomERC20`, the beacon upgrades) acquire one shared transient reentrancy lock; `gnoBusy()` reads it. The transfer proxy's UUPS upgrade (`_authorizeUpgrade`) only refuses while the lock is held and does not acquire it; eureka's initializers `initialize` and `initializeV2` and its `multicall` wrapper hold no enclosing lock (each inner call takes its own); `initializeGno` acquires the lock | the lock | — |
 | everything governed: router `addIBCApp(string,…)`, `addClient(string,…)`, `migrateClient`, `upgradeToAndCall`; transfer `setCustomERC20`, `upgradeToAndCall`, beacons, every control setter (`initializeGno`, `setGuardianKeys`, `setLimits`, `setQuarantine`, `unpauseRoute`, `setRecoveryBlock`, `migrateRoute`) | `ADMIN_ROLE` | `IBCAdmin` only |
 | `recvPacket`, `ackPacket`, `timeoutPacket`, `updateClient` | `PUBLIC_ROLE` in production; `RELAYER_ROLE` only in a testing deployment (`RELAYER_ADDRESS` with `ALLOW_RESTRICTED_RELAYING=true`) | anyone (production) / kind 8 |
 | router `submitMisbehaviour` | none: permissionless whatever the relaying setting | anyone |
@@ -214,23 +214,23 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | §7.13 records hold the router's commitment, not the packet bytes (bytes in `SendPacket`, authenticated against it); an ack or timeout without a record is refused (`GnoNoSendRecord`; none can exist on a fresh deployment) | `_recordSend`; `GnoICS20Controls.ackHook` |
 | §7.13 ack/timeout attach outcome, local processing block and payment state | `GnoICS20Controls.ackHook` |
 | §7.13 refund meter per (route, token), queue beyond it, permissionless `claim` (installments); the meter is charged before the token moves (given back if the payment fails), and its limits cannot change mid-payment (shared lock; IBCAdmin refuses while busy). A refund is paid at once only when the token's queue is empty, the refunds hold does not stand, the route is open and the meter has room for the **whole** refund; otherwise it is queued, with no first installment. `claim(clientId, token, maxCount)` works the queue in order from its head, `maxCount` clamped to 20; it pays the head's remainder as far as the meter allows (a partial installment ends the call), parks a refund its token refuses, skips entries already settled, and returns the number of queue entries it removed (paid in full, parked or skipped), not tokens paid: a partial installment removes nothing | `GnoICS20Controls.ackHook`, `claim` |
-| §7.12 escrow per route and token never falls below the reservation (for supported tokens: "Supported tokens" below): owed refunds (queued, parked, decided but unpaid) and outstanding escrowed sends (no ack or timeout yet, not settled), whose refund could still be owed. A receive below it is an error ack (`GnoEscrowReserved`); a refund (at once, claim, `claimParked`, kind 12) that would take another record's backing is parked; vouchers reserve nothing | `GnoTransferStorage.reservation/syncReserve/tryPayRefund`; `GnoICS20Transfer.onRecvPacket`, `_recordSend` |
+| §7.12 escrow per route and token is kept at the reservation (for supported tokens: "Supported tokens" below), with one exception: reconciliation may reveal refunds a forged success ack hid, owed again beyond what the compromise left (e.g. escrow 150 against a reservation of 200, `test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment`), the shortfall invariant 5 permits. The guards are that no receive and no refund payment consumes another reservation's backing: owed refunds (queued, parked, decided but unpaid) and outstanding escrowed sends (no ack or timeout yet, not settled), whose refund could still be owed. A receive below it is an error ack (`GnoEscrowReserved`); a refund (at once, claim, `claimParked`, kind 12) that would take another record's backing is parked; vouchers reserve nothing | `GnoTransferStorage.reservation/syncReserve/tryPayRefund`; `GnoICS20Transfer.onRecvPacket`, `_recordSend` |
 | a refund the token or escrow refuses (blacklisted sender, paused token) is parked, never blocking the ack or the queue; `claimParked` retries it. One exception: a voucher refund first mints into the escrow, and if the escrow's release then fails, the mint is undone by an **unbounded** `burn` on the governance-pinned voucher, whose failure propagates (the voucher's burn is trusted to succeed) | `GnoTransferStorage.tryPayRefund`; `claim`, `claimParked` |
-| a sender's `IIBCSenderCallbacks` notification of an error ack or timeout is delivered when its refund is paid at once, with at most 100,000 gas and only when 60,000 more remain for the caller. Only its hash is ever stored (held, or kept after a failure): a claim, `claimParked` or kind 12 paying it only marks it due (`GnoNotificationDue`), and anyone delivers it with `retryNotification(clientId, sequence, call, gasBudget)`, `call` being the callback calldata the router's ack or timeout carried, authenticated against the hash, with a caller-chosen gas budget (a non-zero budget is raised to at least 100,000, and a caller sending too little for it and the 60,000 reserve reverts `GnoNotificationStarved`; a zero budget is the automatic 100,000 and never reverts as starved: `retryNotification(…, 0)` then delivers only if the gas left covers the call and the reserve, else returns false and keeps the hash, and `notifySettled(…, 0)` makes its call without the reserve check); a failing notification never rolls the refund back; a rejected refund's notification is dropped | `GnoTransferStorage.notify/holdNotice/releaseNotice/retryNotice`; `GnoICS20Evidence.retryNotification` |
+| a sender is notified only if it answers ERC-165 `supportsInterface` true for `IIBCSenderCallbacks` (implementing the callbacks is not enough): `notify` and `holdNotice` skip any other sender silently, and `notifySettled` refuses it (`GnoNoNotification`). A sender's `IIBCSenderCallbacks` notification of an error ack or timeout is delivered when its refund is paid at once, with at most 100,000 gas and only when 60,000 more remain for the caller. Only its hash is ever stored (held, or kept after a failure): a claim, `claimParked` or kind 12 paying it only marks it due (`GnoNotificationDue`), and anyone delivers it with `retryNotification(clientId, sequence, call, gasBudget)`, `call` being the callback calldata the router's ack or timeout carried, authenticated against the hash, with a caller-chosen gas budget (a non-zero budget is raised to at least 100,000, and a caller sending too little for it and the 60,000 reserve reverts `GnoNotificationStarved`; a zero budget is the automatic 100,000 and never reverts as starved: `retryNotification(…, 0)` then delivers only if the gas left covers the call and the reserve, else returns false and keeps the hash, and `notifySettled(…, 0)` makes its call without the reserve check); a failing notification never rolls the refund back; a rejected refund's notification is dropped | `GnoTransferStorage.notify/holdNotice/releaseNotice/retryNotice`; `GnoICS20Evidence.retryNotification` |
 | one terminal notification per send record. **A transport callback already delivered is final**: when kind 12 later decides the other kind (a forged success ack delivered to the sender contract, then an action 1 refund; or a delivered refund notification, then actions 2 to 4), no second, contradictory terminal callback ever follows (`notifySettled` refuses it), and the reconciliation is reported by the settlement event `GnoSettled(clientId, sequence, action, amount)`, emitted once per record (a record is settled at most once); integrations that took the transport callback reconcile from that event (`test_d5_deliveredForgedSuccess_thenRefund_noSecondCallback`). Otherwise the notification is decided by the final outcome: the transport's (success or refund) until kind 12 settles it, then the settlement's (action 1 a refund, actions 2 to 4 a success). A settlement deciding another kind supersedes a saved, undelivered transport notification (it is never delivered after); a permissionless `notifySettled(packet, ack, gasBudget)` delivers the settlement's once: the refund (`onTimeoutPacket`, synthesized because no refund notification came from the transport) once paid in full, or the success (`onAckPacket(true, …)`) with the ack `proveOutcome` proved (kept as a hash), which covers a delivered outstanding packet settled by action 3; the packet authenticated against the record's commitment, retried by calling again. A success the transport announced but never delivered (the sender refused it) is replaced by the proven one once actions 2 or 3 settle it, even when both are successes: the transport's ack may be forged. After that settlement, `retryNotification` takes only a call carrying the proven ack, and `notifySettled` delivers it once. Delivering through either path marks the other done, so the sender is told of the success exactly once | `GnoICS20Reconcile.settleRecords`; `GnoICS20Evidence.notifySettled`; `GnoTransferStorage.noticeKinds/deliverSettled` |
 | §7.13 refunds hold suspends proof-based refunds and claims, cancels nothing, follows the ordinary flag and hold rules; a refund-paying kind 12 (an action 1 item with a non-zero amount) is **deferred** while the route's refunds hold stands (any key's refunds flag): `execute` reverts `Deferred` and the decision stays pending, as on gno.land; a kind 12 paying nothing is not held | route `refundFlags`; `setRefundsFlag`/`clearRefundsFlag`; `unpauseRoute`; checked in `ackHook`, `claim`, `claimParked`; `IBCAdmin.execute` with `IBCAdminChecks.settleHeld` (`test_d6_refundPayingSettlement_pendsUnderTheRefundsHold`) |
 | §7.3 a pause never blocks acks, timeouts or refunds; PAUSER_ROLE granted to nobody | `whenNotPaused` removed from the ack/timeout callbacks; deployment roles |
 | E7 4 guardian + 2 watch seats, flags, holds (two guardian flags), 24 h hold end, unpause clears earlier flags, refused under a hold | `Guardians`; per route in the fork, on IBCAdmin itself |
 | a replaced key's flags die on every flag set, and stay dead if the key returns (seat generations) | `Guardians.Keys.gen`, `setKeys`, `standing` |
 | E7 route flags block receives and Ethereum-native sends only | `_checkReceiveRoute`, `_checkEscrowedSend` |
-| E9 live-epoch quarantine, anchor-independent; fail closed where it is read: `_lastTransition` requires exactly two uint64 words, so a client whose `lastTransition()` is missing, reverts or answers anything else refuses receives and quarantine changes (`GnoQuarantineUnknown`), and installation (`IBCAdminChecks.transitionKnown`) refuses it. Two paths do not read it: a receive on a route whose quarantine duration and saved deadline are both zero, and the route's first quarantine setting (which arms the route without a checkpoint); a duration applies to transitions accepted after it, a started quarantine keeps its deadline; transitions told apart by number; a duration change reads the route's current client, whichever id names it; the deadline of a started quarantine is checkpointed before any verifier swap (kind 6 op 2) or route replacement (kind 10), so the new client cannot end it early; governance not quarantined | `GnoLightClient._isLiveTransition`, `lastTransition`; `GnoTransferStorage.quarantineUntil`; `GnoICS20Controls.setQuarantine` settles; never checked by IBCAdmin |
+| E9 live-epoch quarantine, anchor-independent; fail closed where it is read: a client whose `lastTransition()` is missing or reverts refuses receives and quarantine changes (`GnoQuarantineUnknown`). The exact-length check (precisely two uint64 words, 64 bytes) is made by the quarantine checkpoints and changes (`GnoICS20Controls._lastTransition`) and by installation (`IBCAdminChecks.transitionKnown`), which refuse anything else; a receive reads it with a typed call, which accepts a longer answer whose first two words decode. Two paths do not read it: a receive on a route whose quarantine duration and saved deadline are both zero, and the route's first quarantine setting (which arms the route without a checkpoint); a duration applies to transitions accepted after it, a started quarantine keeps its deadline; transitions told apart by number; a duration change reads the route's current client, whichever id names it; the deadline of a started quarantine is checkpointed before any verifier swap (kind 6 op 2) or route replacement (kind 10), so the new client cannot end it early; governance not quarantined | `GnoLightClient._isLiveTransition`, `lastTransition`; `GnoTransferStorage.quarantineUntil`; `GnoICS20Controls.setQuarantine` settles; never checked by IBCAdmin |
 | §5.4 envelope, acks, statuses, window W = 64, drain D = 8 (every delivery and `drain()`), duplicates, conflicts | `IBCAdmin.onRecvPacket`, `_deliver`, `_record`, `_drain` |
 | §5.4 cancels anywhere: tombstones on arrival of the ranges as given, merged with every stored range they touch; at most 64 stored ranges per epoch, past which a new range merges with the nearest stored one, cancelling the numbers in the gap too; a cancel carries 1 to 16 ranges by its grammar, but the 1024-byte envelope makes 14 the effective maximum (15 ranges take 1,038 bytes: an oversize envelope, spent); a cancel beyond the window is bound to its hash and acked `status 2, redispatch 1`, and a malformed one beyond the window is an error ack | `IBCAdmin._deliver`, `_parseCancel`, `_tombstone`; `IBCAdminStorage.addTombstone` |
 | §5.4 epochs: another epoch refused, everything keyed by (epoch, seq) | `IBCAdmin.onRecvPacket`; `IBCAdminStorage.Layout` |
 | §5.4 unknown kind / bad params recorded and spent; a decision's parameters must be exactly the canonical `abi.encode` of its tuple (decoded, re-encoded and compared: trailing data, offsets or padding otherwise are spent at recording); a decision failing its checks at execution spent (no code, another code hash, a refused call, failed after-checks, rolled back) | `IBCAdmin._record`, `execute`; `IBCAdminExec.atRecording`, `_codeIs`, `_call`, `_selfStep` |
 | no one spends a decision by starving it of gas: recording, refusable calls and self-steps run with fixed budgets and floors | `IBCAdmin._atRecording`; `IBCAdminExec._call`, `_selfStep` |
 | §5.4 kind delays: cancel / kind 4 tightening / kind 8 revoke / kind 11 lengthening at recording; unpause 24 h; others 7 d | `IBCAdminExec.atRecording`, `IBCAdmin.execute`, `_delay` |
-| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and through a standing hold no sooner than its floor: the earliest hold overlapping the interval from the decision's recording to now (the standing one, or an ended one whose end is at or after the recording), plus 21 days. The hold history keeps at most eight holds: a ninth merges the two oldest into one spanning both | `IBCAdmin.execute`, `_replacementFloor`; `IBCAdminStorage.noteHoldEnd` |
+| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days. The anchor is the first moment a hold stood once the seat change was due (its 7 days passed): the earliest start of the standing hold and of every recorded hold that ended at or after the due time, never before the due time, so a hold that ended before the change was due never counts, and one nobody observed still does. The first `execute` that finds a hold standing pins it (`replacementAnchor`, `ReplacementAnchored`) and returns without reverting, since a revert would undo the pin; the decision stays pending. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold standing since before the change was due anchors at the due time (day 7 → day 28), a few days later than "day 21 of the hold" (a deliberate, stricter reading: before it was due the hold deferred nothing). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both: a merge can only move a not-yet-pinned anchor earlier (never before the due time) | `IBCAdmin.execute`, `_anchor`, `replacementAnchor`; `IBCAdminStorage.hold`, `noteHoldEnd` |
 | §7.4 unpause spent under a hold of its object (a route: its flags or refunds flags) | `IBCAdminExec._unpause` |
 | kind 3 at most 2 guardian seats, never a current key; both key copies follow; a replaced seat loses its recovery approval | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule; an older decision maturing later never overwrites a newer setting (kinds 4, 11). Bounds (spent otherwise): a non-zero token, `dayCap` and `refundCap` at most 2^128 − 1 (`LeakyBucket.MAX_CAP`), and `sendMin <= sendMax` when `sendMax` is set. A zero `dayCap` refuses every receive, a zero `maxPerMessage` too, and a zero `refundCap` queues every refund; kind 11's quarantine is at most 365 days | `IBCAdminExec._validLimits`, `_loosens`; `IBCAdminStorage.supersede` |
@@ -246,7 +246,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | kind 12 settle: per send record of a retired client id, at most once, all or nothing, with a fixed 6M gas budget and at most eight records (more is spent at recording), each action matching the proven outcome (else the decision is spent): 1 a genuine refund (refundable or collision), `amount` equal to its whole remainder (parked if refused), zero for a refund already paid in full (which only settles the record); 2 reject an owed refund, queued or parked; 3 settled as delivered (2 and 3 need a delivered outcome and nothing refunded yet, and ignore `amount`); 4 forged refund: the record's transport outcome an error ack or a timeout, its proven outcome delivered, `amount` exactly what was already refunded (zero allowed, which only rejects the unpaid remainder; the ADR's "with a refund paid" is relaxed to that), what was paid booked as the loss; 5 a forged receive at an inbound sequence of the retired client, booked as a loss once for exactly the amount the local receive record holds: no destination-outcome proof is involved, so action 5 runs even while the replacement verifier is frozen or expired. Two passes: the first validates and settles every item and owes every action 1 refund its whole remainder, so each one's reservation is restored (a refund a forged success ack hid included); only then does the second pass pay those refunds, each against the batch's complete reservations, in any item order. An ack or timeout of a settled record pays nothing and notifies nobody | `IBCAdminExec.run`; `GnoICS20Reconcile.settleRecords`; `GnoICS20Controls.ackHook` |
 | kind 13 reopen a closed route only when `pendingIncidents` is zero: **no retired client of an unresolved replacement incident has an open send record** (opened by a send, closed by a success ack, a refund paid in full or a settlement) **or an unsettled suspect record**. The live client's records never count, open or not (a refund it owes waits for the reopening, then `claim`), and a late-loss incident needs nothing; otherwise `GnoIncidentsPending` (`openRecords(clientId)` is per client id); every loss not recapitalized becomes an accepted deficit (`GnoDeficitAccepted`, `acceptedDeficit`), 16 tokens in kind 13 and the rest in bounded batches by a permissionless `continueReopen` (the route stays closed, `routeReopening`, until the last); while the route reopens, no kind 12 runs on a client whose incident is reopening and no loss is booked anywhere on the route (`GnoRouteReopening`); a settlement booking no loss on a client of an already resolved incident still executes; the last batch checks the prerequisites again before the route opens (a retired client's record opened meanwhile keeps it closed, `GnoReopenAborted`); a closed route refuses receives, escrowed sends and claims, while returning vouchers still exit | `GnoICS20Reconcile.reopenRoute`, `continueReopen`; `GnoTransferStorage.openRecord/closeRecord`; `_checkReceiveRoute`, `_sendTransferFromEscrowWithSender`, `_openRoute` |
 | E12 route keys, constant-work migration, wire translation | `GnoTransferStorage.routeKey/toRouteDenom/toWireDenom`; `migrateRoute` |
-| §7.12 emergency recovery, off unless enabled at deployment; approval ≥ 3 of 4 guardians, cancellation by a guardian majority (≥ 3 of 4); eligibility when it opens (see "Emergency recovery" below); an attested client of gno.land's chain id, neither frozen nor expired at approval and at execution; a long public delay of at least 30 days (`MIN_RECOVERY_DELAY`, enforced by the constructor and the deploy script); suspends kinds 3, 6–10 at recording and at execution; while open, blocks receives and escrowed (Ethereum-native) sends at once (`GnoRouteRecovering`), returning-voucher burns staying available; the route stays closed after it | `IBCAdmin` constructor, `approveRecovery/cancelRecovery/executeRecovery`; `IBCAdminRecovery` |
+| §7.12 emergency recovery, off unless enabled at deployment; approval ≥ 3 of 4 guardians, cancellation by a guardian majority (≥ 3 of 4, never more than the approval threshold); permanent proposal conditions (the new id's grammar and freshness) checked at approval; eligibility when it opens (see "Emergency recovery" below); an attested client of gno.land's chain id, neither frozen nor expired at approval and at execution; a long public delay of at least 30 days (`MIN_RECOVERY_DELAY`, enforced by the constructor and the deploy script); suspends kinds 3, 6–10 at recording and at execution; while open, blocks receives and escrowed (Ethereum-native) sends at once (`GnoRouteRecovering`), returning-voucher burns staying available; the route stays closed after it | `IBCAdmin` constructor, `approveRecovery/cancelRecovery/executeRecovery`; `IBCAdminRecovery` |
 | E4/E11 hand-over of the authorities, deployer roles removed, check list read back. `finishSetup` checks IBCAdmin's and the deployer's roles, never other holders: the AccessManager cannot list a role's members, so **exclusive ownership needs an external audit** of its `RoleGranted` log. Its function list covers the router's governed functions and relaying, the transfer app's governed setters (`setCustomERC20`, beacons, upgrades, `initializeGno`, `setGuardianKeys`, `setLimits`, `setQuarantine`, `unpauseRoute`, `setRecoveryBlock`, `migrateRoute`, `checkpointQuarantine`) and pause/unpause; it does not read the roles of `settleRecords` and `reopenRoute` (unassigned, so the AccessManager's default `ADMIN_ROLE`) or of `sendTransferWithSender` (`DELEGATE_SENDER_ROLE`, granted to nobody); the audit confirms them | `script/DeployGnoIBC.s.sol`; `IBCAdmin.finishSetup`; `IBCAdminSetupCheck` |
 | §7.2/§9 launch values from the expected lock: day cap min(100,000 GNOT, lock/10), max per message min(25,000 GNOT, day cap), refund cap the day cap; overrides only lower; quarantine 7 d | `DeployGnoIBC._launchLimits`, `_deploy` |
 
@@ -396,13 +396,13 @@ one incident is never counted by another; nothing is counted on the live client.
 
 ### Operating rules and accepted residuals
 
-- **Choosing `suspectFrom`.** A replacement's `suspectFrom` (kind 10, the emergency recovery) must be the
-  block of the earliest verification operation the compromised client may have performed falsely. When that is
-  unknown it is **0**, which counts every ack and timeout the retired client ever processed: the range is clamped
-  to the client's activation, because its processed list starts there. A later value may be used only once the
-  compromise is established as header-only (forged consensus states, not a broken verifier). Only then may it be
-  the block of the first client update after the last authenticated root. Every proof the client verified before
-  that update ran against an authentic root. Choosing it later than the facts support leaves forged successes
+- **Choosing `suspectFrom`.** A replacement's `suspectFrom` (kind 10, the emergency recovery) defaults to **0**,
+  which counts every ack and timeout the retired client ever processed: the range is clamped to the client's
+  activation, because its processed list starts there. A later boundary is allowed only when operators establish
+  that **every consensus state the client retained before that point is genuine** (a safe history prefix), and it
+  must then be the block at which the earliest potentially forged consensus state was installed. A newer genuine head
+  alone never advances it: authenticating a recent root says nothing of the older roots the client stored, and a
+  forged older root can still back proofs. Choosing it later than the facts support leaves forged successes
   unreserved and outside reconciliation.
 - **Refund liveness on a closed route.** This is a deliberate exception to refund liveness. A closed route pays
   no refund outside kind 12 until it reopens: no claim, and acks and timeouts do not pay. Those refunds stay owed
@@ -427,6 +427,13 @@ one incident is never counted by another; nothing is counted on the live client.
   loss against a settled record. This document's operating policy is to compensate such a refund outside the
   bridge; a governed path (it would need a kind 7 upgrade of the transfer app) is a proposed extension, not part of
   the design.
+- **Cross-chain loss ownership: the payout chain is authoritative.** A loss is identified by its packet (the
+  sending chain's client id and sequence) and its token. Every loss is a payout on exactly one chain, and it is
+  booked there with that chain's own machinery: on Ethereum, kind 12 action 4 (a forged refund paid here) or action 5
+  (a forged receive paid here); on gno.land, its void and settlement paths. Its remedies (recapitalization,
+  reduction, accepted deficit) act on that chain. A record on the other chain of the same (packet, token) is a
+  **mirror**: it is resolved only by an accepted deficit (kind 13 here), never recapitalized or reduced. Monitoring
+  counts each loss once, at the payout chain's open balance; mirrors contribute nothing.
 - **`claimParked` and the meter.** `claimParked(clientId, sequence, gasBudget)` retries a parked refund (else
   `GnoNotParked`) on an open route with no refunds hold (`GnoRouteClosed`, `GnoRefundsHeld`). An ordinary parked
   refund (from an ack, a timeout or a claim) is metered: it pays what the refund meter allows now. A refund kind 12
@@ -446,16 +453,33 @@ one incident is never counted by another; nothing is counted on the live client.
   a shortfall outside the one reconciliation recognizes, and the invariants do not hold for that token. A token
   that pauses or blacklists only makes refunds park (`claimParked` retries them). gno.land vouchers are the bridge's
   own code (kind 5, code-hash pinned).
-- **Emergency recovery.** Configured once, at deployment (`RecoveryConfig`, `recoveryConfig()`): `delay` (0
+- **Emergency recovery.** Configured once, at deployment (`RecoveryConfig`, `recoveryConfig()`), and fixed: no
+  governed decision enables, disables or retunes it later (IBCAdmin is immutable). **Whether to enable it is a
+  pre-deployment decision**, taken with the guardian set the deployment installs; a deployment with recovery
+  disabled stays without it. `delay` (0
   disables recovery; otherwise at least 30 days, `MIN_RECOVERY_DELAY`; launch value 0 unless `RECOVERY_DELAY` is set),
-  `threshold` (approvals, launch 3), `cancelThreshold` (cancel votes, launch 3, at least 3), `silence` (launch 30 days,
+  `threshold` (approvals, `RECOVERY_THRESHOLD`, launch 3, 3 or 4 when recovery is enabled), `cancelThreshold` (cancel
+  votes, `RECOVERY_CANCEL_THRESHOLD`, launch 3; when enabled at least 3 and **at most `threshold`**, so the guardians
+  who can open a proposal can always close it; the constructor and the deploy script refuse anything else,
+  `test_m1_cancelThreshold_atMostTheApprovalThreshold`), `silence` (launch 30 days,
   `RECOVERY_SILENCE`; 0 disables that criterion) and `holdPeriod` (launch 14 days, `RECOVERY_HOLD_PERIOD`; 0 disables
   it). A proposal (`RecoveryProposal`) names `newClientId`, `counterpartyClientId`, `merklePrefix` (canonical:
   gno.land's exact prefix), `lightClient`, `codeHash` and `suspectFrom`.
-  - **Approval** (`approveRecovery`, a guardian seat, after `finishSetup`, while no proposal is open): the proposal's
+  - **Approval** (`approveRecovery`, a guardian seat, after `finishSetup` and after gno.land has bound, while no
+    proposal is open): the proposal's
     client must be code with that hash (not an EIP-7702 designator), follow gno.land's chain id, and be neither frozen
-    nor expired, every status view answering exactly. Each seat approves one proposal (its hash); a replaced seat
-    loses its approval.
+    nor expired, every status view answering exactly. Every permanent condition execution needs is checked here,
+    before the proposal can open: `newClientId` is a valid custom router id (4 to 128 bytes of the router's grammar,
+    never `client-` or `channel-`) and unknown to the router, which also makes it a fresh route for the transfer app
+    (every id the transfer app knows, a route key, an alias, a retired id or an escrow's, was a router client); a
+    proposal naming, say, `bad` is refused (`test_m1_permanentlyInvalidIds_refusedAtApproval`).
+    With the authority-changing kinds suspended while it is open, these stay true until execution. Each seat
+    approves one proposal (its hash); a replaced seat loses its approval.
+  - **Launch invariant: Ethereum stays at epoch 1 until gno.land binds.** gno.land binds by sending IBCAdmin its first
+    decision. Until IBCAdmin has recorded one (`lastSeq` non-zero in epoch 1), approval is refused
+    (`RecoveryNotEligible`, `test_m2_recoveryRefusedBeforeTheFirstDecision`): a recovery then would advance Ethereum
+    to epoch 2 while gno.land binds at epoch 1, and every dispatch would be refused with nothing to repair it. Kind 10
+    needs no such gate: it can only come from gno.land, after the binding.
   - **Opening**, checked on each approval (so a guardian calls `approveRecovery` again when eligibility arrives later):
     at least `threshold` seats approve this proposal, and the route is **eligible**, which is any of: the epoch's
     client answers `isFrozen()` or `isExpired()` true (an exact answer: a client answering neither opens nothing by
@@ -466,7 +490,17 @@ one incident is never counted by another; nothing is counted on the live client.
   - **Before execution**, a guardian withdraws its approval (before opening) or votes to cancel (after);
     `cancelThreshold` votes close the proposal and unblock the route.
   - **Execution** (`executeRecovery`, permissionless): at least `delay` after `openedAt`, and the proposal's client
-    still usable (as at approval). Eligibility is **not** checked again. It adds the client under its new id,
+    still usable (as at approval). Eligibility is **not** checked again. Any failure reverts the whole call: the
+    proposal stays open and the route stays blocked, so anyone retries once the cause is gone (a client that froze
+    or expired meanwhile never recovers), or the guardians cancel it. **The cancellation quorum must stay
+    available**: an open proposal that can no longer execute is closed only by `cancelThreshold` guardian votes, and
+    guardian replacement (kind 3) is suspended while it is open.
+  - **Keeping the candidate fresh.** The proposal's verifier must still be neither frozen nor expired when the delay
+    (30 days or more) ends, longer than a trusting period (14 days at launch). It is not a router client until
+    execution, so the ordinary client-update relaying does not reach it: an operator relays updates **directly to
+    the candidate's address** (`updateClient` on the light client) at least daily throughout the delay, and monitors
+    its latest consensus time against its trusting period, alerting well before expiry. If it expires anyway, the
+    guardians cancel the proposal and propose a fresh, attested client. It adds the client under its new id,
     checkpoints the quarantine, migrates the route (a new incident; the route closes), freezes the old id and opens the
     next epoch, whose notice it sends.
 - **Trust in gno.land's Ethereum verifier (reverse direction).** Governance depends on gno.land's approved local
@@ -591,12 +625,15 @@ own address (`gnoSelf()`) to be its address, which rejects any wrong metadata. K
 executor: its `bindings()` answer nothing otherwise. The delegate guard itself refuses only when the execution
 context equals the recorded own address: a module that recorded the transfer proxy as its own address would refuse
 delegated execution there (`NotDelegated`), while an arbitrary other address is caught by the explicit kind 7 check,
-not by the guard. A module behind a proxy answers its implementation's address.
+not by the guard. An ordinary proxy-backed module is therefore refused on chain: through a proxy, `gnoSelf()` answers the
+implementation's address, not the module's, and kind 7 requires the module's own.
 
 A hash says nothing of the source, and a proxy's hash never changes when its target does. So **every pinned hash
 must equal a reproducible build of the named source, and no module may hold a mutable implementation pointer** (a
-beacon or an ERC-1967 proxy as a module would keep its hash while its owner changed what it runs; on chain it
-passes, as governance pinned it). `scripts/verify-codehashes.sh` (`script/VerifyCodehashes.s.sol`,
+beacon or an ERC-1967 proxy keeps its hash while its owner changes what it runs). The on-chain checks refuse ordinary
+proxies as modules and executors; the build verification also catches code that supplies acceptable metadata
+without being a build of the intended source, and proxies where no on-chain check reads metadata (vouchers,
+verifiers). `scripts/verify-codehashes.sh` (`script/VerifyCodehashes.s.sol`,
 `script/CodeVerifier.sol`) checks against a clean build, taking no deployed byte on trust. Each contract is rebuilt in
 the verifier's own simulation: its build's creation code runs at its own address, with the constructor arguments the
 system's graph calls for, and the result must equal the deployed code byte for byte. So every immutable is checked
@@ -609,22 +646,42 @@ against its constructor relationship:
 
 An executor is rebuilt from its creation nonce, so the four modules it deploys come out at their recorded addresses,
 and they are compared too. IBCAdmin's deployer and recovery settings are configuration values with no relationship to
-check; the verifier prints them, for comparison with the deployment plan. Every rebuild is rolled back. It covers:
+check; the verifier prints them, for comparison with the deployment plan. Every rebuild is rolled back.
+
+**Status of the coverage.** Implemented in `script/CodeVerifier.sol` and run by `scripts/verify-codehashes.sh`
+(tested in `CodePinning.t.sol` and `DeploymentRace.t.sol`): every item below. **Manual** until tooling covers it:
+running it at all (no watcher triggers it, T5 is unbuilt), collecting the pending decisions' hashes and candidates and
+a recovery proposal's `lightClient` (from gno.land's envelopes and the approval transactions), and checking a verifier
+of any type other than GnoLightClient against its own source. It covers:
 
 - **What runs now** (`verifyLive`), read from the chain and never from the deployment file, which goes stale after
   any kind 7 or 9: the transfer proxy's and the router proxy's live ERC-1967 implementation slots, the escrow and
   voucher beacons' implementations, IBCAdmin, and the executor IBCAdmin has installed, each delegate graph complete.
-- **Every pending kind 7 or kind 9, before it matures** (`verifyPending`, given `PENDING_SEQS`, `PENDING_HASHES`,
+- **The launch's other pinned code** (`verifyLaunch`): the epoch client's verifier (a GnoLightClient, which has no
+  immutables, rebuilt from any state) and the ugnot voucher registered for it (rebuilt from its own name, symbol,
+  decimals and denom, its `ics20` immutable the transfer app).
+- **Every pending kind 5, 6, 7 or 9, before it matures** (`verifyPending`, given `PENDING_SEQS`, `PENDING_HASHES`,
   `PENDING_CANDIDATES`): the recorded decision must have the hash of the envelope gno.land sent, name the expected
-  implementation or executor, and pin that candidate's live code hash. The candidate's whole graph must then be a
-  build of its source: the transfer app's four contracts, the router, the escrow or voucher implementation, or the
-  executor and its modules.
+  voucher, verifier, implementation or executor, and pin that candidate's live code hash. The candidate must then be a
+  build of its source: the voucher (bound to the transfer app), the GnoLightClient, the transfer app's four
+  contracts, the router, the escrow or voucher implementation, or the executor and its modules.
+- **Further vouchers and verifiers** (`VOUCHERS`, `CLIENTS`): every voucher a kind 5 registered and every verifier a
+  kind 6 installed or an emergency recovery proposal attests (its `lightClient`, read from the approval's calldata or
+  the `RecoveryApproved` transaction; IBCAdmin keeps only its hash), each rebuilt from its source.
+
+A rebuild compares the deployed bytes with the build's, so any proxy or other code indirection fails it, whatever
+its target. A verifier of another type than GnoLightClient is not covered by the tool: its operator checks by hand
+that its deployed code is a reproducible build of its named source with its constructor bindings, and that it
+holds no mutable implementation pointer (no proxy, beacon, `delegatecall` to a settable address or
+`SELFDESTRUCT`-and-redeploy pattern), before the kind 6 or recovery that installs it matures.
 
 **Required operating procedure** (the watch tool, T5, is not built: ADR pr6375 lists it as unimplemented, and
-`scripts/verify-codehashes.sh` is run by hand with operator-supplied pending lists): run both after every deployment
-and every executed decision, and for each recorded kind 7 or 9 as soon as it is recorded, within its seven-day delay.
-Automating these triggers is outstanding integration work. A failure is the signal to cancel the decision with **kind 1**
-(cancel), never kind 2 (kind 2 unpauses). Kind 1 takes the sequence ranges to cancel, `abi.encode((uint64 from,
+`scripts/verify-codehashes.sh` is run by hand with operator-supplied pending lists): run it after every deployment
+and every executed decision, and for each recorded kind 5, 6, 7 or 9 and each opened emergency recovery as soon as it
+is recorded, within its delay. Automating these triggers is outstanding integration work.
+
+**A pending candidate that fails** is cancelled with **kind 1** (cancel), never kind 2 (kind 2 unpauses); for a
+recovery proposal, the guardians vote to cancel it (`cancelRecovery`). Kind 1 takes the sequence ranges to cancel, `abi.encode((uint64 from,
 uint64 to)[])`; to cancel the pending decision at sequence `s`, send the range `[(s, s)]` in the current epoch. The
 `kind1-cancel` entry of `contracts/test/fixtures/gov-vectors.json` is a byte-exact example: epoch 1, sequence 11,
 cancelling sequences 2 to 3:
@@ -642,6 +699,29 @@ executor is refused on chain already: through a proxy its `bindings()` answer ze
 (`CodePinning.t.sol`). The build verification refuses it before it matures as well
 (`test_r11_3_pendingProxyBackedExecutor_refused`), and catches what an on-chain check cannot: a candidate whose
 bindings are right but whose code is not a build of its source.
+
+**Live code that fails after execution** cannot be cancelled (kind 1 acts only on pending decisions). An IBCAdmin
+hold defers every 7-day decision, the repair's included, so the order matters:
+1. **Cancel unsafe pending decisions** (kind 1): every pending decision that relies on the failed code or would
+   install unverified code.
+2. **Keep the transfers contained.** Guardians set the route flags on every route (`setRouteFlag`: receives and
+   escrowed sends stop) and the refunds flags (`setRefundsFlag`: refunds, claims and refund-paying kind 12 wait); a
+   compromised verifier's route may be closed by replacing it (step 4). These flags are on the transfer app, not
+   on IBCAdmin, so they do not defer governance; they last while the guardians keep them (kind 2 clears them only
+   when no hold of theirs stands).
+3. **Clear the administrative flags and wait out the hold.** IBCAdmin flags (`setFlag`) defer every 7-day
+   decision, so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
+   after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days.
+4. **Execute the verified repair**, each candidate verified as pending (`verifyPending`) before it matures:
+   - a failed transfer-app, router or beacon implementation: a kind 7 back to the last verified implementation
+     (named in the previous `verifyLive` run), or to a fixed build;
+   - a failed executor: a kind 9 hand-over to a verified executor;
+   - a failed voucher: none can be swapped (kind 5 registers a denom once); stop the denom's flows with the route
+     flags and limits (kind 4 to zero caps, applied at recording), and treat its balances as at risk;
+   - a failed verifier: a kind 6 migration of the client to a verified verifier, or a kind 10 route replacement
+     (or the emergency recovery, if enabled at deployment), with `suspectFrom` covering the time it ran.
+5. **Reconcile** what ran meanwhile (kind 12) where the failure touched outcomes, and lift the transfer flags (owners
+   clear their own; kind 2 for the rest) once `verifyLive` passes again.
 
 ### Calls to candidate code before installation
 
@@ -666,20 +746,21 @@ client and call nothing.
 ### External callees during privileged operations
 
 The transfer app's state-changing entry points (the fork, the controls, reconciliation, evidence) acquire one shared
-transient lock; the UUPS upgrade path only refuses while it is held (`_authorizeUpgrade`), and initializers and the
-`multicall` wrapper take no enclosing lock (each inner call acquires its own). While the lock is held, IBCAdmin
+transient lock; the UUPS upgrade path only refuses while it is held (`_authorizeUpgrade`), and eureka's `initialize` and
+`initializeV2` and the `multicall` wrapper take no enclosing lock (each inner call acquires its own; `initializeGno`
+acquires it). While the lock is held, IBCAdmin
 refuses `execute` (`Busy`) and its delivery (a whole revert), and `drain()` records nothing. The router holds its own lock around every packet it processes. A callee therefore
 reaches no privileged entry point, whatever state it sees.
 
 | Callee (who chooses it) | Where it is called, and how | State during the call | Under the lock | Can reach a privileged entry point |
 |---|---|---|---|---|
 | ERC-20 token of a send (the sender) | `transferFrom` (eureka's `_transferFrom`), a CALL | tokens moved, the send record not yet written | yes | no: the lock (`CalleeReentry`, `busyGovernance`); a delivery it relays reverts whole (`test_r11_callee_tokenHookRelaysAnInboundTransfer_notConsumed`) |
-| ERC-20 token or voucher of a refund (sender's token; registered voucher) | `tryPayRefund`: `balanceOf` STATICCALL, then `mint`/`Escrow.send` CALLs with PAY_GAS, in ack hooks, claims, `claimParked`, kind 12 | paid, `rec.refunded` updated after the call | yes | no: the lock (`ReentrantToken`, `HookToken` regressions); kind 12 rechecks its verifier after the payments |
+| ERC-20 token or voucher of a refund (sender's token; registered voucher) | `tryPayRefund`: `balanceOf` STATICCALL (BALANCE_GAS), then `mint`/`Escrow.send` CALLs with PAY_GAS, in ack hooks, claims and kind 12; `claimParked` gives each its caller-chosen budget (at least PAY_GAS) | paid, `rec.refunded` updated after the call | yes | no: the lock (`ReentrantToken`, `HookToken` regressions); kind 12 rechecks its verifier after the payments |
 | registered voucher, undoing a refund's mint (governance's kind 5) | `burn`, a CALL with all remaining gas (unbounded), only when the escrow's release failed after the mint; its failure reverts the whole call | the mint done, the release refused | yes | no: the lock |
 | voucher of a returning send (governance's kind 5) | `burn`, a CALL, in the send | tokens moved to the escrow, the send record not yet written | yes | no: the lock |
 | ERC-20 token of a receive | `balanceOf` STATICCALL; voucher `mint`; `Escrow.send` CALL | the receive charged and recorded before the release | yes | no: the lock |
-| sender adapter (the sender) | IIBCSenderCallbacks with CALLBACK_GAS (ack hook, `retryNotification`, `notifySettled`) | after the record's outcome and payment are written; marked done after the call | yes | no: the lock (`senderReentry`, `ReentrantSender`) |
-| permit2 (fixed at deployment) | `permitTransferFrom`, a CALL, in `sendTransferWithPermit2` | as a send's token | yes | no: the lock (`test_r11_callee_permit2InSend`) |
+| sender adapter (the sender) | IIBCSenderCallbacks with CALLBACK_GAS in the ack hook; `retryNotification` and `notifySettled` with the caller-chosen budget (at least CALLBACK_GAS; zero: the automatic one) | after the record's outcome and payment are written; marked done after the call | yes | no: the lock (`senderReentry`, `ReentrantSender`) |
+| permit2 (fixed at deployment: `PERMIT2`; unset in an ordinary deployment, so `sendTransferWithPermit2` is unavailable) | `permitTransferFrom`, a CALL, in `sendTransferWithPermit2` | as a send's token | yes | no: the lock (`test_r11_callee_permit2InSend`) |
 | route's active verifier (governance's kind 6/10; never caller-supplied: `proveOutcome` reads it from storage) | `verifyMembership`/`verifyNonMembership`, CALLs (eureka's interface is not `view`) | before any write of the proof | yes | no: the lock (`test_r11_callee_verifierInProveOutcome`) |
 | live client's status views (governance's) | `lastTransition`, `isFrozen`, `isExpired`, `getClientState` | — | — | STATICCALL only |
 | candidates (kind 6, 7, 9, recovery proposals) | see the table above | — | — | STATICCALL only |
@@ -792,7 +873,7 @@ separately); the two scenarios that model governance finding a forged payout lat
 forged payout is exempt from the completeness check until it is booked. Payment
 conservation is checked against the tokens themselves (the senders', the escrow's, bob's, the voucher's supply) and
 losses as per-packet amounts that the booked losses and the accepted deficit must equal; every required transition is
-covered in each run, counted only on its intended outcome; 24 runs of depth 40 in the suite). Its invariants assume governance reconciles completely before kind 13, as §7.12 asks: the controls
+covered in each run, counted only on its intended outcome, a coverage sweep after each run driving any scenario the run missed, each sweep step in its own call so that no single frame outgrows the EVM's 32 MiB memory limit; 24 runs of depth 40 in the suite). A refund-paying kind 12 under a refunds flag is driven pending → `Deferred` → executed once the flag clears (`heldSettlement`; the handler keeps deferred decisions), and kind 12's preparation gate is asserted at its own payments only: a parked refund it settled may be claimed after an unprepared reopening (`parkedAfterUnpreparedReopen`). Its invariants assume governance reconciles completely before kind 13, as §7.12 asks: the controls
 themselves enforce the suspected interval and the open records, not the identification of every forged payout. Also `ProvenOutcomes.t.sol` (a strict
 mock light client checks every path and value `proveOutcome` computes; the R19 vectors), `ControlsGas.t.sol`,
 `GovVectors.t.sol`. Library and client tests: `Guardians.t.sol` (differential fuzz against a model),
