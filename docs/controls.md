@@ -349,6 +349,10 @@ bounds (constant work whatever the number of incidents).
    while any incident of the route is unprepared (the refund stays parked). This holds whatever the order of
    proofs and decisions. Outside kind 12 a closed route pays nothing: no claim, and acks do not pay.
 
+   **Settlement freezes the evidence.** `proveOutcome` and `voidOutcome` refuse a settled record (`GnoBadProof`), so
+   no later proof, even a valid non-receipt after the settling proof went stale, can recreate a hold, change a
+   reservation, or replace the proven ack its notifications use (`test_d6r1_settledRecord_evidenceFrozen`).
+
    **A hold is released only by the kind 12 that settles the record**, with an outcome still valid at execution.
    No proof releases it, not even one of delivery, which may later go void. `voidOutcome` clears an outcome its
    verifier no longer vouches for, so that it can be proven again, and keeps the hold. A batch that settles a

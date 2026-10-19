@@ -190,6 +190,28 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ugnot.balanceOf(bob), 5);
     }
 
+    /// @notice Design r6: settlement freezes the evidence. A record settled as delivered (action 3), whose proof is
+    /// then invalidated (the verifier generation bumped), refuses a later non-receipt proof and a void: no proof can
+    /// recreate a hold or change its reservation, nor the proven ack its notifications use.
+    function test_d6r1_settledRecord_evidenceFrozen() public {
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        IICS26RouterMsgs.Packet memory pkt = _send(alice, address(usdc), 50, clientId); // delivered, never acked
+        _retire();
+        _proveDelivered(pkt);
+        _settle(_item(pkt.sequence, 3, 0));
+        T.SendRecord memory before = ctl.sendRecord(clientId, pkt.sequence);
+        uint256 reserved = ctl.reserved(clientId, address(usdc));
+        vm.prank(address(admin));
+        ctl.checkpointQuarantine("gnoland-9"); // the proof's generation is now stale
+        MockLightClient(address(router.getClient("gnoland-9"))).setTimestamp(pkt.timeoutTimestamp);
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.proveOutcome(pkt, T.OutcomeProof(IICS02ClientMsgs.Height(0, 1), bytes32(0), "", "", ""));
+        vm.expectRevert(T.GnoBadProof.selector);
+        ctl.voidOutcome(clientId, pkt.sequence);
+        assertEq(abi.encode(ctl.sendRecord(clientId, pkt.sequence)), abi.encode(before), "the record unchanged");
+        assertEq(ctl.reserved(clientId, address(usdc)), reserved, "its reservation unchanged");
+    }
+
     /// @notice Design r5 #1: a contract sender whose ERC-165 `supportsInterface` burns its gas (`burn`) or answers
     /// 4,000 bytes. OpenZeppelin's probe is already isolated (at most three STATICCALLs of 30,000 gas, one word
     /// copied): its error-ack refund is paid at once, and a forged-success packet's settlement (action 1) executes.
