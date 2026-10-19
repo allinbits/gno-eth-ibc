@@ -9,7 +9,7 @@ import { ControlsFixture } from "./ControlsFixture.sol";
 /// @notice The hold state machine as it gates execution (§6.6, §6.7, §7.4): random flags, clears and clock steps by
 /// the six keys, with a 7-day decision and a guardian replacement waiting. A 7-day decision executes exactly when it
 /// has matured and no flag or hold stands; the replacement never before its 7 days, and under a hold never before
-/// its anchor plus 21 days: the first moment a hold stood once it was due, pinned and never reset by later holds.
+/// its anchor plus 21 days: the start of the first hold standing once it was due, pinned, never reset by later holds.
 contract IBCAdminHoldFuzzTest is ControlsFixture {
     /// forge-config: default.fuzz.runs = 128
     function testFuzz_holdStateMachine(uint256 seed) public {
@@ -56,9 +56,10 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
                 (bool ok,) = address(admin).call(abi.encodeCall(admin.execute, (seats)));
                 ok = ok && admin.decision(admin.epoch(), seats).state == S.EXECUTED;
                 uint64 pinned = admin.replacementAnchor(admin.epoch(), seats);
-                // never before its 7 days; the anchor, once pinned, never moves and is never before the due time
+                // never before its 7 days; the anchor, once pinned, never moves
                 if (anchor != 0) assertEq(pinned, anchor, "an anchor never moves");
-                if (pinned != 0) assertGe(pinned, recorded + 7 days, "never anchored before it was due");
+                // the anchor is the start of a hold: one standing at or after the due time (it may have begun before)
+                if (pinned != 0) assertLe(pinned, _now(), "anchored at a hold already started");
                 bool due = _now() >= recorded + 7 days;
                 // lands exactly when due with no hold standing, or under a hold from its anchor plus 21 days
                 bool should = due && (!holdStands || (pinned != 0 && _now() >= uint256(pinned) + 21 days));

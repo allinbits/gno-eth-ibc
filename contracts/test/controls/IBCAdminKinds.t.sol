@@ -156,21 +156,21 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.setFlag();
     }
 
-    /// @notice ADR §7.4: a hold standing since before the replacement was due anchors it at its due time (the first
-    /// moment a hold deferred it); it lands from the anchor plus 21 days. The first deferring `execute` pins the anchor
-    /// and returns (a revert would undo the pin); the decision stays pending.
+    /// @notice ADR §7.4: a hold standing since before the replacement was due anchors it at the hold's start: it lands
+    /// on day 21 of the hold. The first deferring `execute` pins the anchor and returns (a revert would undo the pin);
+    /// the decision stays pending.
     function test_kind3_throughAHold_noSoonerThanDay21() public {
-        _hold();
-        _skip(1 days);
+        uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(1, makeAddr("fresh")));
-        uint256 due = _now() + 7 days;
-        _skip(7 days);
-        admin.execute(seq); // pins the anchor: the due time
+        vm.warp(t0 + 1 days);
+        _hold(); // from day 1, before the replacement is due (day 7)
+        vm.warp(t0 + 7 days);
+        admin.execute(seq); // pins the anchor: the hold's start
         assertEq(_state(seq), S.PENDING);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), due);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, due + 21 days));
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 1 days);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 22 days));
         admin.execute(seq);
-        vm.warp(due + 21 days);
+        vm.warp(t0 + 22 days);
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
         // the replacement cleared a holder's flag: one guardian flag is left, the hold ends at once

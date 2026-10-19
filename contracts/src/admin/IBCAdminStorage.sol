@@ -131,7 +131,7 @@ library IBCAdminStorage {
         /// Each epoch's notice (§7.12), kept per epoch so that every one stays re-sendable after consecutive
         /// replacements: none at launch (epoch 1).
         mapping(uint32 epoch => Notice) notices;
-        /// A pending seat change's anchor (kind 3 under a hold): the first moment a hold deferred it once due.
+        /// A pending seat change's anchor (kind 3 under a hold): the start of the first hold standing once it was due.
         mapping(uint32 epoch => mapping(uint64 seq => uint64)) seatAnchor;
     }
 

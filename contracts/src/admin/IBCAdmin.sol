@@ -463,9 +463,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             matureAt = d.recordedTime;
         } else if (kind == S.KIND_SEATS) {
             // a seat change's deferral by holds is bounded by a deadline later holds cannot reset (ADR §7.4): its
-            // anchor is the first moment a hold deferred it once due (the hold history included, so a hold nobody
-            // observed still counts), pinned the first time it is seen; under a hold it lands from the anchor plus 21
-            // days, whatever hold stands then, and with no hold standing as any decision does
+            // anchor is the start of the first hold standing at or after it was due (the hold history included, so a
+            // hold nobody observed still counts), pinned the first time it is seen; under a hold it lands from the
+            // anchor plus 21 days, whatever hold stands then, and with no hold standing as any decision does
             uint64 a = l.seatAnchor[ep][seq];
             if (a == 0 && holdStands && block.timestamp >= matureAt) {
                 a = _anchor(l, matureAt, holdStart);
@@ -505,15 +505,15 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         }
     }
 
-    /// @notice A seat change's anchor: the first moment a hold stood once it was `due`: the earliest start of the
-    /// standing hold and of every recorded hold that ended at or after `due`, never before `due`.
+    /// @notice A seat change's anchor: the start of the first hold standing at or after it was `due` (ADR §7.4, day 21
+    /// of the hold, even one that began before `due`): the earliest start of the standing hold and of every recorded
+    /// hold that ended at or after `due`.
     function _anchor(S.Layout storage l, uint64 due, uint64 standing) private view returns (uint64 a) {
         a = standing;
         for (uint256 i = 0; i < l.holds.length; i++) {
             IGuardians.Hold memory h = l.holds[i];
             if (h.end >= due && h.start < a) a = h.start;
         }
-        if (a < due) a = due;
     }
 
     /// @notice A pending seat change's anchor (zero: none pinned yet): under a hold it lands from this plus 21 days.
