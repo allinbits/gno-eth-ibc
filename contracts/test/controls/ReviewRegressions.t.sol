@@ -190,6 +190,42 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(ugnot.balanceOf(bob), 5);
     }
 
+    /// @notice Design r5 #1: a contract sender whose ERC-165 `supportsInterface` burns its gas (`burn`) or answers
+    /// 4,000 bytes. OpenZeppelin's probe is already isolated (at most three STATICCALLs of 30,000 gas, one word
+    /// copied): its error-ack refund is paid at once, and a forged-success packet's settlement (action 1) executes.
+    function _hostileIntrospection(bool burn) internal {
+        HostileIntrospector h = new HostileIntrospector(IICS20Transfer(address(ics20)), IERC20(address(usdc)), burn);
+        usdc.mint(address(h), 30);
+        _setLimits(address(usdc), 1000, 1000, 1000);
+        vm.recordLogs();
+        h.send(10, clientId);
+        IICS26RouterMsgs.Packet memory a = _sentPacket();
+        router.ackPacket{ gas: 1_500_000 }(
+            IICS26RouterMsgs.MsgAckPacket(a, ICS24Host.UNIVERSAL_ERROR_ACK, "", IICS02ClientMsgs.Height(0, 1))
+        );
+        assertEq(uint8(ctl.sendRecord(clientId, a.sequence).payment), uint8(T.Payment.Paid), "refunded at once");
+        assertEq(usdc.balanceOf(address(h)), 20 + 10);
+        vm.recordLogs();
+        h.send(10, clientId);
+        IICS26RouterMsgs.Packet memory b = _sentPacket();
+        _ack(b, bytes("{\"result\":\"AQ==\"}")); // a forged success
+        _retire();
+        _proveRefundable(b);
+        uint64 seq = _decide(S.KIND_SETTLE, P.settle1(clientId, b.sequence, 1, 10));
+        _skip(7 days + 1);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED, "settled");
+        assertEq(ctl.sendRecord(clientId, b.sequence).refunded, 10);
+    }
+
+    function test_d5r1_introspectionBurningGas_refundsAndSettlementComplete() public {
+        _hostileIntrospection(true);
+    }
+
+    function test_d5r1_introspectionLongAnswer_refundsAndSettlementComplete() public {
+        _hostileIntrospection(false);
+    }
+
     /// @notice Docs r3 #12: kind 13 names the route's current client only; a retired alias is refused.
     function test_r26_reopenByARetiredAlias_refused() public {
         _retire();
@@ -3089,6 +3125,43 @@ contract LaunchParamsTest is ControlsFixture {
         vm.setEnv("GNOT_MAX_PER_MESSAGE", "0");
         vm.setEnv("GNOT_DAY_CAP", "0");
         vm.setEnv("GNOT_REFUND_CAP", "0");
+    }
+}
+
+/// @notice A contract sender whose ERC-165 introspection is hostile: it burns all its gas, or answers 4,000 bytes.
+contract HostileIntrospector {
+    IICS20Transfer internal immutable ics20;
+    IERC20 internal immutable token;
+    bool internal immutable burn;
+
+    constructor(IICS20Transfer ics20_, IERC20 token_, bool burn_) {
+        (ics20, token, burn) = (ics20_, token_, burn_);
+        token_.approve(address(ics20_), type(uint256).max);
+    }
+
+    function send(uint256 amount, string calldata clientId) external returns (uint64) {
+        return ics20.sendTransfer(
+            IICS20TransferMsgs.SendTransferMsg({
+                denom: address(token),
+                amount: amount,
+                receiver: "g1receiver",
+                sourceClient: clientId,
+                destPort: "transfer",
+                timeoutTimestamp: uint64(block.timestamp + 600),
+                memo: ""
+            })
+        );
+    }
+
+    function supportsInterface(bytes4) external view returns (bool) {
+        if (burn) {
+            while (true) { }
+        }
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            mstore(0, 1)
+            return(0, 4000)
+        }
     }
 }
 

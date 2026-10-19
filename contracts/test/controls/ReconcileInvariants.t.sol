@@ -575,6 +575,7 @@ contract ReconcileHandler is Test {
                 if (items[k].action != 5) {
                     settledCount[keccak256(abi.encode(c, items[k].sequence))]++;
                     settledAction[keccak256(abi.encode(c, items[k].sequence))] = items[k].action;
+                    _snapNotices(c, items[k].sequence);
                 }
                 // a refund a forged success ack hid, owed again: the compromise loss reconciliation recognizes
                 if (items[k].action == 1) {
@@ -592,6 +593,22 @@ contract ReconcileHandler is Test {
             _snapshotNew();
         }
         return true;
+    }
+
+    /// @notice The contract sender's callback history at the moment its packet is settled (a settlement delivers no
+    /// callback itself): a callback delivered before stays the only one allowed; none, and only the settlement's
+    /// terminal kind may follow.
+    mapping(uint256 => bool) public snapped;
+    mapping(uint256 => uint256) public kindsAtSettle;
+
+    function _snapNotices(string memory c, uint64 seq) internal {
+        uint256 j = _packetIndex(c, seq);
+        bytes32 k = keccak256(abi.encode(c, seq));
+        address sender = ghost[j].sender;
+        if (sender == address(adapter)) kindsAtSettle[j] = adapter.terminalKinds(k);
+        else if (sender == address(reentrant)) kindsAtSettle[j] = reentrant.terminalKinds(k);
+        else return;
+        snapped[j] = true;
     }
 
     function _packetIndex(string memory c, uint64 seq) internal view returns (uint256) {
@@ -1700,6 +1717,59 @@ contract ReconcileHandler is Test {
         _checkpoint();
     }
 
+    /// @notice r28: a forged success notification refused (kept), then an action 1 refund; anyone retries the stale
+    /// success afterwards: refused (the settlement superseded it); the refund's notification is delivered once.
+    function staleSuccessRetry(bool announce) public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 62 || !_ensureOpen()) return;
+        for (uint256 d = 0; d < 20; d++) {
+            (uint64 head, uint64 tail) = ctl.refundQueue(_live(), tokens[0]);
+            if (head == tail) break;
+            _skip(1 days);
+            try ctl.claim(_live(), tokens[0], 20) { } catch { }
+        }
+        uint256 amount = 10;
+        ERC20Mock(tokens[0]).mint(address(adapter), amount);
+        minted[address(adapter)][tokens[0]] += amount;
+        _limits(tokens[0]);
+        vm.recordLogs();
+        try adapter.send(amount, _live()) { }
+        catch {
+            return;
+        }
+        if (!_record(false, address(adapter), tokens[0], amount)) return;
+        uint256 i = packets.length - 1;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        adapter.setRefuse(true);
+        this.relay(i, true, false); // a forged success, refused: kept
+        adapter.setRefuse(false);
+        bytes32 k = keccak256(abi.encode(pkt.sourceClient, pkt.sequence));
+        if (adapter.terminals(k) != 0 || !_replace(true)) return;
+        for (uint256 c = 0; c + 1 < clients.length; c++) {
+            _prepare(clients[c], 1000);
+        }
+        _liveClient().setStatus(false, false);
+        if (!_prove(i, 0)) return;
+        T.SettleItem memory it = _action(i);
+        if (!_executeAll(_one(_decide(S.KIND_SETTLE, P.settle1(pkt.sourceClient, it.sequence, it.action, it.amount)))))
+        {
+            return;
+        }
+        bool refused;
+        try ctl.retryNotification(
+            pkt.sourceClient, pkt.sequence, _successNotice(pkt, bytes("{\"result\":\"AQ==\"}")), 0
+        ) { }
+        catch {
+            refused = true;
+        }
+        if (announce && ctl.sendRecord(pkt.sourceClient, pkt.sequence).payment == T.Payment.Claimed) {
+            try ctl.notifySettled(pkt, "", 0) { } catch { }
+        }
+        if (refused && adapter.terminals(k) <= 1 && adapter.terminalKinds(k) != 1) ok["staleSuccessRetryRefused"]++;
+        _checkpoint();
+    }
+
     /// @notice A contract sender refuses its transport success notification (kept); before any settlement anyone
     /// retries it with its bytes: delivered once, a second retry refused. Then the route is replaced and the record
     /// settled as delivered (action 3): the settlement's notification is refused too.
@@ -2788,7 +2858,7 @@ contract ReconcileHandler is Test {
     /// its own external call (`sweepStep`), so its memory is released before the next: a single frame holding every
     /// composite's allocations outgrew the EVM's 32 MiB memory limit and halted (out of gas, a bare revert).
     function sweep() external {
-        for (uint256 k = 0; k < 54; k++) {
+        for (uint256 k = 0; k < 55; k++) {
             this.sweepStep(k);
         }
     }
@@ -3072,6 +3142,7 @@ contract ReconcileHandler is Test {
         }
         if (k == 50 && ok["noticeSuccessThenRefund"] == 0) contradictoryNotices(true);
         if (k == 51 && ok["noticeRefundThenSuccess"] == 0) contradictoryNotices(false);
+        if (k == 54 && ok["staleSuccessRetryRefused"] == 0) staleSuccessRetry(true);
         if (k == 53 && ok["successRetryOnce"] == 0) successRetry();
         if (k == 52 && ok["delayedPayNoticeOnce"] == 0) delayedPayNotice();
     }
@@ -3215,10 +3286,14 @@ contract ReconcileInvariantsTest is ControlsFixture {
         if (n == 0) return;
         (bool delivered, bool forgedSuccess, bool forgedRefund, bool relayed,,, uint256 amount) = h.ghost(i);
         uint256 allowed;
-        if (relayed && !h.ignoredRelay(i)) allowed |= (forgedSuccess || (delivered && !forgedRefund)) ? 1 : 2;
-        uint8 action = h.settledAction(nk);
-        if (action == 1) allowed |= 2;
-        else if (action != 0) allowed |= 1;
+        if (h.snapped(i)) {
+            // settled: a callback delivered before the settlement stays the only one; none, and only the
+            // settlement's terminal kind (action 1 a refund, 2 to 4 a success)
+            uint256 pre = h.kindsAtSettle(i);
+            allowed = pre != 0 ? pre : (h.settledAction(nk) == 1 ? 2 : 1);
+        } else if (relayed && !h.ignoredRelay(i)) {
+            allowed = (forgedSuccess || (delivered && !forgedRefund)) ? 1 : 2;
+        }
         assertEq(kinds & ~allowed, 0, "a terminal callback of the kind the outcomes allow");
         if (kinds & 2 != 0) assertEq(rec.refunded, amount, "a refund announced only once paid in full");
     }
@@ -3368,6 +3443,34 @@ contract ReconcileInvariantsTest is ControlsFixture {
         assertEq(h.ok("noticeRefundThenSuccess"), 1, "a delivered refund, then a delivery");
         h.delayedPayNotice();
         assertEq(h.ok("delayedPayNoticeOnce"), 1, "a refund paid late, notified once");
+        this.checkpoint();
+    }
+
+    /// @notice r28: after an action 1 refund settled a packet whose success notification was never delivered, only the
+    /// refund's kind may follow; the stale success retried through the controls is refused, and one delivered anyway
+    /// (the sender called as the transfer app) fails the oracle at once.
+    function test_r28_staleSuccessAfterRefund_refused_andProbe() public {
+        h.staleSuccessRetry(false); // the refund settled, its notification not delivered yet
+        assertEq(h.ok("staleSuccessRetryRefused"), 1, "the stale success refused after the refund's settlement");
+        this.checkpoint();
+        uint256 i = h.packetCount() - 1;
+        IICS26RouterMsgs.Packet memory pkt = h.packet(i);
+        SenderAdapter ad = SenderAdapter(h.adapterAddress());
+        assertTrue(h.snapped(i));
+        assertEq(ad.terminals(keccak256(abi.encode(pkt.sourceClient, pkt.sequence))), 0, "nothing delivered yet");
+        vm.prank(address(ics20));
+        ad.onAckPacket(
+            true,
+            IIBCAppCallbacks.OnAcknowledgementPacketCallback(
+                pkt.sourceClient,
+                pkt.destClient,
+                pkt.sequence,
+                pkt.payloads[0],
+                bytes("{\"result\":\"AQ==\"}"),
+                address(0)
+            )
+        );
+        vm.expectRevert(bytes("a terminal callback of the kind the outcomes allow: 1 != 0"));
         this.checkpoint();
     }
 
@@ -3879,7 +3982,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[85] memory names = [
+        string[86] memory names = [
+            "staleSuccessRetryRefused",
             "successRetryOnce",
             "noticeSuccessThenRefund",
             "noticeRefundThenSuccess",
@@ -3971,7 +4075,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[68] memory required = [
+        string[69] memory required = [
+            "staleSuccessRetryRefused",
             "successRetryOnce",
             "noticeSuccessThenRefund",
             "noticeRefundThenSuccess",
