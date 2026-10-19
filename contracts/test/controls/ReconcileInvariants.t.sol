@@ -174,6 +174,7 @@ contract ReconcileHandler is Test {
     uint256 internal heldBack; // 1 + the index of a forged receive governance leaves out of its reconciliation //
     // unique client ids for the split steps and the recovery attempts
     uint64[] internal pending; // decisions recorded by the split actions, executed by executePending
+    mapping(bytes32 => bool) internal heldDeferred; // (epoch, seq) of a kind 12 the refunds hold deferred
 
     string[] public clients; // every client id of the route, in order; the last is the live one
     uint256 public calls;
@@ -504,6 +505,47 @@ contract ReconcileHandler is Test {
         if (admin.decision(admin.epoch(), seq).state != S.PENDING) return 0;
     }
 
+    /// @notice Executes decision `s` of the current epoch, checking what kind 12 may do at that moment: a
+    /// refund-paying kind 12 under its route's refunds hold must be deferred (it stays pending), and one that pays a
+    /// refund must find every incident prepared (invariant 5: the gate is kind 12's own, so it is checked here, at
+    /// the payment, never on a later `claimParked`). Whether the call succeeded.
+    function _execute(uint64 s) internal returns (bool okx) {
+        uint32 ep = admin.epoch();
+        IIBCAdmin.Decision memory dec = admin.decision(ep, s);
+        string memory c;
+        T.SettleItem[] memory items;
+        uint256[] memory before;
+        bool paying;
+        if (dec.kind == S.KIND_SETTLE && dec.state == S.PENDING) {
+            (c, items) = abi.decode(dec.params, (string, T.SettleItem[]));
+            before = new uint256[](items.length);
+            for (uint256 k = 0; k < items.length; k++) {
+                if (items[k].action != 1) continue;
+                if (items[k].amount != 0) paying = true;
+                before[k] = ctl.sendRecord(c, items[k].sequence).refunded;
+            }
+        }
+        bool held = paying && ctl.refundsHeld(c);
+        bool prepared = allPrepared();
+        bytes32 key = keccak256(abi.encode(ep, s));
+        bytes memory r;
+        (okx, r) = address(admin).call(abi.encodeCall(admin.execute, (s)));
+        assertFalse(okx && held, "a refund-paying kind 12 executed under the refunds hold");
+        if (held && r.length == 4 && bytes4(r) == IIBCAdmin.Deferred.selector) {
+            assertEq(admin.decision(ep, s).state, S.PENDING, "a held kind 12 stays pending");
+            heldDeferred[key] = true;
+            ok["settleHeldDeferred"]++;
+        }
+        if (okx && dec.kind == S.KIND_SETTLE && admin.decision(ep, s).state == S.EXECUTED) {
+            for (uint256 k = 0; k < items.length; k++) {
+                if (items[k].action == 1 && ctl.sendRecord(c, items[k].sequence).refunded > before[k]) {
+                    assertTrue(prepared, "a kind 12 refund before the preparation");
+                }
+            }
+            if (heldDeferred[key]) ok["settleDeferredThenExecuted"]++;
+        }
+    }
+
     /// @notice Matures and executes recorded decisions, in order; whether all executed.
     function _executeAll(uint64[] memory seqs) internal returns (bool all) {
         _skip(7 days + 1);
@@ -515,7 +557,7 @@ contract ReconcileHandler is Test {
                 continue;
             }
             IIBCAdmin.Decision memory dec = admin.decision(ep, seqs[i]); // its parameters, before they are cleared
-            try admin.execute(seqs[i]) { } catch { }
+            _execute(seqs[i]);
             if (!_noteExecuted(ep, seqs[i], dec)) all = false;
         }
         _checkpoint();
@@ -1301,16 +1343,17 @@ contract ReconcileHandler is Test {
             try admin.cancelRecovery() { } catch { }
             (, openedAt,,) = admin.recovery();
         }
+        // the refunds flags first: a refund-paying kind 12 waits (stays pending) under them
+        for (uint256 g = 0; g < 4; g++) {
+            vm.prank(G[g]);
+            try ctl.clearRefundsFlag(_live()) { } catch { }
+        }
         for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
             if (_continue(true)) ok["continueReopen"]++;
         }
         if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
             _reconcile(0, true);
             _reopen();
-        }
-        for (uint256 g = 0; g < 4; g++) {
-            vm.prank(G[g]);
-            try ctl.clearRefundsFlag(_live()) { } catch { }
         }
         _liveClient().setStatus(false, false);
         return !ctl.routeClosed(_live());
@@ -1538,6 +1581,8 @@ contract ReconcileHandler is Test {
         _skip(7 days + 1);
         uint32 ep = admin.epoch();
         uint256 n;
+        uint64[] memory keep = new uint64[](pending.length);
+        uint256 kept;
         for (uint256 k = 0; k < pending.length; k++) {
             uint64 s = pending[k];
             if (admin.decision(ep, s).state != S.PENDING) continue;
@@ -1546,12 +1591,78 @@ contract ReconcileHandler is Test {
             // are tested separately)
             if (admin.decision(ep, s).kind == S.KIND_REOPEN) _reconcile(0, true);
             IIBCAdmin.Decision memory dec = admin.decision(ep, s);
-            try admin.execute(s) { } catch { }
+            _execute(s);
             if (_noteExecuted(ep, s, dec)) n++;
+            // a decision still pending (a held kind 12, deferred) is kept: the same decision runs once it may
+            else if (admin.decision(ep, s).state == S.PENDING) keep[kept++] = s;
             _checkpoint();
         }
         delete pending;
+        for (uint256 k = 0; k < kept; k++) {
+            pending.push(keep[k]);
+        }
         if (n != 0) ok["executePending"]++;
+    }
+
+    // ------------------------------------------------------------------------------- round 25 transitions --
+
+    /// @notice A refund-paying kind 12 recorded, then a refunds flag: the decision is deferred and stays pending;
+    /// once the flag clears, the same decision executes and pays.
+    function heldSettlement() public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 62 || !_ensureOpen()) return;
+        if (!_send(alice, tokens[0], 10, false)) return; // never delivered, outstanding
+        uint256 i = packets.length - 1;
+        if (!_replace(true)) return;
+        for (uint256 k = 0; k + 1 < clients.length; k++) {
+            _prepare(clients[k], 1000);
+        }
+        _liveClient().setStatus(false, false);
+        if (!_prove(i, 0)) return;
+        T.SettleItem memory it = _action(i);
+        uint64 s = _decide(S.KIND_SETTLE, P.settle1(packets[i].sourceClient, it.sequence, it.action, it.amount));
+        if (s == 0) return;
+        vm.prank(G[0]);
+        ctl.setRefundsFlag(_live());
+        _skip(7 days + 1);
+        uint32 ep = admin.epoch();
+        IIBCAdmin.Decision memory dec = admin.decision(ep, s);
+        _execute(s); // deferred: pending
+        _checkpoint();
+        vm.prank(G[0]);
+        ctl.clearRefundsFlag(_live());
+        _execute(s); // the same decision, now
+        _noteExecuted(ep, s, dec);
+        _checkpoint();
+    }
+
+    /// @notice A refund kind 12 settled while its incident is unprepared parks; with every record settled the route
+    /// reopens without any preparation, and the parked refund is then claimed (legitimately: the preparation gate is
+    /// kind 12's own).
+    function parkedAfterUnpreparedReopen() public {
+        calls++;
+        _ratchet();
+        if (clients.length >= 61 || !_ensureOpen()) return;
+        if (!_replace(true) || !_reopen()) return; // a fresh live client, the route open on it
+        if (!_send(alice, tokens[0], 10, false)) return;
+        uint256 i = packets.length - 1;
+        this.relay(i, true, false); // a forged success ack: the refund hidden
+        if (!_replace(true)) return; // retired from 0: its incident unprepared
+        _liveClient().setStatus(false, false);
+        if (!_prove(i, 0)) return;
+        IICS26RouterMsgs.Packet memory pkt = packets[i];
+        T.SettleItem memory it = _action(i);
+        if (!_executeAll(_one(_decide(S.KIND_SETTLE, P.settle1(pkt.sourceClient, it.sequence, it.action, it.amount)))))
+        {
+            return;
+        }
+        if (ctl.sendRecord(pkt.sourceClient, pkt.sequence).payment != T.Payment.Parked) return;
+        if (!_reopenOnly()) return; // no reconciliation, so no preparation
+        try ctl.claimParked(pkt.sourceClient, pkt.sequence, 300_000) returns (uint256 got) {
+            if (got == it.amount) ok["parkedAfterUnpreparedReopen"]++;
+        } catch { }
+        _checkpoint();
     }
 
     // ---------------------------------------------------------------------------------- more adversaries --
@@ -2518,181 +2629,291 @@ contract ReconcileHandler is Test {
 
     // ----------------------------------------------------------------------------------- coverage sweep --
 
-    /// @notice Runs each required composite once after the random sequence when the sequence did not.
+    /// @notice Runs each required composite once after the random sequence when the sequence did not. Each step is
+    /// its own external call (`sweepStep`), so its memory is released before the next: a single frame holding every
+    /// composite's allocations outgrew the EVM's 32 MiB memory limit and halted (out of gas, a bare revert).
     function sweep() external {
-        if (ok["deliveredVoidHeld"] == 0) deliveredVoidSibling(false);
-        if (ok["deliveredVoidHeldReversed"] == 0) deliveredVoidSibling(true);
-        if (ok["noticeTimedOut"] == 0 && clients.length < 64 && _ensureOpen() && _replace(true)) {
-            noticeStep((uint256(2) << 16) | (admin.epoch() - 2)); // the latest epoch's notice, timed out
+        for (uint256 k = 0; k < 50; k++) {
+            this.sweepStep(k);
         }
-        if (ok["noticeAcked"] == 0 && clients.length < 64 && _ensureOpen() && _replace(true)) {
-            noticeStep(admin.epoch() - 2); // the latest epoch's notice, switched
+    }
+
+    function sweepStep(uint256 k) external {
+        if (k == 0) {
+            if (ok["deliveredVoidHeld"] == 0) deliveredVoidSibling(false);
         }
-        if (ok["noticeResentAfterAck"] == 0) {
-            // an acknowledged notice re-sent (then answered by an error ack, which unmarks nothing)
-            for (uint32 e = 2; e <= admin.epoch(); e++) {
-                if (noticeAckedGhost[e]) {
-                    noticeStep((uint256(1) << 16) | (e - 2));
-                    break;
+        if (k == 1) {
+            if (ok["deliveredVoidHeldReversed"] == 0) deliveredVoidSibling(true);
+        }
+        if (k == 2) {
+            if (ok["noticeTimedOut"] == 0 && clients.length < 64 && _ensureOpen() && _replace(true)) {
+                noticeStep((uint256(2) << 16) | (admin.epoch() - 2)); // the latest epoch's notice, timed out
+            }
+        }
+        if (k == 3) {
+            if (ok["noticeAcked"] == 0 && clients.length < 64 && _ensureOpen() && _replace(true)) {
+                noticeStep(admin.epoch() - 2); // the latest epoch's notice, switched
+            }
+        }
+        if (k == 4) {
+            if (ok["settleDeferredThenExecuted"] == 0) heldSettlement();
+        }
+        if (k == 5) {
+            if (ok["parkedAfterUnpreparedReopen"] == 0) parkedAfterUnpreparedReopen();
+        }
+        if (k == 6) {
+            if (ok["noticeResentAfterAck"] == 0) {
+                // an acknowledged notice re-sent (then answered by an error ack, which unmarks nothing)
+                for (uint32 e = 2; e <= admin.epoch(); e++) {
+                    if (noticeAckedGhost[e]) {
+                        noticeStep((uint256(1) << 16) | (e - 2));
+                        break;
+                    }
                 }
             }
         }
-        if (ok["noticeResentOld"] == 0) {
-            for (uint256 k = 0; k < 2 && admin.epoch() < 3 && clients.length < 64 && _ensureOpen(); k++) {
-                _replace(true);
+        if (k == 7) {
+            if (ok["noticeResentOld"] == 0) {
+                for (uint256 k = 0; k < 2 && admin.epoch() < 3 && clients.length < 64 && _ensureOpen(); k++) {
+                    _replace(true);
+                }
+                if (admin.epoch() >= 3) noticeStep(uint256(1) << 16); // epoch 2's, a newer one current
             }
-            if (admin.epoch() >= 3) noticeStep(uint256(1) << 16); // epoch 2's, a newer one current
         }
-        if (ok["preparePartial"] == 0 && _ensureOpen() && clients.length < 64) {
-            // two successes processed, the route replaced from 0, then a batch of one: partial, then the rest
-            if (_send(alice, tokens[0], 5, true) && _send(alice, tokens[0], 6, true)) {
-                this.relay(packets.length - 2, false, false);
-                this.relay(packets.length - 1, false, false);
-                string memory c = packets[packets.length - 1].sourceClient;
+        if (k == 8) {
+            if (ok["preparePartial"] == 0 && _ensureOpen() && clients.length < 64) {
+                // two successes processed, the route replaced from 0, then a batch of one: partial, then the rest
+                if (_send(alice, tokens[0], 5, true) && _send(alice, tokens[0], 6, true)) {
+                    this.relay(packets.length - 2, false, false);
+                    this.relay(packets.length - 1, false, false);
+                    string memory c = packets[packets.length - 1].sourceClient;
+                    if (_replace(true)) {
+                        _prepare(c, 1);
+                        _checkpoint();
+                        _prepare(c, 1000);
+                    }
+                }
+                _ensureOpen();
+            }
+        }
+        if (k == 9) {
+            if ((ok["prepared"] == 0 || ok["proveAndPay"] == 0) && _ensureOpen() && clients.length < 64) {
+                if (_send(alice, tokens[0], 5, false)) {
+                    uint256 i = packets.length - 1;
+                    this.relay(i, true, false); // a forged success ack: suspect once the client is retired
+                    string memory c = packets[i].sourceClient;
+                    if (_replace(true)) {
+                        this.proveAndPay(i, 0); // proven and settled before the preparation: parked
+                        _prepare(c, 1000);
+                    }
+                }
+                _ensureOpen();
+            }
+        }
+        if (k == 10) {
+            if (ok["voidReproveHeld"] == 0) voidAndReprove();
+        }
+        if (k == 11) {
+            if (ok["tightenDelivery"] == 0) tightenAtRecording(0, false);
+        }
+        if (k == 12) {
+            if (ok["tightenDrain"] == 0) tightenAtRecording(1, true);
+        }
+        if (k == 13) {
+            if (ok["tightenAfterHook"] == 0 || ok["tightenInHookRefused"] == 0) tightenAtRecording(2, false);
+        }
+        if (k == 14) {
+            if (ok["retiredTimeout"] == 0 && _ensureOpen() && clients.length < 64) {
+                _send(alice, tokens[0], 3, false);
+                if (_replace(true)) retiredTimeout(packets.length - 1);
+                _ensureOpen();
+            }
+        }
+        if (k == 15) {
+            if (ok["twinInitialHeld"] == 0) twinHiddenInitial(false, false);
+        }
+        if (k == 16) {
+            if (ok["twinInitialHeldReversed"] == 0) twinHiddenInitial(true, false);
+        }
+        if (k == 17) {
+            if (ok["twinInitialHeldSeparate"] == 0) twinHiddenInitial(false, true);
+        }
+        if (k == 18) {
+            if (ok["twinRefundHeld"] == 0) this.twinEligibleRefunds();
+        }
+        if (k == 19) {
+            if (ok["replaceInDipRefunds"] == 0) replaceDuringDip(true);
+        }
+        if (k == 20) {
+            if (ok["replaceInDipRoute"] == 0) replaceDuringDip(false);
+        }
+        if (k == 21) {
+            if (ok["olderRefundHeld"] == 0) this.partialBacking();
+        }
+        if (k == 22) {
+            if (ok["partialBackingHeld"] == 0) this.partialBacking();
+        }
+        if (k == 23) {
+            if (ok["lossResolvedIncidentSealed"] == 0) this.lossResolvedIncidentDuringReopening();
+        }
+        if (k == 24) {
+            if (ok["continueNonTerminal"] == 0) {
+                _startLongReopening();
+                _ensureOpen();
+            }
+        }
+        if (k == 25) {
+            if (ok["prematureReopenRefused"] == 0 && _ensureOpen() && clients.length < 64) {
+                _send(alice, tokens[0], 4, false); // outstanding: an open record
+                if (_replace(true)) prematureReopen();
+                _ensureOpen();
+            }
+        }
+        if (k == 26) {
+            if (ok["lateOnSettledIgnored"] == 0 && _ensureOpen() && clients.length < 64) {
+                _send(alice, tokens[0], 3, false);
+                _send(alice, tokens[0], 2, true);
+                uint256 a = packets.length - 2;
                 if (_replace(true)) {
-                    _prepare(c, 1);
-                    _checkpoint();
-                    _prepare(c, 1000);
+                    _reconcile(0, true); // both settled while outstanding (a refund, a delivery)
+                    lateOnSettled(a, true);
+                    lateOnSettled(a + 1, false);
                 }
+                _ensureOpen();
             }
-            _ensureOpen();
         }
-        if ((ok["prepared"] == 0 || ok["proveAndPay"] == 0) && _ensureOpen() && clients.length < 64) {
-            if (_send(alice, tokens[0], 5, false)) {
-                uint256 i = packets.length - 1;
-                this.relay(i, true, false); // a forged success ack: suspect once the client is retired
-                string memory c = packets[i].sourceClient;
+        if (k == 27) {
+            if (ok["provenAckReplaced"] == 0) this.forgedSuccessAck(9);
+        }
+        if (k == 28) {
+            if (ok["approvalWithdrawn"] == 0) this.withdrawApproval();
+        }
+        if (k == 29) {
+            if (ok["retiredAck"] == 0 && _ensureOpen() && clients.length < 64) {
+                _send(alice, tokens[0], 5, true);
+                _send(alice, tokens[0], 6, false);
                 if (_replace(true)) {
-                    this.proveAndPay(i, 0); // proven and settled before the preparation: parked
-                    _prepare(c, 1000);
+                    this.retiredAck(packets.length - 2);
+                    this.retiredAck(packets.length - 1);
                 }
+                _ensureOpen();
             }
-            _ensureOpen();
         }
-        if (ok["voidReproveHeld"] == 0) voidAndReprove();
-        if (ok["tightenDelivery"] == 0) tightenAtRecording(0, false);
-        if (ok["tightenDrain"] == 0) tightenAtRecording(1, true);
-        if (ok["tightenAfterHook"] == 0 || ok["tightenInHookRefused"] == 0) tightenAtRecording(2, false);
-        if (ok["retiredTimeout"] == 0 && _ensureOpen() && clients.length < 64) {
-            _send(alice, tokens[0], 3, false);
-            if (_replace(true)) retiredTimeout(packets.length - 1);
-            _ensureOpen();
+        if (k == 30) {
+            if (ok["settleExpiredRefused"] == 0 || ok["settleStaleGenRefused"] == 0) staleSettlements(0x1);
         }
-        if (ok["twinInitialHeld"] == 0) twinHiddenInitial(false, false);
-        if (ok["twinInitialHeldReversed"] == 0) twinHiddenInitial(true, false);
-        if (ok["twinInitialHeldSeparate"] == 0) twinHiddenInitial(false, true);
-        if (ok["twinRefundHeld"] == 0) this.twinEligibleRefunds();
-        if (ok["replaceInDipRefunds"] == 0) replaceDuringDip(true);
-        if (ok["replaceInDipRoute"] == 0) replaceDuringDip(false);
-        if (ok["olderRefundHeld"] == 0) this.partialBacking();
-        if (ok["partialBackingHeld"] == 0) this.partialBacking();
-        if (ok["lossResolvedIncidentSealed"] == 0) this.lossResolvedIncidentDuringReopening();
-        if (ok["continueNonTerminal"] == 0) {
-            _startLongReopening();
-            _ensureOpen();
-        }
-        if (ok["prematureReopenRefused"] == 0 && _ensureOpen() && clients.length < 64) {
-            _send(alice, tokens[0], 4, false); // outstanding: an open record
-            if (_replace(true)) prematureReopen();
-            _ensureOpen();
-        }
-        if (ok["lateOnSettledIgnored"] == 0 && _ensureOpen() && clients.length < 64) {
-            _send(alice, tokens[0], 3, false);
-            _send(alice, tokens[0], 2, true);
-            uint256 a = packets.length - 2;
-            if (_replace(true)) {
-                _reconcile(0, true); // both settled while outstanding (a refund, a delivery)
-                lateOnSettled(a, true);
-                lateOnSettled(a + 1, false);
+        if (k == 31) {
+            if (ok["adapterRefused"] == 0) {
+                _ensureOpen();
+                this.adapterRefuses(7);
             }
-            _ensureOpen();
         }
-        if (ok["provenAckReplaced"] == 0) this.forgedSuccessAck(9);
-        if (ok["approvalWithdrawn"] == 0) this.withdrawApproval();
-        if (ok["retiredAck"] == 0 && _ensureOpen() && clients.length < 64) {
-            _send(alice, tokens[0], 5, true);
-            _send(alice, tokens[0], 6, false);
-            if (_replace(true)) {
-                this.retiredAck(packets.length - 2);
-                this.retiredAck(packets.length - 1);
+        if (k == 32) {
+            if (ok["sendVoucher"] == 0) {
+                _ensureOpen();
+                if (ugnot.balanceOf(bob) == 0) this.receiveVoucher(50, false);
+                this.sendVoucher(3, true);
             }
-            _ensureOpen();
         }
-        if (ok["settleExpiredRefused"] == 0 || ok["settleStaleGenRefused"] == 0) staleSettlements(0x1);
-        if (ok["adapterRefused"] == 0) {
-            _ensureOpen();
-            this.adapterRefuses(7);
+        if (k == 33) {
+            if (ok["authoritySuspended"] == 0) this.recoverWithAuthorityAttempts();
         }
-        if (ok["sendVoucher"] == 0) {
-            _ensureOpen();
-            if (ugnot.balanceOf(bob) == 0) this.receiveVoucher(50, false);
-            this.sendVoucher(3, true);
-        }
-        if (ok["authoritySuspended"] == 0) this.recoverWithAuthorityAttempts();
-        if (ok["lossDuringReopeningRefused"] == 0) {
-            _ensureOpen();
-            this.lossDuringReopening(3);
-            _ensureOpen();
-        }
-        if (ok["abortInjected"] == 0) {
-            this.faultInjectedAbort();
-            _ensureOpen();
-        }
-        if (ok["startReplacement"] == 0 || ok["executePending"] == 0) {
-            _ensureOpen();
-            this.startReplacement(true);
-            this.executePending();
-        }
-        if (ok["proveOne"] == 0 || ok["decideSettle"] == 0 || ok["startReopen"] == 0) {
-            _ensureOpen();
-            if (!ctl.routeClosed(_live()) && clients.length < 64) {
-                _send(alice, tokens[0], 5, false);
-                _replace(true);
+        if (k == 34) {
+            if (ok["lossDuringReopeningRefused"] == 0) {
+                _ensureOpen();
+                this.lossDuringReopening(3);
+                _ensureOpen();
             }
-            for (uint256 i = 0; i < packets.length && ok["proveOne"] == 0; i++) {
-                this.proveOne(i, 0);
+        }
+        if (k == 35) {
+            if (ok["abortInjected"] == 0) {
+                this.faultInjectedAbort();
+                _ensureOpen();
             }
-            for (uint256 i = 0; i < packets.length && ok["decideSettle"] == 0; i++) {
-                if (!ctl.isRetired(packets[i].sourceClient)) continue;
-                T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
-                if (rec.settlement != 0) continue;
-                if (_prove(i, 0)) this.decideSettle(i);
+        }
+        if (k == 36) {
+            if (ok["startReplacement"] == 0 || ok["executePending"] == 0) {
+                _ensureOpen();
+                this.startReplacement(true);
+                this.executePending();
             }
-            this.executePending();
-            this.startReopen();
-            this.executePending();
         }
-        if (
-            ok["mismatchRefused"] == 0 || ok["settleStaleRefused"] == 0 || ok["replayRefused"] == 0
-                || ok["recoveryCancelled"] == 0
-        ) {
-            adversarialRound(0x2);
+        if (k == 37) {
+            if (ok["proveOne"] == 0 || ok["decideSettle"] == 0 || ok["startReopen"] == 0) {
+                _ensureOpen();
+                if (!ctl.routeClosed(_live()) && clients.length < 64) {
+                    _send(alice, tokens[0], 5, false);
+                    _replace(true);
+                }
+                for (uint256 i = 0; i < packets.length && ok["proveOne"] == 0; i++) {
+                    this.proveOne(i, 0);
+                }
+                for (uint256 i = 0; i < packets.length && ok["decideSettle"] == 0; i++) {
+                    if (!ctl.isRetired(packets[i].sourceClient)) continue;
+                    T.SendRecord memory rec = ctl.sendRecord(packets[i].sourceClient, packets[i].sequence);
+                    if (rec.settlement != 0) continue;
+                    if (_prove(i, 0)) this.decideSettle(i);
+                }
+                this.executePending();
+                this.startReopen();
+                this.executePending();
+            }
         }
-        if (ok["senderReentryRefused"] == 0) {
-            _ensureOpen();
-            this.senderReentry(5);
+        if (k == 38) {
+            if (
+                ok["mismatchRefused"] == 0 || ok["settleStaleRefused"] == 0 || ok["replayRefused"] == 0
+                    || ok["recoveryCancelled"] == 0
+            ) {
+                adversarialRound(0x2);
+            }
         }
-        if (ok["receiveVoucher"] == 0) {
-            _ensureOpen();
-            this.receiveVoucher(10, true);
+        if (k == 39) {
+            if (ok["senderReentryRefused"] == 0) {
+                _ensureOpen();
+                this.senderReentry(5);
+            }
         }
-        if (ok["transportRound"] == 0) transportRound(0xA5A5A5);
-        if (ok["lateLoss"] == 0) lateLossScenario();
-        if (ok["replace"] == 0 && clients.length < 6 && _replace(true)) ok["replace"]++;
-        if (ok["reconcile"] == 0 && _reconcile(0, true)) ok["reconcile"]++;
-        if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) _reopen();
-        if (ok["busyGovernance"] == 0) {
-            _ensureOpen();
-            this.busyGovernance(3);
+        if (k == 40) {
+            if (ok["receiveVoucher"] == 0) {
+                _ensureOpen();
+                this.receiveVoucher(10, true);
+            }
         }
-        if (ok["replaceDuringReopening"] == 0) this.replaceDuringReopening();
-        // the aborted reopening reconciled and reopened again: its deficits need the continuation
-        if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
-            _reconcile(0, true);
-            _reopen();
+        if (k == 41) {
+            if (ok["transportRound"] == 0) transportRound(0xA5A5A5);
         }
-        for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
-            if (_continue(true)) ok["continueReopen"]++;
+        if (k == 42) {
+            if (ok["lateLoss"] == 0) lateLossScenario();
+        }
+        if (k == 43) {
+            if (ok["replace"] == 0 && clients.length < 6 && _replace(true)) ok["replace"]++;
+        }
+        if (k == 44) {
+            if (ok["reconcile"] == 0 && _reconcile(0, true)) ok["reconcile"]++;
+        }
+        if (k == 45) {
+            if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) _reopen();
+        }
+        if (k == 46) {
+            if (ok["busyGovernance"] == 0) {
+                _ensureOpen();
+                this.busyGovernance(3);
+            }
+        }
+        if (k == 47) {
+            if (ok["replaceDuringReopening"] == 0) this.replaceDuringReopening();
+        }
+        if (k == 48) {
+            // the aborted reopening reconciled and reopened again: its deficits need the continuation
+            if (ctl.routeClosed(_live()) && !ctl.routeReopening(_live())) {
+                _reconcile(0, true);
+                _reopen();
+            }
+        }
+        if (k == 49) {
+            for (uint256 i = 0; i < 32 && ctl.routeReopening(_live()); i++) {
+                if (_continue(true)) ok["continueReopen"]++;
+            }
         }
     }
 }
@@ -2715,7 +2936,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
         vm.prank(alice);
         usdc.approve(address(ics20), type(uint256).max);
         targetContract(address(h));
-        bytes4[] memory sel = new bytes4[](4);
+        bytes4[] memory sel = new bytes4[](5);
+        sel[4] = ReconcileHandler.sweepStep.selector;
         sel[0] = ReconcileHandler.sweep.selector;
         sel[1] = ReconcileHandler.setVoucher.selector;
         sel[2] = ReconcileHandler.setChecker.selector;
@@ -2846,6 +3068,116 @@ contract ReconcileInvariantsTest is ControlsFixture {
             }
         }
         revert("the burned bit not found");
+    }
+
+    /// @notice The coordinator's clean-rebuild failure on 2c70d3d (fuzz seed 0xfc4e86bf…8e93), replayed call by call
+    /// with the invariants checked after each, then the coverage sweep.
+    function test_r25_replay_cleanRebuildFailure() public {
+        h.reopen();
+        this.checkpoint();
+        h.replaceDuringReopening();
+        this.checkpoint();
+        h.busyGovernance(
+            uint256(
+                115_792_089_237_316_195_423_570_985_008_687_907_853_269_984_665_640_564_039_457_584_007_913_129_639_933
+            )
+        );
+        this.checkpoint();
+        h.relay(uint256(32), false, false);
+        this.checkpoint();
+        h.faultInjectedAbort();
+        this.checkpoint();
+        h.notify(uint256(8_636_187_912_294_515));
+        this.checkpoint();
+        h.startReplacement(false);
+        this.checkpoint();
+        h.warp(uint256(692_512));
+        this.checkpoint();
+        h.lateLoss(uint256(19_768_231));
+        this.checkpoint();
+        h.lossDuringReopening(uint256(2_224_416));
+        this.checkpoint();
+        h.faultInjectedAbort();
+        this.checkpoint();
+        h.warp(uint256(149_951_658_319_388_986_530_622_216_975_178_582_433_988_468_264_166_373_037_772));
+        this.checkpoint();
+        h.faultInjectedAbort();
+        this.checkpoint();
+        h.decideSettle(uint256(157_453_017_879_430_585_286_266_172_075_085_324));
+        this.checkpoint();
+        h.send(uint256(5), uint256(61), true);
+        this.checkpoint();
+        h.deliveredVoidSibling(false);
+        this.checkpoint();
+        h.adapterRefuses(uint256(163));
+        this.checkpoint();
+        h.senderReentry(uint256(2_152_384));
+        this.checkpoint();
+        h.executePending();
+        this.checkpoint();
+        h.replaceDuringReopening();
+        this.checkpoint();
+        h.staleSettlements(uint256(160));
+        this.checkpoint();
+        h.partialBacking();
+        this.checkpoint();
+        h.relay(uint256(2), false, false);
+        this.checkpoint();
+        h.retiredAck(uint256(60));
+        this.checkpoint();
+        h.twinHiddenInitial(true, false);
+        this.checkpoint();
+        h.proveAndPay(uint256(21_845), uint256(6_066_496));
+        this.checkpoint();
+        h.continueReopen();
+        this.checkpoint();
+        h.send(uint256(3_175_488), uint256(3_612_288), false);
+        this.checkpoint();
+        h.relay(uint256(10_319_846_207_007_369_954_805_338_036_812_263_194_609_957_516_740), false, false);
+        this.checkpoint();
+        h.noticeStep(uint256(27));
+        this.checkpoint();
+        h.retiredAck(uint256(270_723_296_102_775_939_709_059_890_702_615_238_863_132_279));
+        this.checkpoint();
+        h.partialBacking();
+        this.checkpoint();
+        h.replaceDuringReopening();
+        this.checkpoint();
+        h.sendVoucher(uint256(40_235_035_013_310_175_772_800_308_895_691_486_041_330_235_625_052_351_573), false);
+        this.checkpoint();
+        h.replaceDuringReopening();
+        this.checkpoint();
+        h.verifierEvent(uint256(23_637_647_358_220_070_651_070_582_291_733_490_496_670_002_561_914_238_478_985));
+        this.checkpoint();
+        h.lossDuringReopening(uint256(256));
+        this.checkpoint();
+        h.sendFromAdapter(uint256(50_136_283_919_348_177_303_259_887_566_592_923_932_150_404), false);
+        this.checkpoint();
+        h.twinEligibleRefunds();
+        this.checkpoint();
+        h.startReopen();
+        this.checkpoint();
+        h.proveAndPay(
+            uint256(2_762_516_273_420_225_237_108_168_775_886_929_350_853_832_956_525_705_958_095_059_060_309_064),
+            uint256(148_329_277_815_858_261_667_671_272_380_683_896_142)
+        );
+        this.checkpoint();
+        h.sweep();
+        this.checkpoint();
+    }
+
+    /// @notice r25 #1: a refunds flag left set before the coverage sweep. The sweep's reconciliation clears it first
+    /// (a refund-paying kind 12 waits under it), so every required scenario still completes.
+    function test_r25_1_refundsFlagBeforeTheSweep_coverageHolds() public {
+        h.send(0, 10, false);
+        h.replace(true);
+        h.refundsFlag(0, true);
+        h.sweep();
+        assertGt(h.ok("deliveredVoidHeld"), 0, "deliveredVoidHeld covered");
+        assertGt(h.ok("deliveredVoidHeldReversed"), 0, "deliveredVoidHeldReversed covered");
+        assertGt(h.ok("settleDeferredThenExecuted"), 0, "a held kind 12 executed once the flag cleared");
+        assertGt(h.ok("parkedAfterUnpreparedReopen"), 0, "a parked refund claimed after an unprepared reopening");
+        this.checkpoint();
     }
 
     /// @notice r23, redirection probes: a refund the record shows paid to its contract sender, moved afterwards to
@@ -3163,7 +3495,8 @@ contract ReconcileInvariantsTest is ControlsFixture {
             T.SendRecord memory rec = ctl.sendRecord(pkt.sourceClient, pkt.sequence);
             if (rec.refunded <= h.refundedAt(i)) continue;
             // invariant 5: no kind 12 refund before every unsettled suspect success of the route is reserved
-            if (rec.settlement == 1) assertTrue(h.allPrepared(), "a kind 12 refund before the preparation");
+            // (kind 12's own preparation gate is checked at its payment, in the handler's `_execute`: a parked
+            // refund kind 12 settled may be claimed after the reopening, prepared or not)
             if (_burnedOf(i)) continue;
             if (_tokenIndex(rec.token, tn) == tn) continue;
             uint256 own = _reserveOf(rec, i);
@@ -3281,7 +3614,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
     function afterInvariant() external {
         h.sweep();
         _checkAll();
-        string[78] memory names = [
+        string[81] memory names = [
+            "settleHeldDeferred",
+            "settleDeferredThenExecuted",
+            "parkedAfterUnpreparedReopen",
             "noticeResentAfterAck",
             "noticeResentOld",
             "preparePartial",
@@ -3366,7 +3702,10 @@ contract ReconcileInvariantsTest is ControlsFixture {
             line = string.concat(line, " ", names[i], "=", vm.toString(h.ok(names[i])));
         }
         console2.log(line);
-        string[61] memory required = [
+        string[64] memory required = [
+            "settleHeldDeferred",
+            "settleDeferredThenExecuted",
+            "parkedAfterUnpreparedReopen",
             "noticeResentAfterAck",
             "noticeResentOld",
             "preparePartial",
