@@ -109,6 +109,8 @@ interface IIBCAdmin {
     event FlagSet(address indexed key, uint8 seat);
     event FlagCleared(address indexed key, uint8 seat);
     event HoldEnded(uint64 start, uint64 end);
+    /// @notice A pending seat change's hold deadline pinned: under a hold it lands no sooner than `notBefore`.
+    event ReplacementAnchored(uint32 indexed epoch, uint64 indexed seq, uint64 notBefore);
     event Unpaused(uint64 beforeBlock, uint256 cleared);
     event GuardiansSet(uint8 seat, address key);
     event EpochOpened(uint32 indexed epoch, string clientId);

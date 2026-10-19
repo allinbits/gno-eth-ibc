@@ -11,6 +11,9 @@ import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
 
 import { DeployGnoIBC } from "../../script/DeployGnoIBC.s.sol";
+import { CodeVerifier } from "../../script/CodeVerifier.sol";
+
+contract LaunchVerifier is CodeVerifier { }
 import { IGnoICS20Controls, IGnoICS20ControlsTypes } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
 import { IBCAdmin } from "../../src/admin/IBCAdmin.sol";
@@ -196,6 +199,13 @@ contract DeploymentRealClientTest is Fixtures, DeployGnoIBC {
         Msgs.ClientState memory cs = abi.decode(GnoLightClient(d.gnoLightClient).getClientState(), (Msgs.ClientState));
         assertEq(cs.latestHeight, 11, "advanced past the launch height");
         assertTrue(IBCAdmin(d.ibcAdmin).setupDone(), "the original checkpoint still checks");
+    }
+
+    /// @notice Design r2 #2: the launch's verifier (the real GnoLightClient) and its ugnot voucher are builds of their
+    /// sources, the voucher bound to the transfer app.
+    function test_d2_launchVerifierAndVoucher_verified() public {
+        test_r16_1_honestUpdateBeforeFinishSetup_setupPasses();
+        assertTrue(new LaunchVerifier().verifyLaunch(d.ibcAdmin));
     }
 }
 

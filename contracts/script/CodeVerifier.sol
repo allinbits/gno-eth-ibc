@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import { Script } from "forge-std/Script.sol";
 import { console2 } from "forge-std/console2.sol";
 import { IIBCAdmin } from "../src/interfaces/IIBCAdmin.sol";
+import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 
 interface IAccessManagedLike {
     function authority() external view returns (address);
@@ -11,6 +12,15 @@ interface IAccessManagedLike {
 
 interface IRouterLike {
     function getIBCApp(string calldata portId) external view returns (address);
+    function getClient(string calldata clientId) external view returns (address);
+}
+
+interface IVoucherLike {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+    function ics20() external view returns (address);
+    function fullDenomPath() external view returns (string memory);
 }
 
 interface IBCAdminLike {
@@ -40,6 +50,8 @@ abstract contract CodeVerifier is Script {
     /// @notice ERC-1967's implementation slot.
     bytes32 internal constant IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
 
+    uint8 internal constant KIND_VOUCHER = 5;
+    uint8 internal constant KIND_CLIENT = 6;
     uint8 internal constant KIND_UPGRADE = 7;
     uint8 internal constant KIND_HANDOVER = 9;
 
@@ -150,6 +162,57 @@ abstract contract CodeVerifier is Script {
         console2.log("  recovery silence, hold period", rc.silence, rc.holdPeriod);
     }
 
+    /// @notice A GnoVoucher: rebuilt with its own name, symbol, decimals and denom path, and bound to the system's
+    /// transfer app (`ics20`), which its immutable must name. A proxy, or any code other than this build, fails.
+    function verifyVoucher(address voucher, address ics20) public returns (bool ok) {
+        IVoucherLike v = IVoucherLike(voucher);
+        if (voucher.code.length == 0) return false;
+        try v.ics20() returns (address bound) {
+            if (bound != ics20) {
+                console2.log("MISMATCH voucher bound to another transfer app", voucher);
+                return false;
+            }
+        } catch {
+            console2.log("MISMATCH voucher answers no ics20()", voucher);
+            return false;
+        }
+        ok = _check(
+            voucher,
+            "GnoVoucher.sol:GnoVoucher",
+            abi.encode(v.name(), v.symbol(), v.decimals(), ics20, v.fullDenomPath())
+        );
+    }
+
+    /// @notice A GnoLightClient: it has no immutables, so its runtime code is the build's whatever its trusted
+    /// state; rebuilt from a placeholder state. A proxy, or any other verifier code, fails (another verifier type is
+    /// checked by hand against its own source).
+    function verifyLightClient(address lc) public returns (bool) {
+        Msgs.ClientState memory cs = Msgs.ClientState({
+            chainId: "verify",
+            revisionNumber: 0,
+            latestHeight: 1,
+            trustLevel: Msgs.TrustThreshold(1, 1),
+            trustingPeriod: 1,
+            maxClockDrift: 0,
+            isFrozen: false
+        });
+        Msgs.ConsensusState memory cons = Msgs.ConsensusState(1, bytes32(0), bytes32(0));
+        return _check(lc, "GnoLightClient.sol:GnoLightClient", abi.encode(cs, cons));
+    }
+
+    /// @notice The launch's pinned code beyond the delegate graphs: the epoch client's verifier and the ugnot voucher
+    /// registered for it (`transfer/<client>/ugnot`).
+    function verifyLaunch(address ibcAdmin) public returns (bool all) {
+        (address router,, address ics20) = _system(ibcAdmin);
+        string memory client = IBCAdminLike(ibcAdmin).govClient();
+        all = verifyLightClient(IRouterLike(router).getClient(client));
+        (bool ok, bytes memory ret) = ics20.staticcall(
+            abi.encodeWithSignature("ibcERC20Contract(string)", string.concat("transfer/", client, "/ugnot"))
+        );
+        address voucher = ok && ret.length >= 32 ? abi.decode(ret, (address)) : address(0);
+        all = voucher != address(0) && verifyVoucher(voucher, ics20) && all;
+    }
+
     /// @notice What runs now, from the chain alone: the transfer proxy's and the router proxy's live implementations,
     /// the escrow and voucher beacons' implementations, IBCAdmin and its installed executor, each graph complete.
     function verifyLive(address ibcAdmin) public returns (bool all) {
@@ -189,6 +252,23 @@ abstract contract CodeVerifier is Script {
             }
             return verifyExec(x, router, am, ics20);
         }
+        if (d.kind == KIND_VOUCHER) {
+            (,, address v, bytes32 codeHash) = abi.decode(d.params, (string, string, address, bytes32));
+            if (v != candidate || v.codehash != codeHash) {
+                console2.log("MISMATCH kind 5 candidate or its pinned hash", v);
+                return false;
+            }
+            return verifyVoucher(v, ics20);
+        }
+        if (d.kind == KIND_CLIENT) {
+            (,,,, address lc, bytes32 codeHash) =
+                abi.decode(d.params, (uint8, string, string, bytes[], address, bytes32));
+            if (lc != candidate || lc.codehash != codeHash) {
+                console2.log("MISMATCH kind 6 candidate or its pinned hash", lc);
+                return false;
+            }
+            return verifyLightClient(lc);
+        }
         if (d.kind == KIND_UPGRADE) {
             (address proxy, address impl, bytes32 codeHash,) = abi.decode(d.params, (address, address, bytes32, bytes));
             if (impl != candidate || impl.codehash != codeHash) {
@@ -202,7 +282,7 @@ abstract contract CodeVerifier is Script {
             console2.log("MISMATCH kind 7 of an unknown proxy", proxy);
             return false;
         }
-        console2.log("MISMATCH not a kind 7 or 9, seq", seq);
+        console2.log("MISMATCH not a kind 5, 6, 7 or 9, seq", seq);
         return false;
     }
 }

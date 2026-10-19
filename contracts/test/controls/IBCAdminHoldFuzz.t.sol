@@ -9,7 +9,7 @@ import { ControlsFixture } from "./ControlsFixture.sol";
 /// @notice The hold state machine as it gates execution (§6.6, §6.7, §7.4): random flags, clears and clock steps by
 /// the six keys, with a 7-day decision and a guardian replacement waiting. A 7-day decision executes exactly when it
 /// has matured and no flag or hold stands; the replacement never before its 7 days, and under a hold never before
-/// day 21 of the earliest hold overlapping its pending life.
+/// its anchor plus 21 days: the first moment a hold stood once it was due, pinned and never reset by later holds.
 contract IBCAdminHoldFuzzTest is ControlsFixture {
     /// forge-config: default.fuzz.runs = 128
     function testFuzz_holdStateMachine(uint256 seed) public {
@@ -52,20 +52,17 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
                 settingsDone = ok;
             }
             if (!seatsDone) {
+                uint64 anchor = admin.replacementAnchor(admin.epoch(), seats);
                 (bool ok,) = address(admin).call(abi.encodeCall(admin.execute, (seats)));
-                if (ok) {
-                    assertGe(_now(), recorded + 7 days, "never before 7 days");
-                    if (holdStands) {
-                        uint64 earliest = h.time;
-                        IGuardians.Hold[] memory past = admin.holds();
-                        for (uint256 i = 0; i < past.length; i++) {
-                            if (past[i].end >= recorded && past[i].start < earliest) earliest = past[i].start;
-                        }
-                        assertGe(_now(), uint256(earliest) + 21 days, "under a hold, never before day 21");
-                    }
-                } else if (_now() >= recorded + 7 days && !holdStands) {
-                    revert("a matured replacement without a hold must land, flags or not");
-                }
+                ok = ok && admin.decision(admin.epoch(), seats).state == S.EXECUTED;
+                uint64 pinned = admin.replacementAnchor(admin.epoch(), seats);
+                // never before its 7 days; the anchor, once pinned, never moves and is never before the due time
+                if (anchor != 0) assertEq(pinned, anchor, "an anchor never moves");
+                if (pinned != 0) assertGe(pinned, recorded + 7 days, "never anchored before it was due");
+                bool due = _now() >= recorded + 7 days;
+                // lands exactly when due with no hold standing, or under a hold from its anchor plus 21 days
+                bool should = due && (!holdStands || (pinned != 0 && _now() >= uint256(pinned) + 21 days));
+                assertEq(ok, should, "a replacement lands exactly when due and unheld, or at its anchor plus 21 days");
                 seatsDone = ok;
             }
         }

@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import { IICS02Client, IICS02ClientAccessControlled } from "@eureka/interfaces/IICS02Client.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
+import { IBCIdentifiers } from "@eureka/utils/IBCIdentifiers.sol";
 
 import { IIBCAdmin } from "../interfaces/IIBCAdmin.sol";
 import { IGnoICS20Controls } from "../interfaces/IGnoICS20Controls.sol";
@@ -51,7 +52,9 @@ contract IBCAdminRecovery is IIBCAdmin {
         S.Recovery storage r = l.recovery;
         if (r.openedAt != 0) revert RecoveryState();
         RecoveryProposal memory rp = abi.decode(proposal, (RecoveryProposal));
-        if (bytes(rp.newClientId).length == 0 || !_usableClient(l, rp)) revert RecoveryState();
+        // every permanent condition execution needs is checked before the proposal can open: a proposal execution
+        // must refuse for good would stay open and blocking until a cancellation quorum closes it
+        if (!_freshId(rp.newClientId) || !_usableClient(l, rp)) revert RecoveryState();
         bytes32 h = keccak256(proposal);
         r.approved[seat] = h;
         if (bytes(r.params[h]).length == 0) r.params[h] = proposal;
@@ -66,6 +69,16 @@ contract IBCAdminRecovery is IIBCAdmin {
         r.cancels = 0;
         IGnoICS20Controls(ics20).setRecoveryBlock(l.govClient, true);
         emit RecoveryOpened(h, uint64(block.timestamp) + c.delay);
+    }
+
+    /// @notice Whether `id` can become the route's new client id at execution: a custom id in the router's grammar (4
+    /// to 128 characters, never `client-` or `channel-`) and unknown to the router. Every id the transfer app knows
+    /// (a route key, an alias, a retired id, an escrow's) was a router client, so this makes it a fresh route too;
+    /// with the authority-changing kinds suspended while the proposal is open, it stays so until execution.
+    function _freshId(string memory id) private view returns (bool) {
+        if (!IBCIdentifiers.validateCustomIBCIdentifier(bytes(id))) return false;
+        (bool exists,) = router.staticcall(abi.encodeCall(IICS02Client.getClient, (id)));
+        return !exists;
     }
 
     /// @notice Whether a proposal's client is the pinned code, follows gno.land's chain id, and is neither frozen nor

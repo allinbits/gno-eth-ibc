@@ -149,22 +149,125 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertEq(_state(seq), S.EXECUTED);
     }
 
-    function test_kind3_throughAHold_noSoonerThanDay21() public {
+    function _hold() internal {
         vm.prank(G[0]);
         admin.setFlag();
         vm.prank(G[1]);
         admin.setFlag();
-        uint256 holdStart = _now();
+    }
+
+    /// @notice ADR §7.4: a hold standing since before the replacement was due anchors it at its due time (the first
+    /// moment a hold deferred it); it lands from the anchor plus 21 days. The first deferring `execute` pins the anchor
+    /// and returns (a revert would undo the pin); the decision stays pending.
+    function test_kind3_throughAHold_noSoonerThanDay21() public {
+        _hold();
         _skip(1 days);
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(1, makeAddr("fresh")));
+        uint256 due = _now() + 7 days;
         _skip(7 days);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, holdStart + 21 days));
+        admin.execute(seq); // pins the anchor: the due time
+        assertEq(_state(seq), S.PENDING);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), due);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, due + 21 days));
         admin.execute(seq);
-        vm.warp(holdStart + 21 days);
+        vm.warp(due + 21 days);
         admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
         // the replacement cleared a holder's flag: one guardian flag is left, the hold ends at once
         assertEq(admin.hold().blockNumber, 0);
         assertTrue(admin.flags()[0].blockNumber != 0);
+    }
+
+    /// @notice Design r2 #1 (Codex's example): a replacement recorded on day 0 (due day 7), a hold on days 1 to 3 (it
+    /// ended before the replacement was due: it never deferred it), another from day 20: the anchor is day 20 and the
+    /// replacement lands from day 41.
+    function test_kind3_anchor_holdBeforeDueNeverCounts() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.warp(t0 + 1 days);
+        _hold(); // days 1 to 3
+        vm.warp(t0 + 2 days);
+        vm.prank(G[1]);
+        admin.clearFlag();
+        vm.warp(t0 + 20 days);
+        assertEq(admin.hold().blockNumber, 0, "the first hold ended");
+        vm.prank(G[1]);
+        admin.setFlag(); // the second hold, from day 20
+        vm.warp(t0 + 22 days);
+        admin.execute(seq); // pins day 20
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
+        vm.warp(t0 + 41 days - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 41 days));
+        admin.execute(seq);
+        vm.warp(t0 + 41 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+    }
+
+    /// @notice Design r2 #1, the cycling attack: a guardian clears, waits out the 24-hour grace and flags again, over
+    /// and over. The anchor, pinned at the first hold after the replacement was due, never moves: it lands from the
+    /// anchor plus 21 days, whatever hold stands then.
+    function test_kind3_anchor_clearAndReflagCycles_neverReset() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.warp(t0 + 8 days);
+        _hold(); // the first hold after day 7, from day 8
+        vm.warp(t0 + 9 days);
+        admin.execute(seq);
+        uint256 floor = t0 + 8 days + 21 days;
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
+        for (uint256 k = 0; k < 3; k++) {
+            vm.prank(G[1]);
+            admin.clearFlag();
+            _skip(1 days + 1); // the grace passes: the hold ends
+            assertEq(admin.hold().blockNumber, 0);
+            vm.prank(G[1]);
+            admin.setFlag(); // a fresh hold
+            assertTrue(admin.hold().blockNumber != 0);
+            vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, floor));
+            admin.execute(seq);
+        }
+        vm.warp(floor);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED, "lands at anchor + 21 days under a fresh hold");
+    }
+
+    /// @notice A hold nobody observed still anchors: a hold on days 8 to 10 (after the replacement was due), then
+    /// another from day 15; the first `execute`, on day 16, anchors at day 8 from the hold history.
+    function test_kind3_anchor_unobservedHoldCounts() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.warp(t0 + 8 days);
+        _hold();
+        vm.warp(t0 + 9 days);
+        vm.prank(G[1]);
+        admin.clearFlag();
+        vm.warp(t0 + 15 days);
+        vm.prank(G[1]);
+        admin.setFlag();
+        vm.warp(t0 + 16 days);
+        admin.execute(seq);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
+        vm.warp(t0 + 29 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+    }
+
+    /// @notice A single standing hold starting after the replacement was due: it lands from day 21 of that hold, as
+    /// ADR §7.4 has it.
+    function test_kind3_anchor_singleStandingHold() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.warp(t0 + 10 days);
+        _hold();
+        vm.warp(t0 + 11 days);
+        admin.execute(seq);
+        vm.warp(t0 + 31 days - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 31 days));
+        admin.execute(seq);
+        vm.warp(t0 + 31 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
     }
 
     function test_kind3_otherSevenDayKindsDeferredByHold() public {

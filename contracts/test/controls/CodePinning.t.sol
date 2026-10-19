@@ -2,6 +2,9 @@
 pragma solidity ^0.8.28;
 
 import { BeaconProxy } from "@openzeppelin-contracts/proxy/beacon/BeaconProxy.sol";
+import { GnoLightClient } from "../../src/GnoLightClient.sol";
+import { GnoVoucher } from "../../src/GnoVoucher.sol";
+import { IGnoLightClientMsgs as Msgs } from "../../src/msgs/IGnoLightClientMsgs.sol";
 import { UpgradeableBeacon } from "@openzeppelin-contracts/proxy/beacon/UpgradeableBeacon.sol";
 
 import { GnoICS20Transfer } from "../../src/GnoICS20Transfer.sol";
@@ -17,6 +20,28 @@ import { CodeVerifier } from "../../script/CodeVerifier.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
 contract Verifier is CodeVerifier { }
+
+/// @notice A plain forwarding proxy: mutable code indirection (its target could be swapped by whoever deploys it).
+contract ForwardingProxy {
+    address internal immutable target;
+
+    constructor(address t) {
+        target = t;
+    }
+
+    fallback() external payable {
+        address t = target;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let ok := delegatecall(gas(), t, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch ok
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
+    }
+}
 
 /// @notice Round 10 #1: the delegate graph is pinned transitively. Each implementation and module records its
 /// delegates' code hashes at construction, so the implementation's pinned hash fixes the whole graph; a module whose
@@ -288,5 +313,61 @@ contract CodePinningTest is ControlsFixture {
                 new address[](0)
             )
         );
+    }
+
+    // ============================================== design r2 #2: vouchers, verifiers and their pending kinds ==
+
+    function _gnoClient() internal returns (GnoLightClient) {
+        return new GnoLightClient(
+            Msgs.ClientState("gnoland-9", 0, 5, Msgs.TrustThreshold(1, 1), 1 days, 10, false),
+            Msgs.ConsensusState(1, bytes32(uint256(1)), bytes32(uint256(2)))
+        );
+    }
+
+    /// @notice A voucher rebuilds from its own name, symbol, decimals and denom, bound to the transfer app; one bound
+    /// elsewhere, or behind a proxy, fails.
+    function test_d2_vouchers_rebuiltAndBound() public {
+        assertTrue(verifier.verifyVoucher(address(ugnot), address(ics20)), "the launch voucher");
+        assertFalse(verifier.verifyVoucher(address(ugnot), address(0xBEEF)), "bound to another transfer app");
+        GnoVoucher impl = new GnoVoucher("x", "X", 6, address(ics20), "transfer/client-0/ux");
+        address proxied = address(new ForwardingProxy(address(impl)));
+        assertFalse(verifier.verifyVoucher(proxied, address(ics20)), "a voucher behind a proxy");
+    }
+
+    /// @notice A GnoLightClient rebuilds whatever its trusted state; a proxy to one, or other verifier code, fails.
+    function test_d2_lightClients_rebuilt_proxiesRefused() public {
+        GnoLightClient lc = _gnoClient();
+        assertTrue(verifier.verifyLightClient(address(lc)));
+        assertFalse(verifier.verifyLightClient(address(new ForwardingProxy(address(lc)))), "a verifier behind a proxy");
+        assertFalse(verifier.verifyLightClient(address(new MockLightClient())), "other verifier code");
+    }
+
+    /// @notice Pending kinds 5 and 6 are verified before they mature: the decision's hash, its candidate, the pinned
+    /// hash and the candidate's build.
+    function test_d2_pendingKinds5And6_verified() public {
+        GnoLightClient lc = _gnoClient();
+        address proxied = address(new ForwardingProxy(address(lc)));
+        uint64 seq = admin.lastSeq() + 1;
+        bytes memory e1 = _env(
+            seq, S.KIND_CLIENT, P.client(1, "gnoland-9", "ethereum-9", _prefix(), address(lc), address(lc).codehash)
+        );
+        bytes memory e2 =
+            _env(seq + 1, S.KIND_CLIENT, P.client(1, "gnoland-8", "ethereum-8", _prefix(), proxied, proxied.codehash));
+        _recvGov(e1);
+        _recvGov(e2);
+        assertTrue(verifier.verifyPending(address(admin), seq, keccak256(e1), address(lc)), "a genuine verifier");
+        assertFalse(verifier.verifyPending(address(admin), seq + 1, keccak256(e2), proxied), "a proxy-backed verifier");
+        GnoVoucher v = new GnoVoucher("Atom", "ATOM", 6, address(ics20), "transfer/client-0/uatom");
+        GnoVoucher other = new GnoVoucher("Atom", "ATOM", 6, address(0xBEEF), "transfer/client-0/uatom");
+        bytes memory e3 = _env(seq + 2, S.KIND_VOUCHER, P.voucher(clientId, "uatom", address(v), address(v).codehash));
+        bytes memory e4 =
+            _env(seq + 3, S.KIND_VOUCHER, P.voucher(clientId, "uatom", address(other), address(other).codehash));
+        _recvGov(e3);
+        _recvGov(e4);
+        assertTrue(verifier.verifyPending(address(admin), seq + 2, keccak256(e3), address(v)), "a genuine voucher");
+        assertFalse(
+            verifier.verifyPending(address(admin), seq + 3, keccak256(e4), address(other)), "bound to another app"
+        );
+        assertFalse(verifier.verifyPending(address(admin), seq + 2, keccak256(e3), address(other)), "other candidate");
     }
 }

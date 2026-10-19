@@ -115,7 +115,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
                     || rc.threshold < 3
                     || rc.threshold > 4
                     || rc.cancelThreshold < 3
-                    || rc.cancelThreshold > 4)
+                    || rc.cancelThreshold > rc.threshold)
         ) {
             revert RecoveryState();
         }
@@ -462,10 +462,18 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             // a revocation an open recovery held back: due at once, never deferred (it tightens)
             matureAt = d.recordedTime;
         } else if (kind == S.KIND_SEATS) {
-            if (holdStands) {
-                uint64 floor = _replacementFloor(l, d.recordedTime, holdStart);
-                if (floor > matureAt) matureAt = floor;
+            // a seat change's deferral by holds is bounded by a deadline later holds cannot reset (ADR §7.4): its
+            // anchor is the first moment a hold deferred it once due (the hold history included, so a hold nobody
+            // observed still counts), pinned the first time it is seen; under a hold it lands from the anchor plus 21
+            // days, whatever hold stands then, and with no hold standing as any decision does
+            uint64 a = l.seatAnchor[ep][seq];
+            if (a == 0 && holdStands && block.timestamp >= matureAt) {
+                a = _anchor(l, matureAt, holdStart);
+                l.seatAnchor[ep][seq] = a;
+                emit ReplacementAnchored(ep, seq, a + S.HOLD_REPLACEMENT);
+                if (block.timestamp < a + S.HOLD_REPLACEMENT) return; // pinned (a revert would undo it); pending
             }
+            if (holdStands && a + S.HOLD_REPLACEMENT > matureAt) matureAt = a + S.HOLD_REPLACEMENT;
         } else if (kind != S.KIND_UNPAUSE && (holdStands || S.flagged(l))) {
             revert Deferred();
         }
@@ -497,20 +505,25 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         }
     }
 
+    /// @notice A seat change's anchor: the first moment a hold stood once it was `due`: the earliest start of the
+    /// standing hold and of every recorded hold that ended at or after `due`, never before `due`.
+    function _anchor(S.Layout storage l, uint64 due, uint64 standing) private view returns (uint64 a) {
+        a = standing;
+        for (uint256 i = 0; i < l.holds.length; i++) {
+            IGuardians.Hold memory h = l.holds[i];
+            if (h.end >= due && h.start < a) a = h.start;
+        }
+        if (a < due) a = due;
+    }
+
+    /// @notice A pending seat change's anchor (zero: none pinned yet): under a hold it lands from this plus 21 days.
+    function replacementAnchor(uint32 epoch_, uint64 seq) external view returns (uint64) {
+        return S.layout().seatAnchor[epoch_][seq];
+    }
+
     /// @notice An unpause waits 24 hours, every other waiting kind 7 days.
     function _delay(uint8 kind) private pure returns (uint64) {
         return kind == S.KIND_UNPAUSE ? S.DAY : S.WEEK;
-    }
-
-    /// @notice A guardian replacement's floor while a hold stands: the earliest hold overlapping [its recording,
-    /// now] (the standing one, or an ended one whose end is at or after the recording) plus 21 days.
-    function _replacementFloor(S.Layout storage l, uint64 recordedTime, uint64 standing) private view returns (uint64) {
-        uint64 floor = standing;
-        for (uint256 i = 0; i < l.holds.length; i++) {
-            IGuardians.Hold memory h = l.holds[i];
-            if (h.end >= recordedTime && h.start < floor) floor = h.start;
-        }
-        return floor + S.HOLD_REPLACEMENT;
     }
 
     // ================================================================================================ flags ==
@@ -548,8 +561,13 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// @notice A guardian approves an emergency route replacement (§7.12); it opens once enough guardians approve
     /// the same proposal while the route is eligible. Calling again re-checks the eligibility.
     function approveRecovery(RecoveryProposal calldata p) external {
-        if (!S.layout().setupDone) revert SetupPending();
+        S.Layout storage l = S.layout();
+        if (!l.setupDone) revert SetupPending();
+        // never before gno.land has bound to this IBCAdmin (its first decision recorded): Ethereum stays at epoch 1
+        // until then, or gno.land would bind at epoch 1 against an Ethereum already past it, for good. After an
+        // epoch switch (a kind 10 from gno.land, or a recovery that passed this) the binding is established
         RecoveryConfig memory c = _recoveryConfig();
+        if (l.epoch == 1 && l.lastSeq == 0) revert RecoveryNotEligible();
         _delegateRecovery(abi.encodeCall(IBCAdminRecovery.approveRecovery, (msg.sender, abi.encode(p), c)));
     }
 

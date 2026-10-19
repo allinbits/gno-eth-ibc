@@ -43,6 +43,8 @@ import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol
 ///   GNO_TRUST_FILE              JSON with "clientState" and "consensusState", each the ABI encoding of the
 ///                               GnoLightClient struct (written by `relayer trust`); default deployments/trust.json
 ///   GNO_COUNTERPARTY_CLIENT_ID  the gno-side Ethereum client id; default "ethereum-1"
+///   PERMIT2                     the chain's Permit2 contract (canonically 0x000000000022D473030F116dDEE9F6B43aC78BA3),
+///                               fixed at deployment; unset, `sendTransferWithPermit2` is unavailable
 ///   RELAYER_ADDRESS             testing only, with ALLOW_RESTRICTED_RELAYING=true: only this address may relay
 ///                               (governance delivery included); unset in production, where relaying is public
 ///   GUARDIANS                   4 comma-separated guardian addresses (seats 0-3); WATCH_KEYS: 2 watch keys (4-5).
@@ -130,6 +132,8 @@ contract DeployGnoIBC is Script {
         string memory trust = vm.readFile(vm.envOr("GNO_TRUST_FILE", string("deployments/trust.json")));
         p.deployer = deployer;
         p.relayer = vm.envOr("RELAYER_ADDRESS", address(0));
+        // the canonical Permit2 contract for `sendTransferWithPermit2`; unset, only allowance-based sends work
+        p.permit2 = vm.envOr("PERMIT2", address(0));
         _checkRelaying(p.relayer, vm.envOr("ALLOW_RESTRICTED_RELAYING", false));
         p.clientState = abi.decode(trust.readBytes(".clientState"), (Msgs.ClientState));
         p.consensusState = abi.decode(trust.readBytes(".consensusState"), (Msgs.ConsensusState));
@@ -170,6 +174,11 @@ contract DeployGnoIBC is Script {
         // an enabled recovery's public delay is long (IBCAdmin refuses less, too)
         require(
             p.recovery.delay == 0 || p.recovery.delay >= 30 days, "RECOVERY_DELAY: zero (disabled) or 30 days or more"
+        );
+        // a cancellation never needs more guardians than an approval: approvers can always close what they opened
+        require(
+            p.recovery.delay == 0 || p.recovery.cancelThreshold <= p.recovery.threshold,
+            "RECOVERY_CANCEL_THRESHOLD: at most RECOVERY_THRESHOLD"
         );
     }
 

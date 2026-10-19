@@ -131,6 +131,8 @@ library IBCAdminStorage {
         /// Each epoch's notice (§7.12), kept per epoch so that every one stays re-sendable after consecutive
         /// replacements: none at launch (epoch 1).
         mapping(uint32 epoch => Notice) notices;
+        /// A pending seat change's anchor (kind 3 under a hold): the first moment a hold deferred it once due.
+        mapping(uint32 epoch => mapping(uint64 seq => uint64)) seatAnchor;
     }
 
     /// @notice An epoch's notice: recorded when its epoch opened by kind 10 or the emergency recovery, the client it

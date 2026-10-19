@@ -80,6 +80,8 @@ contract CandidateStaticTest is ControlsFixture {
             codeHash: address(c).codehash,
             suspectFrom: 0
         });
+        // gno.land bound first (a recorded decision): a recovery waits for it
+        _recvGov(_env(admin.lastSeq() + 1, S.KIND_SETTINGS, P.settings(clientId, 7 days)));
         lc.setStatus(true, false);
         vm.prank(G[0]);
         vm.expectRevert(IIBCAdmin.RecoveryState.selector);

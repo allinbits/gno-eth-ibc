@@ -466,6 +466,16 @@ contract ReviewRegressionsTest is ControlsFixture {
         _adminWith(3, 2);
         _adminWith(3, 3);
         _adminWith(4, 4);
+        _adminWith(4, 3);
+    }
+
+    /// @notice Main-ADR design r1 #1: a cancellation never needs more guardians than an approval, so the approvers can
+    /// always close a proposal they opened (approval 3 with cancellation 4 is refused).
+    function test_m1_cancelThreshold_atMostTheApprovalThreshold() public {
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        _adminWith(3, 4);
+        _adminWith(4, 4);
+        _adminWith(0, 3, 4); // disabled: not checked
     }
 
     // ====================================================================== #15 quarantine deadlines ==
@@ -2768,6 +2778,20 @@ contract ReviewRegressionsTest is ControlsFixture {
     }
 
     // ============================================================= docs/design round 1 (design decisions B) ==
+
+    function paramsPermit2() external view returns (address) {
+        return _params(address(this)).permit2;
+    }
+
+    /// @notice Docs r2 #5: the deploy script takes the chain's Permit2 contract from `PERMIT2`; unset, none (only
+    /// allowance-based sends work).
+    function test_d2_5_permit2FromTheEnvironment() public {
+        address canonical = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+        vm.setEnv("PERMIT2", vm.toString(canonical));
+        assertEq(this.paramsPermit2(), canonical);
+        vm.setEnv("PERMIT2", vm.toString(address(0)));
+        assertEq(this.paramsPermit2(), address(0));
+    }
 
     function checkRelaying(address relayer, bool allowRestricted) external pure {
         _checkRelaying(relayer, allowRestricted);

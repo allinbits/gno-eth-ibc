@@ -9,9 +9,12 @@ import { CodeVerifier } from "./CodeVerifier.sol";
 /// - DEPLOYMENTS_FILE (as DeployGnoIBC writes it) gives only IBCAdmin's address; everything else is read from the
 ///   chain: the transfer and router proxies' live implementation slots, the escrow and voucher beacons'
 ///   implementations, IBCAdmin's installed executor, and each delegate graph from there.
+/// - The launch's verifier and ugnot voucher (`verifyLaunch`).
 /// - PENDING_SEQS, PENDING_HASHES, PENDING_CANDIDATES (comma-separated, the same length; optional): each recorded
-///   kind 7 or kind 9 decision of the current epoch, the hash gno.land's envelope must have, and the implementation or
-///   executor it must install. Each candidate's whole graph is checked.
+///   kind 5, 6, 7 or 9 decision of the current epoch, the hash gno.land's envelope must have, and the voucher,
+///   verifier, implementation or executor it must install. Each candidate's whole graph is checked.
+/// - VOUCHERS, CLIENTS (comma-separated, optional): further registered vouchers and enrolled or attested verifiers
+///   (an emergency recovery proposal's `lightClient` included), each rebuilt from its source.
 ///
 /// Reverts on any mismatch.
 contract VerifyCodehashes is CodeVerifier {
@@ -21,6 +24,16 @@ contract VerifyCodehashes is CodeVerifier {
         string memory json = vm.readFile(vm.envString("DEPLOYMENTS_FILE"));
         address admin = json.readAddress(".ibcAdmin");
         require(verifyLive(admin), "live code does not match the build");
+        require(verifyLaunch(admin), "the launch verifier or voucher does not match the build");
+        (,, address ics20) = _system(admin);
+        address[] memory vouchers = vm.envOr("VOUCHERS", ",", new address[](0));
+        for (uint256 i = 0; i < vouchers.length; i++) {
+            require(verifyVoucher(vouchers[i], ics20), "a voucher fails the build");
+        }
+        address[] memory clients = vm.envOr("CLIENTS", ",", new address[](0));
+        for (uint256 i = 0; i < clients.length; i++) {
+            require(verifyLightClient(clients[i]), "a verifier fails the build");
+        }
         uint256[] memory seqs = vm.envOr("PENDING_SEQS", ",", new uint256[](0));
         bytes32[] memory hashes = vm.envOr("PENDING_HASHES", ",", new bytes32[](0));
         address[] memory candidates = vm.envOr("PENDING_CANDIDATES", ",", new address[](0));

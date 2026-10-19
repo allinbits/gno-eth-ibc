@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IICS26Router } from "@eureka/interfaces/IICS26Router.sol";
 import { Vm } from "forge-std/Vm.sol";
 
@@ -49,6 +50,15 @@ contract IBCAdminRecoveryTest is ControlsFixture {
     function setUp() public override {
         super.setUp();
         attested = new MockLightClient();
+        _bind();
+    }
+
+    /// @notice gno.land binds: IBCAdmin records its first decision (an emergency recovery waits for it).
+    function _bind() internal {
+        assertEq(
+            _status(_recvGov(_env(admin.lastSeq() + 1, S.KIND_SETTINGS, P.settings(clientId, 7 days)))),
+            S.STATUS_RECORDED
+        );
     }
 
     function _proposal(string memory id) internal view returns (IIBCAdmin.RecoveryProposal memory p) {
@@ -106,7 +116,7 @@ contract IBCAdminRecoveryTest is ControlsFixture {
 
     function test_eligibleAfterSilence() public {
         IIBCAdmin.RecoveryProposal memory p = _proposal("gnoland-7");
-        _recvGov(_env(1, S.KIND_SETTINGS, P.settings(clientId, 1 days)));
+        _recvGov(_env(admin.lastSeq() + 1, S.KIND_SETTINGS, P.settings(clientId, 1 days)));
         _skip(30 days - 1);
         _approve(0, p);
         _approve(1, p);
@@ -123,7 +133,7 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         admin.setFlag();
         vm.prank(G[3]);
         admin.setFlag();
-        _recvGov(_env(1, S.KIND_SETTINGS, P.settings(clientId, 1 days))); // the channel is alive
+        _recvGov(_env(admin.lastSeq() + 1, S.KIND_SETTINGS, P.settings(clientId, 1 days))); // the channel is alive
         _skip(14 days);
         _approve(0, p);
         _approve(1, p);
@@ -426,5 +436,73 @@ contract IBCAdminRecoveryTest is ControlsFixture {
         }
         assertTrue(sent, "the notice over the attested client");
         admin.resendEpochNotice(2);
+    }
+
+    /// @notice Main-ADR design r1 #1: a proposal execution would refuse for good is refused at approval, before it can
+    /// open and block the route: an id outside the router's custom grammar (`bad`, a `client-` or `channel-` prefix),
+    /// one the router already knows, or one the transfer app already routes.
+    function test_m1_permanentlyInvalidIds_refusedAtApproval() public {
+        IIBCAdmin.RecoveryProposal memory p;
+        string[4] memory bad = ["bad", "client-77", "channel-1", clientId];
+        for (uint256 i = 0; i < bad.length; i++) {
+            p = _proposal(bad[i]);
+            vm.prank(G[0]);
+            vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+            admin.approveRecovery(p);
+        }
+        // an id the router already knows (a custom client added before)
+        vm.prank(address(admin));
+        router.addClient("gnoland-5", IICS02ClientMsgs.CounterpartyInfo("ethereum-5", _prefixOf()), address(attested));
+        p = _proposal("gnoland-5");
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryState.selector);
+        admin.approveRecovery(p);
+        // a fresh custom id is accepted
+        _approve(0, _proposal("gnoland-7"));
+    }
+
+    function _prefixOf() internal pure returns (bytes[] memory prefix) {
+        prefix = new bytes[](2);
+        prefix[0] = "main";
+        prefix[1] = "/pv/vm:gno.land/r/aib/ibc/core:";
+    }
+}
+
+/// @notice Main-ADR design r21 #2: an emergency recovery waits for gno.land's binding (IBCAdmin's first recorded
+/// decision). Before it, Ethereum stays at epoch 1: a recovery then would let gno.land bind at epoch 1 against an
+/// Ethereum already past it, and every dispatch would be refused for good.
+contract IBCAdminRecoveryUnboundTest is ControlsFixture {
+    function _recovery() internal pure override returns (IIBCAdmin.RecoveryConfig memory) {
+        return IIBCAdmin.RecoveryConfig({
+            delay: 30 days, threshold: 3, cancelThreshold: 3, silence: 30 days, holdPeriod: 14 days
+        });
+    }
+
+    function test_m2_recoveryRefusedBeforeTheFirstDecision() public {
+        MockLightClient attested = new MockLightClient();
+        bytes[] memory prefix = new bytes[](2);
+        prefix[0] = "main";
+        prefix[1] = "/pv/vm:gno.land/r/aib/ibc/core:";
+        IIBCAdmin.RecoveryProposal memory p = IIBCAdmin.RecoveryProposal({
+            newClientId: "gnoland-7",
+            counterpartyClientId: "ethereum-7",
+            merklePrefix: prefix,
+            lightClient: address(attested),
+            codeHash: address(attested).codehash,
+            suspectFrom: 0
+        });
+        lc.setStatus(true, false); // eligible by status
+        assertEq(admin.lastSeq(), 0);
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryNotEligible.selector);
+        admin.approveRecovery(p);
+        // gno.land binds: its first decision recorded
+        assertEq(_status(_recvGov(_env(1, S.KIND_SETTINGS, P.settings(clientId, 7 days)))), S.STATUS_RECORDED);
+        for (uint256 g = 0; g < 3; g++) {
+            vm.prank(G[g]);
+            admin.approveRecovery(p);
+        }
+        (, uint64 openedAt,,) = admin.recovery();
+        assertTrue(openedAt != 0, "opens once bound");
     }
 }
