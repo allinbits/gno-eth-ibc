@@ -474,7 +474,7 @@ one incident is never counted by another; nothing is counted on the live client.
   - no `sendRecord` there while the transfer app has **retired** that client id (`isRetired(sourceClient)` on the
     transfer proxy, an `eth_call` at the pinned block, or the storage word `retired[sourceClient]`: in the
     `gno.storage.GnoICS20Transfer` namespace, base `0xf3bec7e430c885c7577ab512690266d2e153034fd4fd64588d19040d96496100`,
-    the mapping's slot is the base plus 10, so the word is `keccak256(bytes(sourceClient) ‖ uint256(0xf3bec7e4…9649610a))`):
+    the mapping's slot is the base plus 10, so the word is `keccak256(bytes(sourceClient) ‖ uint256(0xf3bec7e430c885c7577ab512690266d2e153034fd4fd64588d19040d9649610a))`):
     forged at once, whatever the sequence counter or the timeout says. Retirement is permanent: the only write is
     `migrateRoute` setting it true (kind 10, the emergency recovery), nothing clears it, and every send over a
     retired id is refused (`GnoClientRetired`), so no transfer can ever write a record there again; IBCAdmin's
