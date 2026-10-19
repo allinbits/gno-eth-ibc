@@ -45,9 +45,11 @@ Against Sepolia (needs a funded key in `.env`: `DEPLOYER_PRIVATE_KEY`,
 `ETH_PRIVATE_KEY`, `DEPLOYER_ADDRESS`; and, off a local chain, the deployment
 settings `DeployGnoIBC` requires: `GUARDIANS` (4 comma-separated addresses),
 `WATCH_KEYS` (2) and `EXPECTED_LOCK` (the expected ugnot lock in base units, from which the
-launch limits derive). Relaying stays public: leave `RELAYER_ADDRESS` unset
-(a restricted deployment also needs `ALLOW_RESTRICTED_RELAYING=true`, for
-testing only). See [docs/controls.md](docs/controls.md#deployment) for the
+launch limits derive). Relaying is public: `scripts/sepolia.sh` forwards
+neither `RELAYER_ADDRESS` nor `ALLOW_RESTRICTED_RELAYING`, so the Sepolia
+setup always deploys public relaying whatever `.env` says; a restricted
+deployment (testing only) is made by running `DeployGnoIBC` directly with
+`RELAYER_ADDRESS` and `ALLOW_RESTRICTED_RELAYING=true`. See [docs/controls.md](docs/controls.md#deployment) for the
 deployment and its checks). Optional settings:
 
 - The ugnot route launches **inactive** (zero limits): nothing moves until
@@ -57,8 +59,9 @@ deployment and its checks). Optional settings:
   limits derived from `EXPECTED_LOCK` (zero, the default, keeps the derived
   value). `LAUNCH_ACTIVE=true` installs them at launch instead: test networks
   only (refused on mainnet); `make e2e-local` and the Sepolia setup use it.
-- `QUARANTINE_SECONDS`: the launch quarantine (default 7 days; later changes by
-  kind 11 are capped at 365 days).
+- `QUARANTINE_SECONDS`: the launch quarantine (default 7 days, at most 365
+  days: the deployment sets it through `setQuarantine`, whose ceiling applies
+  to it as to every later kind 11 change).
 - `RECOVERY_DELAY` (0, the default, disables the emergency recovery; otherwise
   at least 30 days), `RECOVERY_THRESHOLD` and `RECOVERY_CANCEL_THRESHOLD`
   (default 3; 3 or 4 when enabled, cancellation at most approval),
