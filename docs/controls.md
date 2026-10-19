@@ -413,7 +413,7 @@ bounds (constant work whatever the number of incidents).
 | Event | Precondition | Effect |
 |---|---|---|
 | replacement (kind 10, emergency recovery) | the old id is the route's current client; the new id fresh (its own route key, if it had one, is abandoned: the new client aliases the old route, whose flags, limits and quarantine govern from then on; flags set under the candidate's own id do not carry over, so operators flag the existing route) | a new *replacement* incident covering the old id (suspect range from `suspectFrom`); the route closes; a reopening under way is aborted (its incidents back to *open*); earlier incidents, their records, reservations and counters untouched. Allowed while the route is closed |
-| ack or timeout | a record of the client | appended to the client's processed list; counted as suspect only if the client is retired |
+| ack or timeout | an **unsettled** record of the client (a settled record's callback is ignored: history and counters unchanged) | appended to the client's processed list; counted as suspect only if the client is retired |
 | delivery or drain of a governance decision | the transfer app not busy (a delivery from inside a hook reverts whole with no data, so the router writes nothing and the packet is relayed again later; `drain()` records nothing) | the decision recorded; one acting at recording (kind 4 or 11 tightening) applies |
 | kind 12 on a retired client's records | its incident not *reopening*; the outcome proven by the active verifier | the record settled once; its client's open and suspect counts follow |
 | kind 12 booking a loss | the route not reopening | the loss recorded; if the route was open, a *late-loss* incident opens and the route closes |
@@ -446,6 +446,12 @@ one incident is never counted by another; nothing is counted on the live client.
   the batch. Its record is settled and therefore closed, so it never blocks kind 13. The accepted-deficit
   reopening completes, and the refund is paid by `claimParked` once the backing returns
   (`test_parkedShortfallRefunds_reopeningCompletes`, `test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment`).
+- **A failed executor cannot always hand over (accepted residual).** Kind 9 is recorded and executed by the
+  installed executor itself: an executor whose hand-over path (its kind 9 recording or execution, or the self-step
+  that runs it) is defective cannot install its replacement, and governance on Ethereum is stranded with it
+  (IBCAdmin is immutable and has no independent kind 9 path). Mitigation, before any executor release is approved:
+  its own kind 9 hand-over to a further executor is exercised in the release's test suite and on a test deployment,
+  since the build verification establishes only code identity, not that the hand-over works.
 - **Settlements are final.** A kind 12 settlement is final once it executes. Before that, it waits its seven-day
   delay: guardians can hold it, and a compromise discovered meanwhile voids its proofs (the quarantine checkpoint
   of a verifier swap or replacement changes the verifier generation, and execution requires each record's outcome
@@ -465,7 +471,7 @@ one incident is never counted by another; nothing is counted on the live client.
   authenticate each against Ethereum's permanently retained `sendRecord(clientId, sequence)` commitment, read from
   an **independently authenticated finalized state** (an independently trusted node, never the possibly compromised
   light client or a single third-party RPC), with `eth_call` and `eth_getProof` pinned to that finalized block,
-  never "latest". A matching commitment is genuine. A forgery is conclusive in any of three ways, all read from that finalized
+  never "latest". A matching commitment is genuine. A forgery is conclusive in any of four ways, all read from that finalized
   state:
   - a `sendRecord` at that (client id, sequence) that holds a **different** packet's commitment: forged at once;
   - **no** `sendRecord` there, while eureka's `prevSequenceSends[sourceClient]` (in `IBCStoreUpgradeable`'s ERC-7201
@@ -490,7 +496,7 @@ one incident is never counted by another; nothing is counted on the live client.
   `ibc.storage.IBCStore`) and the mapping is its second field, so the word is at
   `keccak256(bytes(sourceClient) ‖ uint256(0x1260944489272988d9df285149b5aa1b0f48f2136d6f416159f840a3e0747601))`. It
   holds the last sequence assigned (the next is that plus one) and counts every app's packets on that client id,
-  IBCAdmin's notices included. Until one of the three applies, the entitlement stays unresolved and containment stays
+  IBCAdmin's notices included. Until one of the four applies, the entitlement stays unresolved and containment stays
   in place. Every forged entitlement is voided or settled on
   gno.land first.
   Ethereum's kind 13 checks only its own incident counters and cannot see these entitlements; when the evidence is
@@ -550,7 +556,12 @@ one incident is never counted by another; nothing is counted on the live client.
     (every id the transfer app knows, a route key, an alias, a retired id or an escrow's, was a router client); a
     proposal naming, say, `bad` is refused (`test_m1_permanentlyInvalidIds_refusedAtApproval`).
     With the authority-changing kinds suspended while it is open, these stay true until execution. Each seat
-    approves one proposal (its hash); a replaced seat loses its approval.
+    approves one proposal (its hash); a replaced seat loses its approval. **Approvals have no expiry**: an approval of
+    a proposal that has not opened stays recorded until its guardian withdraws it (`cancelRecovery` before opening),
+    overwrites it by approving another proposal, or loses its seat, and it survives an epoch switch (kind 10 does not
+    clear it). A later approval can therefore count earlier votes toward opening recovery on the then-current route;
+    guardians withdraw approvals they no longer stand behind. Closing an opened recovery (its execution, or a
+    cancellation by `cancelThreshold` votes) clears every approval.
   - **Launch invariant: Ethereum stays at epoch 1 until gno.land binds.** gno.land binds by sending IBCAdmin its first
     decision. Until IBCAdmin has recorded one (`lastSeq` non-zero in epoch 1), approval is refused
     (`RecoveryNotEligible`, `test_m2_recoveryRefusedBeforeTheFirstDecision`): a recovery then would advance Ethereum
@@ -845,7 +856,10 @@ order matters:
      `suspectFrom` covering the time it ran, whenever its history may need reconciliation: kind 6 migrates a
      client in place, with no incident, no retirement and no `suspectFrom`, and kind 12 settles only a retired
      client's records, so a kind 6 swap fits only when the old verifier's history is trusted.
-5. **Reconcile** what ran meanwhile (kind 12) where the failure touched outcomes: the refunds flags are cleared first
+5. **Reconcile** what ran meanwhile (kind 12) where the failure touched outcomes. Kind 12 settles only a retired
+   client's records, so a reconciliation after an implementation repair (kind 7 or 9) first retires the client:
+   enroll a target client (kind 6 op 1), replace the route (kind 10) with a `suspectFrom` covering the fault's
+   time, prepare the incident (`prepareIncident`), then settle (kind 12) and reopen (kind 13). Before settling: the refunds flags are cleared first
    (their owners), since they defer every refund-paying settlement, while the route flags keep receives and escrowed
    sends stopped. Then lift the route flags (owners clear their own; kind 2 for the rest) once `verifyLive` passes
    again.
@@ -861,7 +875,7 @@ never happen):
 | kind 6 verifier (add or migrate) | `IBCAdminChecks.usableClient` (a view, from the executor) → `getClientState`, `isFrozen`, `isExpired`, `lastTransition` | STATICCALL |
 | recovery proposal's client | `IBCAdminRecovery._usableClient` → `IBCAdminChecks.usableClient` (as above) | STATICCALL |
 | kind 9 executor | `bindings()` | STATICCALL |
-| kind 7 implementation of the transfer app | `IBCAdminChecks.modulesVersion` → `CONTROLS()`, `RECONCILE()`, `EVIDENCE()`, `gnoControlsVersion()` on the implementation and its modules | STATICCALL |
+| kind 7 implementation of the transfer app | `IBCAdminChecks.modulesVersion` → `gnoControlsVersion()` and `CONTROLS()`, `CONTROLS_HASH()` on the implementation; `gnoControlsModuleVersion()`, `gnoSelf()`, `RECONCILE()`, `RECONCILE_HASH()` on the controls; `gnoReconcileModuleVersion()`, `gnoSelf()`, `EVIDENCE()`, `EVIDENCE_HASH()` on reconciliation; `gnoEvidenceModuleVersion()`, `gnoSelf()` on evidence (each module's code hash compared with the one its holder recorded) | STATICCALL |
 | kind 7, any UUPS proxy | OpenZeppelin's `proxiableUUID()` (`view` in `IERC1822Proxiable`), during the upgrade itself | STATICCALL |
 | every candidate | `extcodehash`, `extcodesize` | no call |
 
