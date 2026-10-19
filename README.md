@@ -50,9 +50,13 @@ launch limits derive). Relaying stays public: leave `RELAYER_ADDRESS` unset
 testing only). See [docs/controls.md](docs/controls.md#deployment) for the
 deployment and its checks). Optional settings:
 
-- `GNOT_MAX_PER_MESSAGE`, `GNOT_DAY_CAP`, `GNOT_REFUND_CAP`: override the ugnot
-  launch limits derived from `EXPECTED_LOCK`; zero (the default) keeps the
-  derived value, and an override may only lower it.
+- The ugnot route launches **inactive** (zero limits): nothing moves until
+  gno.land, once IBCAdmin has recorded its first decision, activates it with a
+  kind 4 carrying the deployment file's `activationKind4Params`.
+  `GNOT_MAX_PER_MESSAGE`, `GNOT_DAY_CAP`, `GNOT_REFUND_CAP` lower the activation
+  limits derived from `EXPECTED_LOCK` (zero, the default, keeps the derived
+  value). `LAUNCH_ACTIVE=true` installs them at launch instead: test networks
+  only (refused on mainnet); `make e2e-local` and the Sepolia setup use it.
 - `QUARANTINE_SECONDS`: the launch quarantine (default 7 days; later changes by
   kind 11 are capped at 365 days).
 - `RECOVERY_DELAY` (0, the default, disables the emergency recovery; otherwise
