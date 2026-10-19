@@ -464,9 +464,23 @@ one incident is never counted by another; nothing is counted on the live client.
   authenticate each against Ethereum's permanently retained `sendRecord(clientId, sequence)` commitment, read from
   an **independently authenticated finalized state** (an independently trusted node, never the possibly compromised
   light client or a single third-party RPC), with `eth_call` and `eth_getProof` pinned to that finalized block,
-  never "latest". A matching commitment is genuine. Absence or a mismatch is conclusive only once that finalized
-  state's timestamp has reached the packet's timeout (a send could still be committed until then); before that the
-  entitlement stays unresolved and containment stays in place. Every forged entitlement is voided or settled on
+  never "latest". A matching commitment is genuine. A forgery is conclusive in any of three ways, all read from that finalized
+  state:
+  - a `sendRecord` at that (client id, sequence) that holds a **different** packet's commitment: forged at once;
+  - **no** `sendRecord` there, while the router's last assigned send sequence for that client id is already at or
+    past the receive's sequence (the next send sequence is past it, so no send can ever take that sequence): forged
+    at once;
+  - no `sendRecord` there once the finalized timestamp has reached the packet's timeout (a forged packet may carry
+    a timeout years ahead, so this path alone is not enough).
+
+  The router's sequence has no public getter in eureka v3.0.2 (`nextSequenceSend` is internal): read it as a
+  storage proof (`eth_getProof` on the router proxy at the finalized block) of `IBCStoreStorage.prevSequenceSends[clientId]`.
+  The namespace is at slot `0x1260944489272988d9df285149b5aa1b0f48f2136d6f416159f840a3e0747600` (ERC-7201
+  `ibc.storage.IBCStore`) and the mapping is its second field, so the word is at
+  `keccak256(bytes(clientId) ‖ uint256(0x1260944489272988d9df285149b5aa1b0f48f2136d6f416159f840a3e0747601))`. It
+  holds the last sequence assigned (the next is that plus one) and counts every app's packets on that client id,
+  IBCAdmin's notices included. Until one of the three applies, the entitlement stays unresolved and containment stays
+  in place. Every forged entitlement is voided or settled on
   gno.land first.
   Ethereum's kind 13 checks only its own incident counters and cannot see these entitlements; when the evidence is
   unavailable, the route stays closed.
