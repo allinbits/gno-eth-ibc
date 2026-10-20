@@ -204,6 +204,33 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertEq(_state(seq), S.EXECUTED);
     }
 
+    /// @notice An attempt before the change is due pins nothing (it reverts NotMature), so a hold that ends before the
+    /// due time never anchors even when someone tried to execute while it stood.
+    function test_kind3_anchor_attemptBeforeDue_pinsNothing() public {
+        uint256 t0 = _now();
+        uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
+        vm.warp(t0 + 1 days);
+        _hold(); // days 1 to 3
+        vm.warp(t0 + 2 days);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 7 days));
+        admin.execute(seq); // before due: nothing pinned
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), 0);
+        vm.prank(G[1]);
+        admin.clearFlag();
+        vm.warp(t0 + 20 days);
+        vm.prank(G[1]);
+        admin.setFlag(); // the hold from day 20
+        vm.warp(t0 + 22 days);
+        admin.execute(seq);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
+        vm.warp(t0 + 41 days - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 41 days));
+        admin.execute(seq);
+        vm.warp(t0 + 41 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+    }
+
     /// @notice Design r2 #1, the cycling attack: a guardian clears, waits out the 24-hour grace and flags again, over
     /// and over. The anchor, pinned at the first hold after the replacement was due, never moves: it lands from the
     /// anchor plus 21 days, whatever hold stands then.
