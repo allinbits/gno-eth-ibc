@@ -81,10 +81,6 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         return GnoTransferStorage.layout();
     }
 
-    function _route(string calldata clientId) private view returns (GnoTransferStorage.Route storage) {
-        return _g().routes[GnoTransferStorage.routeHash(clientId)];
-    }
-
     // ----------------------------------------------------------------------------------------------- refunds --
 
     /// @notice See IGnoICS20Controls.
@@ -99,7 +95,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         returns (uint256 paid)
     {
         GnoTransferStorage.Layout storage g = _g();
-        bytes32 route = _openRoute(clientId);
+        bytes32 route = GnoTransferStorage.openRoute(clientId);
         GnoTransferStorage.TokenControls storage t = g.tokens[route][token];
         if (maxCount > MAX_CLAIMS) maxCount = MAX_CLAIMS;
         uint64 now_ = uint64(block.timestamp);
@@ -136,14 +132,6 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             delete t.queue[t.head++];
             ++paid;
         }
-    }
-
-    /// @notice A route whose refunds may be paid: not closed (its refunds wait for kind 12's reconciliation) and
-    /// not under a refunds hold.
-    function _openRoute(string calldata clientId) private view returns (bytes32 route) {
-        route = GnoTransferStorage.routeHash(clientId);
-        require(!_g().routes[route].closed, GnoRouteClosed(clientId));
-        require(!GnoTransferStorage.refundsHeld(route), GnoRefundsHeld(clientId));
     }
 
     // ------------------------------------------------------------------------------------------ the ack hook --
@@ -255,7 +243,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     function _flag(string calldata clientId, bool refunds, bool set) private {
         GnoTransferStorage.Layout storage g = _g();
-        GnoTransferStorage.Route storage r = _route(clientId);
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
         Guardians.Flags storage f = refunds ? r.refundFlags : r.flags;
         uint64 grace = GnoTransferStorage.GRACE;
         uint256 i = set
@@ -322,7 +310,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
             GnoBadLimits()
         );
         // receive limits (which enable receives) wait for the route's quarantine
-        require(_route(clientId).quarantineArmed, GnoBadLimits());
+        require(GnoTransferStorage.routeFor(clientId).quarantineArmed, GnoBadLimits());
         GnoTransferStorage.TokenControls storage t = _g().tokens[GnoTransferStorage.routeHash(clientId)][token];
         // the buckets drain at the old caps up to now; the new caps apply from now on
         uint64 now_ = uint64(block.timestamp);
@@ -336,7 +324,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function setQuarantine(string calldata clientId, uint64 seconds_) external delegated restricted nonReentrant {
         require(seconds_ <= MAX_QUARANTINE, GnoBadLimits());
-        GnoTransferStorage.Route storage r = _route(clientId);
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
         // the transitions accepted so far keep the deadline the old duration gave them; the launch's arming has no
         // old duration: every transition since the trusted checkpoint (anyone may relay one before it) counts as
         // live with the launch duration
@@ -359,7 +347,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function checkpointQuarantine(string calldata clientId) external delegated restricted nonReentrant {
-        GnoTransferStorage.Route storage r = _route(clientId);
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
         _checkpoint(r, clientId);
         // called before every verifier swap: outcomes proven through the old verifier are void
         ++r.verifierGen;
@@ -386,7 +374,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         returns (uint256 cleared)
     {
         GnoTransferStorage.Layout storage g = _g();
-        GnoTransferStorage.Route storage r = _route(clientId);
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
         uint64 b = uint64(block.number);
         uint64 t = uint64(block.timestamp);
         uint64 grace = GnoTransferStorage.GRACE;
@@ -398,7 +386,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function setRecoveryBlock(string calldata clientId, bool blocked) external delegated restricted nonReentrant {
-        _route(clientId).recoveryBlocked = blocked;
+        GnoTransferStorage.routeFor(clientId).recoveryBlocked = blocked;
         emit GnoRecoveryBlockSet(GnoTransferStorage.routeKey(clientId), blocked);
     }
 
@@ -426,8 +414,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
         GnoTransferStorage.Route storage r = g.routes[keccak256(bytes(key))];
         // only the route's current client is replaced; also while the route is closed (an earlier incident's
         // reconciliation unfinished: it carries over untouched), and a reopening under way is aborted
-        string memory current = bytes(g.currentOf[key]).length == 0 ? key : g.currentOf[key];
-        require(keccak256(bytes(current)) == keccak256(bytes(oldClientId)), GnoBadRoute());
+        require(keccak256(bytes(GnoTransferStorage.currentClient(key))) == keccak256(bytes(oldClientId)), GnoBadRoute());
         GnoTransferStorage.abortReopening(r, key);
         g.routeOf[newClientId] = key;
         g.currentOf[key] = newClientId;
@@ -459,8 +446,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     function _lastTransition(string calldata clientId) private view returns (address lc, uint64 id, uint64 time) {
         // the route's current client, whichever of its ids names it: a retired id's client is frozen
         string memory key = GnoTransferStorage.routeKey(clientId);
-        string memory current = _g().currentOf[key];
-        if (bytes(current).length == 0) current = key;
+        string memory current = GnoTransferStorage.currentClient(key);
         (bool ok, bytes memory ret) =
             GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
         require(ok && ret.length == 32, GnoQuarantineUnknown(clientId));
@@ -481,8 +467,7 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function currentClient(string calldata routeKey_) external view delegated returns (string memory) {
-        string memory c = _g().currentOf[routeKey_];
-        return bytes(c).length == 0 ? routeKey_ : c;
+        return GnoTransferStorage.currentClient(routeKey_);
     }
 
     /// @notice See IGnoICS20Controls.
@@ -497,22 +482,24 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function routeFlags(string calldata clientId) external view delegated returns (IGuardians.Flag[6] memory) {
-        return Guardians.flags(_g().keys, _route(clientId).flags);
+        return Guardians.flags(_g().keys, GnoTransferStorage.routeFor(clientId).flags);
     }
 
     /// @notice See IGnoICS20Controls.
     function refundsFlags(string calldata clientId) external view delegated returns (IGuardians.Flag[6] memory) {
-        return Guardians.flags(_g().keys, _route(clientId).refundFlags);
+        return Guardians.flags(_g().keys, GnoTransferStorage.routeFor(clientId).refundFlags);
     }
 
     /// @notice See IGnoICS20Controls.
     function routeHold(string calldata clientId) external view delegated returns (IGuardians.Flag memory) {
-        return Guardians.holdView(_g().keys, _route(clientId).flags, uint64(block.timestamp), GnoTransferStorage.GRACE);
+        return Guardians.holdView(
+            _g().keys, GnoTransferStorage.routeFor(clientId).flags, uint64(block.timestamp), GnoTransferStorage.GRACE
+        );
     }
 
     /// @notice See IGnoICS20Controls.
     function routeClosed(string calldata clientId) external view delegated returns (bool) {
-        return _route(clientId).closed;
+        return GnoTransferStorage.routeFor(clientId).closed;
     }
 
     /// @notice See IGnoICS20Controls.
@@ -523,13 +510,13 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function suspectRecords(string calldata clientId) external view delegated returns (uint64 from, uint64 open) {
         GnoTransferStorage.ClientRecon storage c = _g().clients[keccak256(bytes(clientId))];
-        if (c.incident != 0) from = _route(clientId).incidents[c.incident - 1].suspectFrom;
+        if (c.incident != 0) from = GnoTransferStorage.routeFor(clientId).incidents[c.incident - 1].suspectFrom;
         return (from, c.suspectOpen);
     }
 
     /// @notice See IGnoICS20Controls.
     function routeReopening(string calldata clientId) external view delegated returns (bool) {
-        return _route(clientId).reopening;
+        return GnoTransferStorage.routeFor(clientId).reopening;
     }
 
     /// @notice See IGnoICS20Controls.
@@ -550,13 +537,16 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function refundsHold(string calldata clientId) external view delegated returns (IGuardians.Flag memory) {
         return Guardians.holdView(
-            _g().keys, _route(clientId).refundFlags, uint64(block.timestamp), GnoTransferStorage.GRACE
+            _g().keys,
+            GnoTransferStorage.routeFor(clientId).refundFlags,
+            uint64(block.timestamp),
+            GnoTransferStorage.GRACE
         );
     }
 
     /// @notice See IGnoICS20Controls.
     function routePaused(string calldata clientId) external view delegated returns (bool) {
-        return Guardians.anyFlag(_g().keys, _route(clientId).flags);
+        return Guardians.anyFlag(_g().keys, GnoTransferStorage.routeFor(clientId).flags);
     }
 
     /// @notice See IGnoICS20Controls.
@@ -575,12 +565,12 @@ contract GnoICS20Controls is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
 
     /// @notice See IGnoICS20Controls.
     function quarantineSeconds(string calldata clientId) external view delegated returns (uint64) {
-        return _route(clientId).quarantineSeconds;
+        return GnoTransferStorage.routeFor(clientId).quarantineSeconds;
     }
 
     /// @notice See IGnoICS20Controls.
     function recoveryBlocked(string calldata clientId) external view delegated returns (bool) {
-        return _route(clientId).recoveryBlocked;
+        return GnoTransferStorage.routeFor(clientId).recoveryBlocked;
     }
 
     /// @notice See IGnoICS20Controls.

@@ -85,7 +85,7 @@ contract IBCAdminRecovery is IIBCAdmin {
     /// expired. Its height is not compared with the old client's: a poisoned client's height means nothing.
     function _usableClient(S.Layout storage l, RecoveryProposal memory rp) private view returns (bool) {
         address lc = rp.lightClient;
-        if (!_isCode(lc) || lc.codehash != rp.codeHash) return false;
+        if (!S.isCode(lc) || lc.codehash != rp.codeHash) return false;
         if (!S.canonicalCounterparty(rp.counterpartyClientId, rp.merklePrefix)) return false;
         // its chain id and every status view answering exactly, not frozen, not expired (fail closed)
         return IBCAdminChecks(checks).usableClient(lc, l.gnoChainId);
@@ -112,13 +112,6 @@ contract IBCAdminRecovery is IIBCAdmin {
         return answered && value;
     }
 
-    function _closeRecovery(S.Recovery storage r) private {
-        r.proposal = bytes32(0);
-        r.openedAt = 0;
-        r.cancels = 0;
-        delete r.approved;
-    }
-
     /// @notice Executes the open proposal once its delay has passed (§7.12 step 4): adds the attested client under
     /// its new id, migrates the route, freezes the old id and opens the next epoch over the new one.
     function executeRecovery(RecoveryConfig calldata c) external delegated {
@@ -140,22 +133,7 @@ contract IBCAdminRecovery is IIBCAdmin {
         // the route (now the new id's) was blocked while the proposal was open
         IGnoICS20Controls(ics20).setRecoveryBlock(rp.newClientId, false);
         S.replaceRoute(l, router, frozenClient, oldId, rp.newClientId);
-        _closeRecovery(r);
+        S.closeRecovery(r);
         emit RecoveryExecuted(h, rp.newClientId);
-    }
-
-    /// @notice Whether `a` holds contract code, and not an EIP-7702 delegation designator.
-    function _isCode(address a) private view returns (bool) {
-        uint256 size;
-        bytes32 head;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            size := extcodesize(a)
-            let ptr := mload(0x40)
-            mstore(ptr, 0)
-            extcodecopy(a, ptr, 0, 3)
-            head := mload(ptr)
-        }
-        return size != 0 && bytes3(head) != 0xef0100;
     }
 }

@@ -77,17 +77,6 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         return GnoTransferStorage.layout();
     }
 
-    function _route(string calldata clientId) private view returns (GnoTransferStorage.Route storage) {
-        return _g().routes[GnoTransferStorage.routeHash(clientId)];
-    }
-
-    /// @notice A route whose refunds may be paid: not closed and not under a refunds hold.
-    function _openRoute(string calldata clientId) private view returns (bytes32 route) {
-        route = GnoTransferStorage.routeHash(clientId);
-        require(!_g().routes[route].closed, GnoRouteClosed(clientId));
-        require(!GnoTransferStorage.refundsHeld(route), GnoRefundsHeld(clientId));
-    }
-
     /// @notice See IGnoICS20Controls.
     function claimParked(
         string calldata clientId,
@@ -102,7 +91,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         GnoTransferStorage.Layout storage g = _g();
         SendRecord storage rec = g.records[keccak256(bytes(clientId))][sequence];
         require(rec.payment == Payment.Parked, GnoNotParked(clientId, sequence));
-        bytes32 route = _openRoute(clientId);
+        bytes32 route = GnoTransferStorage.openRoute(clientId);
         GnoTransferStorage.TokenControls storage t = g.tokens[route][rec.token];
         uint64 now_ = uint64(block.timestamp);
         uint256 reservedBefore = GnoTransferStorage.reservation(rec);
@@ -261,7 +250,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
         GnoTransferStorage.Layout storage g = _g();
         string memory key = GnoTransferStorage.routeKey(clientId);
         GnoTransferStorage.Route storage r = g.routes[keccak256(bytes(key))];
-        string memory current = bytes(g.currentOf[key]).length == 0 ? key : g.currentOf[key];
+        string memory current = GnoTransferStorage.currentClient(key);
         // the route's current verifier and its last transition, if it answers exactly (two uint64 words)
         (bool ok, bytes memory ret) =
             GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
@@ -435,7 +424,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
     function reopenRoute(string calldata clientId) external delegated restricted nonReentrant {
         // named by the route's current client only (ADR §7.12), never a retired alias
         require(!_g().retired[clientId], GnoBadRoute());
-        GnoTransferStorage.Route storage r = _route(clientId);
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
         require(r.closed && !r.reopening, GnoNotClosed(clientId));
         // every unresolved incident settled (constant work: the count is kept as records settle): its client's
         // records reconciled (no outstanding packet, no refund owed, no unsettled suspect record); a late loss needs
@@ -449,7 +438,7 @@ contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, 
 
     /// @notice See IGnoICS20Controls.
     function continueReopen(string calldata clientId, uint256 n) external delegated nonReentrant {
-        GnoTransferStorage.Route storage r = _route(clientId);
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
         require(r.reopening, GnoNotClosed(clientId));
         _acceptDeficits(r, clientId, n > REOPEN_BATCH ? REOPEN_BATCH : n);
     }

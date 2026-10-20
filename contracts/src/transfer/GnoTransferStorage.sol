@@ -170,22 +170,43 @@ library GnoTransferStorage {
         return keccak256(bytes(routeKey(clientId)));
     }
 
+    /// @notice The route `clientId` names (by any of its ids).
+    function routeFor(string calldata clientId) internal view returns (Route storage) {
+        return layout().routes[routeHash(clientId)];
+    }
+
+    /// @notice A route whose refunds may be paid: not closed (its refunds wait for kind 12's reconciliation) and not
+    /// under a refunds hold.
+    function openRoute(string calldata clientId) internal view returns (bytes32 h) {
+        h = routeHash(clientId);
+        require(!layout().routes[h].closed, IGnoICS20ControlsTypes.GnoRouteClosed(clientId));
+        require(!refundsHeld(h), IGnoICS20ControlsTypes.GnoRefundsHeld(clientId));
+    }
+
+    /// @notice The route's current client id, from its key (`routeKey`): the key itself until a replacement moved it.
+    function currentClient(string memory key) internal view returns (string memory c) {
+        c = layout().currentOf[key];
+        if (bytes(c).length == 0) c = key;
+    }
+
     /// @notice `transfer/<client id>/rest` with an aliased client id as `transfer/<route key>/rest`.
     function toRouteDenom(bytes memory path) internal view returns (bytes memory) {
-        (bool ok, string memory hop, uint256 end) = _firstHop(path);
-        if (!ok) return path;
-        string memory r = layout().routeOf[hop];
-        if (bytes(r).length == 0) return path;
-        return abi.encodePacked(ICS20Lib.DEFAULT_PORT_ID, "/", r, Bytes.slice(path, end));
+        return _rehop(path, layout().routeOf);
     }
 
     /// @notice `transfer/<route key>/rest` of a migrated route as `transfer/<current client id>/rest`.
     function toWireDenom(bytes memory path) internal view returns (bytes memory) {
+        return _rehop(path, layout().currentOf);
+    }
+
+    /// @notice `transfer/<hop>/rest` as `transfer/<to[hop]>/rest`, or `path` unchanged when it has no such first hop
+    /// or `to[hop]` is empty.
+    function _rehop(bytes memory path, mapping(string => string) storage to) private view returns (bytes memory) {
         (bool ok, string memory hop, uint256 end) = _firstHop(path);
         if (!ok) return path;
-        string memory c = layout().currentOf[hop];
-        if (bytes(c).length == 0) return path;
-        return abi.encodePacked(ICS20Lib.DEFAULT_PORT_ID, "/", c, Bytes.slice(path, end));
+        string memory h = to[hop];
+        if (bytes(h).length == 0) return path;
+        return abi.encodePacked(ICS20Lib.DEFAULT_PORT_ID, "/", h, Bytes.slice(path, end));
     }
 
     /// @notice The client id of a path's first hop `transfer/<hop>/`, and where the rest (from that '/') starts.

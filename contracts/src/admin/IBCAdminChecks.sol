@@ -71,17 +71,7 @@ contract IBCAdminChecks {
     /// reverts or returns anything but its exact encoding makes the client unusable): not frozen, not expired, and a
     /// last transition.
     function usableClient(address lc, string calldata chainId) external view returns (bool) {
-        uint256 size;
-        bytes32 head;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            size := extcodesize(lc)
-            let ptr := mload(0x40)
-            mstore(ptr, 0)
-            extcodecopy(lc, ptr, 0, 3)
-            head := mload(ptr)
-        }
-        if (size == 0 || bytes3(head) == 0xef0100) return false;
+        if (!S.isCode(lc)) return false;
         (bool ok, bytes memory ret) = lc.staticcall(abi.encodeWithSignature("getClientState()"));
         if (!ok) return false;
         IGnoLightClientMsgs.ClientState memory cs =

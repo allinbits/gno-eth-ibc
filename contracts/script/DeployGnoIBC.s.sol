@@ -5,6 +5,7 @@ import { Script } from "forge-std/Script.sol";
 import { stdJson } from "forge-std/StdJson.sol";
 
 import { AccessManager } from "@openzeppelin-contracts/access/manager/AccessManager.sol";
+import { Math } from "@openzeppelin-contracts/utils/math/Math.sol";
 import { ERC1967Proxy } from "@openzeppelin-contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { UUPSUpgradeable } from "@openzeppelin-contracts/proxy/utils/UUPSUpgradeable.sol";
 
@@ -247,18 +248,14 @@ contract DeployGnoIBC is Script {
         returns (IGnoICS20ControlsTypes.Limits memory l)
     {
         require(expectedLock != 0, "EXPECTED_LOCK is required");
-        uint256 dayCap = _min(100_000 * GNOT, expectedLock / 10);
-        uint256 maxPerMessage = _min(25_000 * GNOT, dayCap);
+        uint256 dayCap = Math.min(100_000 * GNOT, expectedLock / 10);
+        uint256 maxPerMessage = Math.min(25_000 * GNOT, dayCap);
         require(
             dayOverride <= dayCap && maxOverride <= maxPerMessage && refundOverride <= dayCap, "overrides only lower"
         );
         l.dayCap = dayOverride != 0 ? dayOverride : dayCap;
-        l.maxPerMessage = _min(maxOverride != 0 ? maxOverride : maxPerMessage, l.dayCap);
+        l.maxPerMessage = Math.min(maxOverride != 0 ? maxOverride : maxPerMessage, l.dayCap);
         l.refundCap = refundOverride != 0 ? refundOverride : l.dayCap;
-    }
-
-    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
-        return a < b ? a : b;
     }
 
     function _u64(uint256 v, string memory name) internal pure returns (uint64) {

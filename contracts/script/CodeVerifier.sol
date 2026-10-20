@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import { Script } from "forge-std/Script.sol";
 import { console2 } from "forge-std/console2.sol";
+import { ERC1967Utils } from "@openzeppelin-contracts/proxy/ERC1967/ERC1967Utils.sol";
 import { IIBCAdmin } from "../src/interfaces/IIBCAdmin.sol";
 import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
 
@@ -47,9 +48,6 @@ interface IBCAdminLike {
 /// hash, which the watcher computes from gno.land's envelope), name the expected candidate, pin its code hash, and the
 /// candidate's whole delegate graph must rebuild to its deployed code.
 abstract contract CodeVerifier is Script {
-    /// @notice ERC-1967's implementation slot.
-    bytes32 internal constant IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
-
     uint8 internal constant KIND_VOUCHER = 5;
     uint8 internal constant KIND_CLIENT = 6;
     uint8 internal constant KIND_UPGRADE = 7;
@@ -103,7 +101,7 @@ abstract contract CodeVerifier is Script {
 
     /// @notice The live implementation of an ERC-1967 proxy, read from its slot.
     function implementationOf(address proxy) public view returns (address) {
-        return address(uint160(uint256(vm.load(proxy, IMPLEMENTATION_SLOT))));
+        return address(uint160(uint256(vm.load(proxy, ERC1967Utils.IMPLEMENTATION_SLOT))));
     }
 
     /// @notice The transfer app's graph from an implementation: the fork, its controls, reconciliation and evidence,

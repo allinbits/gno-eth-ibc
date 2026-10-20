@@ -149,9 +149,8 @@ contract GnoICS20Evidence is IGnoICS20ControlsTypes, ReentrancyGuardTransient, A
     /// @notice See IGnoICS20Controls.
     function quarantineEnd(string calldata clientId) external view delegated returns (uint256) {
         string memory key = GnoTransferStorage.routeKey(clientId);
-        string memory current = _g().currentOf[key];
-        if (bytes(current).length == 0) current = key;
-        address lc = address(IICS02Client(GnoTransferStorage.ics20Router()).getClient(current));
+        address lc =
+            address(IICS02Client(GnoTransferStorage.ics20Router()).getClient(GnoTransferStorage.currentClient(key)));
         (uint64 id, uint64 time) = IGnoLightClientStatus(lc).lastTransition();
         return GnoTransferStorage.quarantineUntil(_g().routes[GnoTransferStorage.routeHash(clientId)], lc, id, time);
     }

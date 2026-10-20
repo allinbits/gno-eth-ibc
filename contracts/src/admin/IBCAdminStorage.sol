@@ -292,6 +292,15 @@ library IBCAdminStorage {
         return (SPEND, "params");
     }
 
+    /// @notice Closes the emergency recovery (executed or cancelled): no proposal open, every vote and approval
+    /// cleared.
+    function closeRecovery(Recovery storage r) internal {
+        r.proposal = bytes32(0);
+        r.openedAt = 0;
+        r.cancels = 0;
+        delete r.approved;
+    }
+
     /// @notice Whether `a` holds contract code, and not an EIP-7702 delegation designator.
     function isCode(address a) internal view returns (bool) {
         uint256 size;

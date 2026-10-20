@@ -131,12 +131,8 @@ contract IBCAdminExec is IIBCAdmin {
             return Guardians.checkReplace(S.layout().g.k, pairs) == bytes4(0) ? (S.WAIT, "") : (S.SPEND, "params");
         }
         if (kind == S.KIND_LIMITS) {
-            (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
-            if (!_validLimits(token, l)) return (S.SPEND, "params");
-            if (_loosens(IGnoICS20Controls(ics20).limits(clientId, token), l)) return (S.WAIT, "");
-            if (!S.supersede(S.layout(), _limitsKey(clientId, token), seq)) return (S.SPEND, "superseded");
-            IGnoICS20Controls(ics20).setLimits(clientId, token, l);
-            return (S.DONE_NOW, "");
+            (bool wait, string memory reason) = _limits(p, seq, true);
+            return _atRecordingStep(wait, reason);
         }
         if (kind == S.KIND_ROLE) {
             (bool grant, uint64 roleId, address account) = abi.decode(p, (bool, uint64, address));
@@ -147,12 +143,39 @@ contract IBCAdminExec is IIBCAdmin {
             return (S.DONE_NOW, "");
         }
         // KIND_SETTINGS (IBCAdmin records no other kind here)
+        (bool shortening, string memory why) = _quarantine(p, seq, true);
+        return _atRecordingStep(shortening, why);
+    }
+
+    /// @notice A limits or quarantine step's verdict at recording: a loosening waits its 7 days, a refusal spends,
+    /// a tightening applied at once is done.
+    function _atRecordingStep(bool wait, string memory reason) private pure returns (uint8, string memory) {
+        if (wait) return (S.WAIT, "");
+        return bytes(reason).length != 0 ? (S.SPEND, reason) : (S.DONE_NOW, "");
+    }
+
+    /// @notice Kind 4 `(clientId, token, limits)`: decoded and validated (else "params"); at recording a loosening
+    /// waits (`wait`), at execution it applies; applied only if no later decision already set them ("superseded").
+    function _limits(bytes calldata p, uint64 seq, bool recording) private returns (bool wait, string memory) {
+        (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
+        if (!_validLimits(token, l)) return (false, "params");
+        if (recording && _loosens(IGnoICS20Controls(ics20).limits(clientId, token), l)) return (true, "");
+        // at execution: a tightening recorded after this loosening, and applied at once, stands
+        if (!S.supersede(S.layout(), _limitsKey(clientId, token), seq)) return (false, "superseded");
+        IGnoICS20Controls(ics20).setLimits(clientId, token, l);
+        return (false, "");
+    }
+
+    /// @notice Kind 11 `(clientId, quarantineSeconds)`: validated (else "params"; an empty id refused at recording);
+    /// at recording a shortening waits (`wait`), at execution it applies; applied only if no later decision already
+    /// set it ("superseded").
+    function _quarantine(bytes calldata p, uint64 seq, bool recording) private returns (bool wait, string memory) {
         (string memory id, uint64 q) = abi.decode(p, (string, uint64));
-        if (q > MAX_QUARANTINE || bytes(id).length == 0) return (S.SPEND, "params");
-        if (q < IGnoICS20Controls(ics20).quarantineSeconds(id)) return (S.WAIT, "");
-        if (!S.supersede(S.layout(), _quarantineKey(id), seq)) return (S.SPEND, "superseded");
+        if (q > MAX_QUARANTINE || (recording && bytes(id).length == 0)) return (false, "params");
+        if (recording && q < IGnoICS20Controls(ics20).quarantineSeconds(id)) return (true, "");
+        if (!S.supersede(S.layout(), _quarantineKey(id), seq)) return (false, "superseded");
         IGnoICS20Controls(ics20).setQuarantine(id, q);
-        return (S.DONE_NOW, "");
+        return (false, "");
     }
 
     function _decodeLimits(bytes calldata p)
@@ -214,12 +237,8 @@ contract IBCAdminExec is IIBCAdmin {
         if (kind == S.KIND_UNPAUSE) return _unpause(p, recordedBlock);
         if (kind == S.KIND_SEATS) return _seats(p);
         if (kind == S.KIND_LIMITS) {
-            (string memory clientId, address token, IGnoICS20ControlsTypes.Limits memory l) = _decodeLimits(p);
-            if (!_validLimits(token, l)) return "params";
-            // a tightening recorded after this loosening, and applied at once, stands
-            if (!S.supersede(S.layout(), _limitsKey(clientId, token), seq)) return "superseded";
-            IGnoICS20Controls(ics20).setLimits(clientId, token, l);
-            return "";
+            (, string memory reason) = _limits(p, seq, false);
+            return reason;
         }
         if (kind == S.KIND_VOUCHER) return _voucher(p);
         if (kind == S.KIND_CLIENT) return _client(p);
@@ -246,11 +265,8 @@ contract IBCAdminExec is IIBCAdmin {
             return _call(ics20, abi.encodeCall(IGnoICS20Controls.reopenRoute, (rid))) ? "" : "route";
         }
         // KIND_SETTINGS: a shortening (a lengthening executed at recording)
-        (string memory id, uint64 q) = abi.decode(p, (string, uint64));
-        if (q > MAX_QUARANTINE) return "params";
-        if (!S.supersede(S.layout(), _quarantineKey(id), seq)) return "superseded";
-        IGnoICS20Controls(ics20).setQuarantine(id, q);
-        return "";
+        (, string memory why) = _quarantine(p, seq, false);
+        return why;
     }
 
     /// @notice Kind 2: object 1 the transfer route of `clientId`, 2 IBCAdmin; spent under a hold on that object;

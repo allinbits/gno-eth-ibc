@@ -195,10 +195,7 @@ contract IBCAdminNative is IIBCAdmin {
         emit RecoveryCancelVote(h, guardian, n);
         if (n < cancelThreshold) return;
         emit RecoveryCancelled(h);
-        r.proposal = bytes32(0);
-        r.openedAt = 0;
-        r.cancels = 0;
-        delete r.approved;
+        S.closeRecovery(r);
         // a caller starving the call cannot leave the block standing on purpose: below the call's budget it reverts
         if (gasleft() < UNBLOCK_GAS * 64 / 63 + 20_000) revert CallStarved();
         try IGnoICS20Controls(ics20).setRecoveryBlock{ gas: UNBLOCK_GAS }(l.govClient, false) { }
