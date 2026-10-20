@@ -66,8 +66,6 @@ interface IIBCAdmin {
     error Undecodable();
     error StaleEpoch(uint32 epoch, uint32 current);
     error BeyondWindow(uint64 seq, uint64 last);
-    error ExecutionStarved();
-    error NotSupported();
 
     // ------------------------------------------------------------------------------------------ other refusals --
 

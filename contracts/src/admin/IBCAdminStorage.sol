@@ -161,7 +161,8 @@ library IBCAdminStorage {
     }
 
     /// @notice An epoch's notice: recorded when its epoch opened by kind 10 or the emergency recovery, the client it
-    /// travels over (the epoch's), whether gno.land acknowledged it, and its last send's sequence (zero: none).
+    /// travels over (the epoch's) and whether gno.land acknowledged it. `seq` is unused, kept for the layout (each
+    /// send's sequence is in `EpochNoticeSent`).
     struct Notice {
         bool recorded;
         bool acked;

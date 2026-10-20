@@ -79,19 +79,30 @@ contract IBCAdminNative is IIBCAdmin {
         return (action, reason);
     }
 
-    /// @notice When a pending kind 9 may land (`due`), and whether this call pinned an anchor (it then must not
-    /// revert: the caller returns, pending, before `due`). From `matureAt` (its 7 days), two deferrals, both applied:
-    /// - **under a hold**, kind 3's rule exactly: no sooner than the hold anchor plus 21 days, the anchor the start
-    ///   of the first hold standing at or after `matureAt` (`IBCAdminStorage.anchor`: the hold history, `end`
-    ///   exclusive, merged intervals never an anchor), pinned in `seatAnchor` the first time it is seen due and held;
-    /// - **under flags** (any standing flag, or a conflict's): no sooner than the flag anchor plus 21 days, the
-    ///   anchor the earliest start (`flagTime`) of the flags standing the first time it is seen due and flagged (a
-    ///   conflict's flag counting from that moment), pinned in `flagAnchor` and never reset: a flag set, cleared or
-    ///   set again later does not move it. A flag standing since before `matureAt` counts from its own start.
-    /// A deferral applies only while its cause stands: with no hold and no flag it lands at `matureAt`.
-    function handoverDue(uint32 ep, uint64 seq, uint64 matureAt) external delegated returns (uint64 due, bool pinned) {
+    /// @notice When a pending seat change (kind 3, `flags` false) or hand-over (kind 9, `flags` true) may land
+    /// (`due`), and whether this call pinned an anchor (it then must not revert: the caller returns, pending, before
+    /// `due`). From `matureAt` (its 7 days), the deferrals applied, each only while its cause stands:
+    /// - **under a hold** (both kinds; ADR §7.4): no sooner than the hold anchor plus 21 days, the anchor the start of
+    ///   the first hold standing at or after `matureAt` (`IBCAdminStorage.anchor`: the hold history, `end` exclusive,
+    ///   merged intervals never an anchor), pinned in `seatAnchor` the first time it is seen due and held;
+    /// - **under flags** (kind 9 only; any standing flag, or a conflict's): no sooner than the flag anchor plus 21
+    ///   days, the anchor the earliest start (`flagTime`) of the flags standing the first time it is seen due and
+    ///   flagged (a conflict's flag counting from that moment), pinned in `flagAnchor` and never reset: a flag set,
+    ///   cleared or set again later does not move it. A flag standing since before `matureAt` counts from its own
+    ///   start. A seat change is never deferred by flags (it is how a flagging key is replaced).
+    /// With no hold (and, for kind 9, no flag) it lands at `matureAt`.
+    function due(
+        uint32 ep,
+        uint64 seq,
+        uint64 matureAt,
+        bool flags
+    )
+        external
+        delegated
+        returns (uint64 landsAt, bool pinned)
+    {
         S.Layout storage l = S.layout();
-        due = matureAt;
+        landsAt = matureAt;
         uint64 now_ = uint64(block.timestamp);
         (bool holdStands,, uint64 holdStart) = S.hold(l);
         if (holdStands) {
@@ -102,9 +113,9 @@ contract IBCAdminNative is IIBCAdmin {
                 emit ReplacementAnchored(ep, seq, a + S.HOLD_REPLACEMENT);
                 pinned = true;
             }
-            if (a + S.HOLD_REPLACEMENT > due) due = a + S.HOLD_REPLACEMENT;
+            if (a + S.HOLD_REPLACEMENT > landsAt) landsAt = a + S.HOLD_REPLACEMENT;
         }
-        if (S.flagged(l)) {
+        if (flags && S.flagged(l)) {
             uint64 f = l.flagAnchor[ep][seq];
             if (f == 0 && now_ >= matureAt) {
                 f = l.conflictBlock != 0 ? now_ : type(uint64).max;
@@ -115,7 +126,7 @@ contract IBCAdminNative is IIBCAdmin {
                 emit ReplacementAnchored(ep, seq, f + S.HOLD_REPLACEMENT);
                 pinned = true;
             }
-            if (f + S.HOLD_REPLACEMENT > due) due = f + S.HOLD_REPLACEMENT;
+            if (f + S.HOLD_REPLACEMENT > landsAt) landsAt = f + S.HOLD_REPLACEMENT;
         }
     }
 

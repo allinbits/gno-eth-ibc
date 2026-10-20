@@ -280,11 +280,9 @@ library GnoTransferStorage {
         return true;
     }
 
-    /// @notice The gas a bounded payment gives each token or escrow call, the gas a balance read gets, and the gas a
-    /// bounded payment needs left to start (both calls in full, and what follows them).
+    /// @notice The gas a bounded payment gives each token or escrow call, and the gas a balance read gets.
     uint256 internal constant PAY_GAS = 200_000;
     uint256 internal constant BALANCE_GAS = 30_000;
-    uint256 internal constant PAY_NEED = (BALANCE_GAS + 2 * PAY_GAS) * 64 / 63 + 100_000;
 
     // ------------------------------------------------------------------------------------------ open records --
 
@@ -537,15 +535,6 @@ library GnoTransferStorage {
         // solhint-disable-next-line no-inline-assembly
         assembly {
             router := sload(slot)
-        }
-    }
-
-    /// @notice `_ibcERC20Contracts[denom]`.
-    function ics20Registered(string memory denom) internal view returns (address token) {
-        bytes32 slot = keccak256(abi.encodePacked(denom, ICS20_SLOT + 1));
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            token := sload(slot)
         }
     }
 

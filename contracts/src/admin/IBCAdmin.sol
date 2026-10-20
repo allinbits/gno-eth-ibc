@@ -233,7 +233,6 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         });
         (bool ok, bytes memory ret) = router.call(abi.encodeCall(IICS26Router.sendPacket, (m)));
         uint64 seq = ok && ret.length == 32 ? abi.decode(ret, (uint64)) : 0;
-        if (seq != 0) n.seq = seq;
         emit EpochNoticeSent(ep, n.client, seq);
     }
 
@@ -260,7 +259,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         emit EpochNoticeAcknowledged(ep, m.sequence, done);
     }
 
-    /// @notice A timeout of an epoch's notice: resend it.
+    /// @notice A timeout of an epoch's notice: reported (`EpochNoticeAcknowledged`, not done); anyone resends it with
+    /// `resendEpochNotice`.
     function onTimeoutPacket(IIBCAppCallbacks.OnTimeoutPacketCallback calldata m) external {
         if (msg.sender != router) revert NotRouter(msg.sender);
         uint32 ep = _noticeEpoch(m.sourceClient, m.payload);
@@ -476,33 +476,23 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         }
         uint8 kind = d.kind;
         if (l.recovery.openedAt != 0 && S.suspendedByRecovery(kind)) revert Suspended();
-        (bool holdStands,, uint64 holdStart) = S.hold(l);
+        (bool holdStands,,) = S.hold(l);
         uint64 matureAt = d.recordedTime + _delay(kind);
         bytes memory params = d.params;
         bool revoke = kind == S.KIND_ROLE && params.length >= 32 && uint256(bytes32(params)) == 0;
         if (revoke) {
             // a revocation an open recovery held back: due at once, never deferred (it tightens)
             matureAt = d.recordedTime;
-        } else if (kind == S.KIND_SEATS) {
-            // a seat change's deferral by holds is bounded by a deadline later holds cannot reset (ADR §7.4): its
-            // anchor is the start of the first hold standing at or after it was due (the hold history included, so a
-            // hold nobody observed still counts), pinned the first time it is seen; under a hold it lands from the
-            // anchor plus 21 days, whatever hold stands then, and with no hold standing as any decision does
-            uint64 a = l.seatAnchor[ep][seq];
-            if (a == 0 && holdStands && block.timestamp >= matureAt) {
-                a = S.anchor(l, matureAt, holdStart);
-                l.seatAnchor[ep][seq] = a;
-                emit ReplacementAnchored(ep, seq, a + S.HOLD_REPLACEMENT);
-                if (block.timestamp < a + S.HOLD_REPLACEMENT) return; // pinned (a revert would undo it); pending
-            }
-            if (holdStands && a + S.HOLD_REPLACEMENT > matureAt) matureAt = a + S.HOLD_REPLACEMENT;
-        } else if (kind == S.KIND_HANDOVER) {
-            // IBCAdmin's own deferral (IBCAdminNative.handoverDue), never the executor's: a hold or a flag defers a
-            // hand-over no longer than its anchor plus 21 days, so no unavailable key can keep it from replacing a
-            // broken executor
+        } else if (kind == S.KIND_SEATS || kind == S.KIND_HANDOVER) {
+            // a seat change's or a hand-over's deferral is bounded by deadlines later holds or flags cannot reset
+            // (ADR §7.4; IBCAdminNative.due, never the executor's): a hold delays either no longer than its anchor
+            // plus 21 days; flags never defer a seat change and delay a hand-over no longer than their own anchor
+            // plus 21 days, so no unavailable key can keep a broken executor from being replaced
             bool pinned;
-            (matureAt, pinned) =
-                abi.decode(_native(abi.encodeCall(IBCAdminNative.handoverDue, (ep, seq, matureAt))), (uint64, bool));
+            (matureAt, pinned) = abi.decode(
+                _native(abi.encodeCall(IBCAdminNative.due, (ep, seq, matureAt, kind == S.KIND_HANDOVER))),
+                (uint64, bool)
+            );
             if (pinned && block.timestamp < matureAt) return; // pinned (a revert would undo it); pending
         } else if (kind != S.KIND_UNPAUSE && (holdStands || S.flagged(l))) {
             revert Deferred();

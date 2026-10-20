@@ -151,8 +151,6 @@ interface IGnoICS20ControlsTypes {
     error GnoLossBooked(string clientId, uint64 sequence, uint8 direction);
     /// @notice Kind 13 waits: `pending` unresolved incidents still have an open or unsettled suspect record.
     error GnoIncidentsPending(string clientId, uint64 pending);
-    error GnoRecordsOpen(string clientId, uint64 open);
-    error GnoSuspectUnsettled(string clientId, uint64 open);
     error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
     error GnoQuarantined(string clientId, uint256 until);
     error GnoQuarantineUnknown(string clientId);
