@@ -211,7 +211,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// retired), at any time: before or after an acknowledgement, whatever the current epoch. Permissionless and
     /// the same bytes every time: a notice states a fact and gno.land de-duplicates it. A gno.land left behind
     /// catches up from resends of the intermediate epochs' notices (an acknowledgement, which a compromised
-    /// verifier could forge, never ends the ability to resend). Changes nothing but the notice's last sequence.
+    /// verifier could forge, never ends the ability to resend). Changes no IBCAdmin state: the packet's sequence is
+    /// only reported in `EpochNoticeSent`.
     function resendEpochNotice(uint32 ep) external {
         if (!S.layout().notices[ep].recorded) revert NoNotice();
         _sendNotice(ep);
