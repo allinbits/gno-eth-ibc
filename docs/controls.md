@@ -447,9 +447,12 @@ one incident is never counted by another; nothing is counted on the live client.
   the batch. Its record is settled and therefore closed, so it never blocks kind 13. The accepted-deficit
   reopening completes, and the refund is paid by `claimParked` once the backing returns
   (`test_parkedShortfallRefunds_reopeningCompletes`, `test_r17_1_twinHiddenRefunds_reservedBeforeAnyPayment`).
-- **A failed executor can always be replaced**: at any time, and during an emergency recovery once the guardians
-  have cancelled it (kind 9 is suspended while one is open, and the cancellation is IBCAdmin's own, so it works
-  whatever the executor does). Kind 9 is IBCAdmin's own: IBCAdmin records and executes it itself (its execution in
+- **A failed executor can always be replaced, given an authenticated governance channel**: at any time, and during
+  an emergency recovery once the guardians have cancelled it (kind 9 is suspended while one is open, and the
+  cancellation is IBCAdmin's own, so it works whatever the executor does). A kind 9 is a decision gno.land sends
+  through the epoch client, so replacement needs that channel working, or, after a channel loss, a working
+  emergency recovery to restore one (see "Repair after a channel loss needs working recovery and transfer
+  components" below), and an accurate `gnoBusy()` (see "The transfer app's busy view is a repair dependency"). Kind 9 is IBCAdmin's own: IBCAdmin records and executes it itself (its execution in
   `IBCAdminNative`, IBCAdmin's immutable code) and never delegatecalls the installed executor for it, at recording
   or at execution, and its execution skips the executor pin check (`ForeignExec`) that every executor-dispatched
   kind has, so an executor that reverts everything, refuses kind 9 or no longer matches its pin is still replaced
@@ -546,7 +549,31 @@ one incident is never counted by another; nothing is counted on the live client.
   exist, not to be active), or a kind 6 client and a kind 10. Otherwise the frozen or expired client refuses every
   proof, so new proof-based processing on the route stops (acks, timeouts, receives, redemptions); refunds already
   owed, queued or parked, stay claimable (`claim`, `claimParked`) subject to their ordinary gates, backing and meter.
-  The rest of the escrow's backing can become permanently stranded. A fresh deployment cannot recover it.
+  The rest of the escrow's backing can become permanently stranded. A fresh deployment cannot recover it. Enabling
+  recovery narrows this but does not remove it: a recovery that a defective recovery module or transfer app blocks
+  leaves the same stranding (the next item).
+- **Repair after a channel loss needs working recovery and transfer components (accepted residual, accepted by the
+  project owner).** Enabling recovery does not by itself guarantee a way out of a channel loss. The emergency
+  recovery assumes that the executor's **recovery module** works (it approves and executes the proposal) and that
+  the **transfer app** works (execution checkpoints and migrates the route and lifts its recovery block). Once the
+  governance client is frozen, expired or otherwise lost, no kind 7 or kind 9 can arrive, so if a defect in either
+  component blocks the recovery (a module that reverts approval or execution, a transfer app that refuses the
+  migration), nothing repairs it: cancelling the recovery lifts the suspension but brings no channel, and a new
+  proposal meets the same defect. Unless a suitable repair was recorded before the loss (as for a disabled
+  recovery, above), the route and its escrow's backing are stranded, exactly as with recovery disabled. There is
+  deliberately **no guardian code-upgrade path**: one would give the guardians the power to change code, which only
+  gno.land's governance holds. Mitigation: exercise every executor and transfer-app release's recovery path
+  (approval, execution, migration, unblock) in its test suite and on a test deployment before approving it, and
+  keep the governance client healthy (relayed, monitored) so that a defect is repaired while the channel works.
+- **The transfer app's busy view is a repair dependency (accepted residual, accepted by the project owner).**
+  IBCAdmin calls the installed transfer implementation's `gnoBusy()` before every delivery (`onRecvPacket`), every
+  drain and every execution, kind 7 repairs and kind 9 included, with no bypass. An implementation whose `gnoBusy()`
+  reverts, answers malformed data or answers true outside an operation therefore blocks every delivery and every
+  execution for good: no decision, the repair included, can run, and neither replacing the route, clearing flags
+  nor cancelling a recovery removes the veto. **An accurate `gnoBusy()` is a trust assumption repair depends on**:
+  it must answer exactly `abi.encode(bool)`, true only while the transfer app's lock is held, and never revert. It is
+  checked as repair-critical in every kind 7 candidate of the transfer app (the build verification's manual items)
+  and before executing a repair (the live-code repair procedure).
 - **Emergency recovery.** Configured once, at deployment (`RecoveryConfig`, `recoveryConfig()`), and fixed: no
   governed decision enables, disables or retunes it later (IBCAdmin is immutable). **Whether to enable it is a
   pre-deployment decision**, taken with the guardian set the deployment installs; a deployment with recovery
@@ -597,9 +624,13 @@ one incident is never counted by another; nothing is counted on the live client.
     direction: receives and escrowed sends stay stopped), with `RecoveryBlockKept`. A kind 7 then repairs the
     transfer app, and anyone lifts the block with `clearRecoveryBlock()` (permissionless; refused while a recovery
     is open, a no-op with no block standing, reverting while the app still refuses;
-    `test_native_cancel_transferAppRefuses_blockKept_thenRepaired`).
+    `test_native_cancel_transferAppRefuses_blockKept_thenRepaired`). Cancellation only closes the recovery and lifts
+    the suspension: the repair itself (a kind 7 or kind 9) must still arrive through an authenticated governance
+    channel, which after a channel loss exists only if a recovery executes.
   - **Execution** (`executeRecovery`, permissionless): at least `delay` after `openedAt`, and the proposal's client
-    still usable (as at approval). Eligibility is **not** checked again. Any failure reverts the whole call: the
+    still usable (as at approval). Approval and execution run in the executor's recovery module, and execution
+    calls the transfer app (`checkpointForReplacement`, `migrateRoute`, `setRecoveryBlock`): a defect in either
+    that blocks it leaves the channel unrestored (an accepted residual, below). Eligibility is **not** checked again. Any failure reverts the whole call: the
     proposal stays open and the route stays blocked, so anyone retries once the cause is gone (a client that froze
     or expired meanwhile never recovers), or the guardians cancel it. **The cancellation quorum must stay
     available**: an open proposal that can no longer execute is closed only by `cancelThreshold` guardian votes, and
@@ -800,6 +831,11 @@ exactly the components of the checkout's release): every item below. **Manual** 
   from a checkout of the release it installs with `CANDIDATES_ONLY=true` (pending decisions and the listed vouchers
   and clients only, never the live code), each build reproducible from its tagged source
   (`scripts/test-verify-wrapper.sh` checks both modes with two builds);
+- **repair-critical views** before every kind 7 of the transfer app: its `gnoBusy()` must answer exactly one ABI
+  `bool`, false outside its operations and true only while its lock is held, and never revert, since every IBCAdmin
+  delivery and execution, the next repair's included, depends on it (an accepted residual, see "The transfer app's
+  busy view is a repair dependency"); review its code and exercise it on the candidate before it matures. Likewise
+  exercise the recovery path (approval, execution, migration, unblock) of every executor and transfer-app release;
 - **storage-layout compatibility** before every kind 7 or kind 9: a matching build says nothing of compatibility.
   Review by hand that the candidate keeps every existing storage layout it touches (the fork's, the controls'
   namespace, eureka's ICS20Transfer namespace, IBCAdmin's), changing them only by appending, as the ADR requires;
@@ -915,7 +951,12 @@ order matters:
 3. **Clear the administrative flags and wait out the hold.** IBCAdmin flags (`setFlag`) defer every 7-day
    decision but a seat change (kind 3), so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
    after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days.
-4. **Execute the verified repair**, each candidate verified as pending (`verifyPending`) before it matures:
+4. **Execute the verified repair**, each candidate verified as pending (`verifyPending`) before it matures. Repair
+   depends on two things the failure itself may have taken: an authenticated governance channel (after a channel
+   loss, only a working emergency recovery restores one) and the installed transfer implementation's `gnoBusy()`
+   answering false outside its operations (it gates every execution, the repair's included). Check `gnoBusy()` on the
+   live transfer app first, and on every transfer-app candidate as repair-critical; if the live one is defective,
+   no repair can execute (an accepted residual):
    - a failed transfer-app, router or beacon implementation: a kind 7 back to the last verified implementation
      (the one the deployment manifest last recorded and its release's run verified) only if it meets the current requirements (for the transfer app, a
      controls version at least the running one's, and a compatible storage layout: kind 7 refuses an older
