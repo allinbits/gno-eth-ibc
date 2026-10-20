@@ -179,6 +179,14 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (seq == 0) revert Undecodable();
         bytes32 hash = keccak256(e);
         (uint8 status, bool redispatch) = _deliver(l, ep, seq, kind, hash, e);
+        // too little gas to record it: no data, so the router reverts the whole delivery (`IBCFailedCallback`) and
+        // keeps no receipt; a relayer cannot consume the packet by starving its recording
+        if (status == 0) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                revert(0, 0)
+            }
+        }
         // every delivery also records what is buffered next (at most DRAIN), so a run stopped by the bound moves
         // on with the next packet as well as by `drain()`
         _drain(l, ep);
@@ -371,8 +379,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         bool suspended = l.recovery.openedAt != 0 && S.suspendedByRecovery(kind);
         // kind 9 is IBCAdmin's own, never the executor's, so a broken executor can always be replaced
         (uint8 action, string memory reason) =
-            kind == S.KIND_HANDOVER ? S.handoverParams(d.params) : _atRecording(l, kind, seq, d.params, suspended);
-        if (action == S.HALT) {
+            kind == S.KIND_HANDOVER ? S.handoverParams(d.params) : _atRecording(kind, seq, d.params, suspended);
+        if (action >= S.HALT) {
             // the executor cannot answer (its code is not the pinned one, or its answer is malformed): nothing is
             // recorded and the decision stays buffered, never spent, for a later drain (after a kind 9 replaced the
             // executor); a drain stops here instead of reverting, so a delivery's own recording stands
@@ -381,7 +389,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             d.recordedTime = 0;
             d.recordedBlock = 0;
             d.state = S.BUFFERED;
-            return S.STATUS_BUFFERED;
+            return action == S.HALT ? S.STATUS_BUFFERED : 0;
         }
         if (action == S.DONE_NOW) return _close(ep, seq, d, S.EXECUTED, "");
         if (action == S.SPEND) return _close(ep, seq, d, S.SPENT, reason);
@@ -412,12 +420,10 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return S.STATUS_RECORDED;
     }
 
-    /// @notice The executor's verdict at recording, run with a fixed gas budget: a failure (bad parameters) spends
-    /// the decision, and with less gas left than the budget needs the delivery reverts `ExecutionStarved` (an error
-    /// ack: `ibcgov` re-sends), so no relayer can spend a decision by starving it. (A remaining-gas test after the
-    /// call cannot tell: the proxies on the way each keep a 64th and hand it back.)
+    /// @notice The executor's verdict at recording, in IBCAdminNative (IBCAdmin's immutable code): WAIT, DONE_NOW or
+    /// SPEND from the executor; HALT when the executor cannot answer (its code not the pinned one, an answer that is
+    /// not the canonical encoding); STARVED with less gas left than its fixed frame needs.
     function _atRecording(
-        S.Layout storage l,
         uint8 kind,
         uint64 seq,
         bytes memory params,
@@ -426,25 +432,18 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         private
         returns (uint8, string memory)
     {
-        address x = l.exec;
-        if (x.codehash != l.execHash) return (S.HALT, "");
-        if (gasleft() < S.RECORD_FLOOR) revert ExecutionStarved();
-        (bool ok, bytes memory ret) = x.delegatecall{ gas: S.RECORD_GAS }(
-            abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params, suspended))
+        return abi.decode(
+            _native(abi.encodeCall(IBCAdminNative.atRecording, (kind, seq, params, suspended))), (uint8, string)
         );
-        if (!ok) return (S.SPEND, "params");
-        // exactly `abi.encode(uint8 action, string reason)` with a known action, or no answer at all (HALT)
-        if (ret.length < 96) return (S.HALT, "");
-        (uint256 a, uint256 off, uint256 n) = abi.decode(ret, (uint256, uint256, uint256));
-        if (a > S.SPEND || off != 0x40 || n > ret.length - 96) return (S.HALT, "");
-        return abi.decode(ret, (uint8, string));
     }
 
     function _drain(S.Layout storage l, uint32 ep) private returns (uint256 n) {
         while (n < S.DRAIN) {
             uint64 next = l.lastSeq + 1;
             if (l.decisions[ep][next].state != S.BUFFERED) break;
-            if (_record(l, ep, next) == S.STATUS_BUFFERED) break; // the executor cannot answer: it stays buffered
+            // the executor cannot answer, or too little gas is left for it: it stays buffered for a later drain
+            uint8 st = _record(l, ep, next);
+            if (st == 0 || st == S.STATUS_BUFFERED) break;
             n++;
         }
     }
@@ -492,12 +491,20 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             // anchor plus 21 days, whatever hold stands then, and with no hold standing as any decision does
             uint64 a = l.seatAnchor[ep][seq];
             if (a == 0 && holdStands && block.timestamp >= matureAt) {
-                a = _anchor(l, matureAt, holdStart);
+                a = S.anchor(l, matureAt, holdStart);
                 l.seatAnchor[ep][seq] = a;
                 emit ReplacementAnchored(ep, seq, a + S.HOLD_REPLACEMENT);
                 if (block.timestamp < a + S.HOLD_REPLACEMENT) return; // pinned (a revert would undo it); pending
             }
             if (holdStands && a + S.HOLD_REPLACEMENT > matureAt) matureAt = a + S.HOLD_REPLACEMENT;
+        } else if (kind == S.KIND_HANDOVER) {
+            // IBCAdmin's own deferral (IBCAdminNative.handoverDue), never the executor's: a hold or a flag defers a
+            // hand-over no longer than its anchor plus 21 days, so no unavailable key can keep it from replacing a
+            // broken executor
+            bool pinned;
+            (matureAt, pinned) =
+                abi.decode(_native(abi.encodeCall(IBCAdminNative.handoverDue, (ep, seq, matureAt))), (uint64, bool));
+            if (pinned && block.timestamp < matureAt) return; // pinned (a revert would undo it); pending
         } else if (kind != S.KIND_UNPAUSE && (holdStands || S.flagged(l))) {
             revert Deferred();
         }
@@ -541,9 +548,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         address x = _exec(l); // a foreign executor pends every decision (ForeignExec), never spends one
         // a refund-paying kind 12 waits while the route's refunds hold stands (it stays pending, as on gno.land)
         if (kind == S.KIND_SETTLE) {
-            (bool ok, bytes memory r) =
+            (bool answered, bytes memory r) =
                 IBCAdminExec(x).checks().staticcall(abi.encodeCall(IBCAdminChecks.settleHeld, (ics20, params)));
-            if (ok && r.length == 32 && abi.decode(r, (bool))) revert Deferred();
+            if (answered && r.length == 32 && abi.decode(r, (bool))) revert Deferred();
         }
         uint256 budget = S.execGas(kind);
         if (gasleft() < budget * 64 / 63 + 60_000) revert CallStarved();
@@ -553,19 +560,6 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             abi.encodeCall(this.selfDelegate, (abi.encodeCall(IBCAdminExec.run, (kind, seq, params, d.recordedBlock))))
         );
         return ok ? abi.decode(abi.decode(ret, (bytes)), (string)) : "reverted";
-    }
-
-    /// @notice A seat change's anchor: the start of the first hold standing at or after it was `due` (ADR §7.4, day 21
-    /// of the hold, even one that began before `due`): the earliest start of the standing hold and of every recorded
-    /// hold that ended after `due` (a hold's end is exclusive: one ending at `due` no longer stood then).
-    function _anchor(S.Layout storage l, uint64 due, uint64 standing) private view returns (uint64 a) {
-        a = standing;
-        for (uint256 i = 0; i < l.holds.length; i++) {
-            IGuardians.Hold memory h = l.holds[i];
-            // a merged interval may span a gap no hold covered: never an anchor (a later genuine hold's start is
-            // used instead, never earlier than the true anchor)
-            if (!h.merged && h.end > due && h.start < a) a = h.start; // `end` is exclusive: ended by `due`
-        }
     }
 
     /// @notice A pending seat change's anchor (zero: none pinned yet): under a hold it lands from this plus 21 days.

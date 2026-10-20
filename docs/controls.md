@@ -28,7 +28,7 @@ The controls are safe under these assumptions; each is detailed where its rule i
 | `GnoICS20Evidence` | `contracts/src/transfer/GnoICS20Evidence.sol` | Evidence: `proveOutcome`, `gnoReceipt`, `receiveRecord`, `notifySettled`, `retryNotification`, and the `incidents` and `clientRecon` views. Reached through `GnoICS20Reconcile`'s fallback; its address is an immutable of the reconciliation module. |
 | `GnoTransferStorage` | `contracts/src/transfer/GnoTransferStorage.sol` | The fork's ERC-7201 layout (`gno.storage.GnoICS20Transfer`) and the route-key helpers both halves use. |
 | `IBCAdmin` | `contracts/src/admin/IBCAdmin.sol` | Permanent, immutable IBC app on port `ibcgov`: the §5.4 delivery protocol, the decision ledger, flags on itself, execution scheduling, recovery entry points, `finishSetup`. Holds `ADMIN_ROLE`. |
-| `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: kinds 2 to 13 at recording and at execution (kind 1, the cancel, is handled by IBCAdmin itself: its tombstones are applied on arrival). Delegatecalled at a pinned code hash; replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor. |
+| `IBCAdminExec` | `contracts/src/admin/IBCAdminExec.sol` | The executor: kinds 2 to 8 and 10 to 13 at recording and at execution (kind 9 is IBCAdmin's own) (kind 1, the cancel, is handled by IBCAdmin itself: its tombstones are applied on arrival). Delegatecalled at a pinned code hash; replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor. |
 | `IBCAdminNative` | `contracts/src/admin/IBCAdminNative.sol` | IBCAdmin's own executor-independent code: kind 9's execution (the hand-over), the guardians' cancellation of an open emergency recovery, and `clearRecoveryBlock`. Part of IBCAdmin's **immutable** code: IBCAdmin deploys it in its constructor and delegatecalls it at that address, never replaceable (no pointer to it is stored, so no decision can redirect it, and since Cancun SELFDESTRUCT no longer removes code, so the address always holds the code IBCAdmin was built with); called at its own address it refuses (`NotDelegated`). |
 | `IBCAdminRecovery` | `contracts/src/admin/IBCAdminRecovery.sol` | The optional emergency route replacement (§7.12): approval and execution. Deployed by the executor (so pinned with it) and delegatecalled by IBCAdmin. Cancellation is IBCAdmin's own (`IBCAdminNative`). |
 | `IBCAdminStorage` | `contracts/src/admin/IBCAdminStorage.sol` | IBCAdmin's ERC-7201 layout (`gno.storage.IBCAdmin`), constants, tombstones, hold history. |
@@ -133,7 +133,9 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   the transfer app alike.
 - Every refusal is an error acknowledgement (the router's universal error ack; the custom error is only in the
   router's `IBCAppRecvPacketCallbackError` event): wrong port/version/encoding/client, undecodable envelope, other
-  epoch (`StaleEpoch`), beyond the window (`BeyondWindow`), a decision starved of gas (`ExecutionStarved`).
+  epoch (`StaleEpoch`), beyond the window (`BeyondWindow`). A decision starved of gas is not refused: its delivery
+  reverts whole with no data, so the router keeps no receipt and writes no ack, and the packet is relayed again
+  (below).
 - **Epoch notice (ADR §7.12, the two-phase epoch switch).** Every executed kind 10 or emergency recovery raises the
   epoch by one and sends that epoch's notice from IBCAdmin's port `ibcgov` over the epoch's NEW client to gno.land's
   `gov` port: payload `sourcePort "ibcgov"`, `destPort "gov"`, `version "ibcgov-1"`, `encoding
@@ -240,7 +242,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | §5.4 unknown kind / bad params recorded and spent; a decision's parameters must be exactly the canonical `abi.encode` of its tuple (decoded, re-encoded and compared: trailing data, offsets or padding otherwise are spent at recording); a decision failing its checks at execution spent (no code, another code hash, a refused call, failed after-checks, rolled back) | `IBCAdmin._record`, `execute`; `IBCAdminExec.atRecording`, `_codeIs`, `_call`, `_selfStep` |
 | no one spends a decision by starving it of gas: recording, refusable calls and self-steps run with fixed budgets and floors | `IBCAdmin._atRecording`; `IBCAdminExec._call`, `_selfStep` |
 | §5.4 kind delays: cancel / kind 4 tightening / kind 8 revoke / kind 11 lengthening at recording; unpause 24 h; others 7 d | `IBCAdminExec.atRecording`, `IBCAdmin.execute`, `_delay` |
-| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days. The anchor is the start of the first hold standing at or after the seat change was due (its 7 days passed), even one that began before: the earliest start of the standing hold and of every recorded hold that ended strictly after the due time, so a hold that ended before the change was due never counts, and one nobody observed still does (gno.land anchors at the hold standing at its first deferring `Execute`; both rules avoid an anchor earlier than the ideal one, while history compression and observation timing can make either chain's wait the longer). A hold's end is exclusive: one whose dip grace expires exactly at the due time had ended then and never anchors (`test_kind3_anchor_holdEndingExactlyAtDue_neverCounts`, `testFuzz_anchorAtTheDueBoundary`). The first `execute` that finds a hold standing once the change's ordinary maturity (its 7 days) has passed pins it (`replacementAnchor`, `ReplacementAnchored`); if that moment is before the anchor plus 21 days, it returns without reverting (a revert would undo the pin) and the decision stays pending; at or after that deadline, it pins and executes at once. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold from day 1, standing when the change is due, → day 22, day 21 of the hold (`test_kind3_throughAHold_noSoonerThanDay21`). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both, marked `merged`: a merged interval may span a gap no hold covered, so it **never** supplies an anchor; a later genuine hold's start (or the standing hold's) is used instead, never earlier than the true anchor (`test_kind3_anchor_compressedHistory_neverEarlier`; the hold fuzz checks every execution against its own, uncompressed record of the holds) | `IBCAdmin.execute`, `_anchor`, `replacementAnchor`; `IBCAdminStorage.hold`, `noteHoldEnd` |
+| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days; kind 9 under the same hold rule (the same anchor, `seatAnchor`) and deferred by flags no longer than its **flag anchor** plus 21 days (below). The anchor is the start of the first hold standing at or after the seat change was due (its 7 days passed), even one that began before: the earliest start of the standing hold and of every recorded hold that ended strictly after the due time, so a hold that ended before the change was due never counts, and one nobody observed still does (gno.land anchors at the hold standing at its first deferring `Execute`; both rules avoid an anchor earlier than the ideal one, while history compression and observation timing can make either chain's wait the longer). A hold's end is exclusive: one whose dip grace expires exactly at the due time had ended then and never anchors (`test_kind3_anchor_holdEndingExactlyAtDue_neverCounts`, `testFuzz_anchorAtTheDueBoundary`). The first `execute` that finds a hold standing once the change's ordinary maturity (its 7 days) has passed pins it (`replacementAnchor`, `ReplacementAnchored`); if that moment is before the anchor plus 21 days, it returns without reverting (a revert would undo the pin) and the decision stays pending; at or after that deadline, it pins and executes at once. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold from day 1, standing when the change is due, → day 22, day 21 of the hold (`test_kind3_throughAHold_noSoonerThanDay21`). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both, marked `merged`: a merged interval may span a gap no hold covered, so it **never** supplies an anchor; a later genuine hold's start (or the standing hold's) is used instead, never earlier than the true anchor (`test_kind3_anchor_compressedHistory_neverEarlier`; the hold fuzz checks every execution against its own, uncompressed record of the holds) | `IBCAdmin.execute`, `_anchor`, `replacementAnchor`; `IBCAdminStorage.hold`, `noteHoldEnd` |
 | §7.4 unpause spent under a hold of its object (a route: its flags or refunds flags); kind 2's parameters need a non-empty client id for object 1 (a route) and an empty one for object 2 (IBCAdmin), spent at recording otherwise | `IBCAdminExec._unpause` |
 | kind 3 replaces 1 to 4 pairs of distinct, valid seats with distinct resulting keys (spent at recording otherwise), at most 2 guardian seats, never a current key; both key copies follow; a replaced seat loses its recovery approval | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule; an older decision maturing later never overwrites a newer setting (kinds 4, 11). Bounds (spent otherwise): a non-zero token, `dayCap` and `refundCap` at most 2^128 − 1 (`LeakyBucket.MAX_CAP`), and `sendMin <= sendMax` when `sendMax` is set. A zero `dayCap` refuses every receive, a zero `maxPerMessage` too, and a zero `refundCap` queues every refund; kind 11's quarantine is at most 365 days | `IBCAdminExec._validLimits`, `_loosens`; `IBCAdminStorage.supersede` |
@@ -466,12 +468,14 @@ one incident is never counted by another; nothing is counted on the live client.
   decision (kind 1, whose tombstones apply on arrival, and a tombstoned decision is recorded as cancelled without the
   executor), and the kind 9 then records (`test_kind9_haltedDecisionAhead_cancelledThenReplaced`). An executor that
   **reverts** at recording is not halted: a revert is indistinguishable from undecodable parameters, so the decision
-  is spent as before (`test_kind9_bufferedBehind_revertingExecutor_spent`); gno.land sends it again after the
+  is spent as before (`test_kind9_bufferedBehind_revertingExecutor_spent`). A spent decision cannot be retried:
+  `Redispatch` resends the same sequence and bytes, which IBCAdmin answers as a duplicate, so it takes a **newly
+  approved decision** on gno.land, with a fresh governance sequence and that kind's normal delay, after the
   replacement
   (`test_kind9_replacesAnExecutorThatRevertsEverything`, `test_kind9_replacesAnExecutorThatRefusesKind9`,
-  `test_kind9_replacesAForeignExecutor`). It keeps the envelope, sequence binding, 7-day delay, deferral by flags,
-  holds and conflicts, suspension while a recovery is open, cancellation by kind 1 and spent-on-refusal of every
-  7-day kind. At recording its parameters must be exactly the canonical `abi.encode(exec, codeHash, migrationCall)`
+  `test_kind9_replacesAForeignExecutor`). It keeps the envelope, sequence binding, 7-day delay, suspension while a
+  recovery is open, cancellation by kind 1 and spent-on-refusal of every 7-day kind; its deferral by holds and flags
+  is bounded (the next item). At recording its parameters must be exactly the canonical `abi.encode(exec, codeHash, migrationCall)`
   with `exec` nonzero and **`migrationCall` empty** (128 bytes): a non-empty migration call is spent (`migration`),
   anything else non-canonical too (`params`). A hand-over only moves the pin; the new executor performs any
   migration itself, through later decisions of its own kinds. At execution: the code at `exec` is contract code (not
@@ -479,6 +483,31 @@ one incident is never counted by another; nothing is counted on the live client.
   gas answering exactly 96 bytes, equal IBCAdmin's router, AccessManager and transfer app (else `bindings`), then
   `exec` and its hash become the pin (`ExecReplaced`). A caller leaving less than 161,587 gas for this is refused
   (`CallStarved`) and the decision pends.
+- **A hand-over is deferred by holds and flags for at most 21 days each (owner decision).** Otherwise a flag could
+  deadlock executor replacement: a watch key flags IBCAdmin and becomes unavailable (its flag never clears, flags
+  never expire), the executor breaks, and kind 9 stays deferred while kind 3 (which would replace the key) and kind
+  2 need the executor. Kind 9's deferral is IBCAdmin's own (`IBCAdminNative.handoverDue`, never the executor's), and
+  two rules apply together, each only while its cause stands:
+  - **under a hold**, kind 3's rule exactly: no sooner than the hold anchor plus 21 days, the anchor the start of
+    the first hold standing at or after the due time (`IBCAdminStorage.anchor`: the hold history, `end` exclusive,
+    merged intervals never an anchor), pinned in the shared `seatAnchor` the first time it is seen due and held
+    (`replacementAnchor`);
+  - **under flags** (any standing guardian or watch flag, or a conflict's): no sooner than the **flag anchor** plus
+    21 days. The flag anchor is the earliest start (`flagTime`, the time its key last set it) of the flags standing
+    the first time the hand-over is seen due and flagged, a flag standing since before the due time counting from
+    its own start, and a conflict's flag (which has no start of its own) from that moment. It is pinned then and
+    **never reset**: a flag cleared and set again, a re-flag by the same key (which moves its own start) or a fresh
+    flag by another key does not move it. So no flag cycling extends the deferral: once pinned, the hand-over lands
+    at the anchor plus 21 days whatever flags stand then, and a flag older than 21 days at the due time does not
+    defer it at all. A live malicious key can still flag before the due time and so set the anchor no earlier than
+    its flag, but only once per hand-over; kind 3 replaces such a key while the executor works.
+
+  The first attempt that pins an anchor returns, pending (a revert would undo the pin, as for kind 3); later ones
+  revert `NotMature` with the landing time (`ReplacementAnchored` carries it). **No new power**: under a lone flag,
+  governance can already replace the flagging seat (kind 3, not deferred by flags, 7 days) and then hand over (7
+  more), 14 days in all; 21 days is longer
+  (`test_kind9_unavailableFlaggingKey_brokenExecutor_landsAfter21Days`, `test_kind9_flagCycling_neverResetsTheAnchor`,
+  `test_kind9_anchor_*`).
 - **Settlements are final.** A kind 12 settlement is final once it executes. Before that, it waits its seven-day
   delay: guardians can hold it, and a compromise discovered meanwhile voids its proofs (the quarantine checkpoint
   of a verifier swap or replacement changes the verifier generation, and execution requires each record's outcome
@@ -693,17 +722,26 @@ replace) and has its own floor of 161,587 gas (`CallStarved`); it keeps every ot
 recovery suspension, deferral and maturity. The frame budgets in the table below are therefore
 not sufficient transaction gas limits. Each of these execution checks reverts and leaves the decision **pending**: calling `execute` again with enough
 gas retries it. One exception does not revert: a seat change (kind 3) whose first held execution pins its anchor
-returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording through the executor (`_atRecording`, every kind 2 to 13 but kind 9)
-has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 10,000; with less gas the delivery reverts
-`ExecutionStarved` and the recording is rolled back. An executor that cannot answer (its code not the pinned one,
-or a malformed answer) halts the decision instead: it stays buffered, unrecorded and unspent (a delivered one is
-acknowledged `status 2`, buffered), and a drain stops there without reverting until a kind 9 has replaced the
-executor. After an `ExecutionStarved` revert the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
-envelope that was never recorded is retried by a source-side redispatch, in a fresh packet from gno.land; work
-already buffered on Ethereum is recorded by `drain()` called with enough gas (a drained decision of an executor kind
-goes through the same frame and floor). A cancel (kind 1), an unknown kind, an oversize envelope or a malformed cancel marked bad (spent), a
+returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording through the executor (`IBCAdminNative.atRecording`, kinds 2 to 8 and
+10 to 13) has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 10,000, checked before the executor is
+called. With less gas left:
+- for the **delivered** decision, the delivery reverts with **no data**, as a busy-hook delivery does: eureka's
+  router turns an empty revert into `IBCFailedCallback` and reverts the whole transaction, so no receipt is kept and
+  no ack written. A relayer that front-runs with too little gas consumes nothing; the same packet is relayed again
+  with enough gas (`test_starvedDelivery_noReceipt_samePacketRecordsOnRetry`). (An out-of-gas revert carries no data
+  either, with the same effect.)
+- for a **drained** decision, the drain stops there without reverting: what the delivery recorded stands (a kind 9
+  included), and the decision stays buffered, unrecorded and unspent, for `drain()` with enough gas
+  (`test_starvedDrain_keepsTheKind9`).
+
+An executor that cannot answer (its code not the pinned one, or an answer that is not exactly the canonical
+`abi.encode(uint8 action, string reason)`: decodable with a known action, then equal to its own re-encoding, so no
+trailing data and the padding present and zero) halts the decision likewise: it stays buffered, unrecorded and
+unspent (a delivered one is acknowledged `status 2`, buffered), and a drain stops there without reverting until a
+kind 9 has replaced the executor. Work already buffered on Ethereum is recorded by `drain()` called with enough gas.
+A cancel (kind 1), an unknown kind, an oversize envelope or a malformed cancel marked bad (spent), a
 tombstoned decision (cancelled) and kind 9 (its parameter check, IBCAdminStorage.handoverParams) are recorded inline,
-with no executor frame and no `ExecutionStarved` floor. An envelope whose header cannot be read is not recorded at all: it is refused
+with no executor frame and no starvation floor. An envelope whose header cannot be read is not recorded at all: it is refused
 (`Undecodable`, an error ack) before delivery and consumes no governance sequence. A tombstoned pending decision is the exception: `execute` cancels it
 (`CANCELLED`, its parameters deleted, `DecisionCancelled`) and returns.
 
@@ -964,7 +1002,9 @@ order matters:
    pending); they last while the guardians keep them (kind 2 clears them only when no hold of theirs stands).
 3. **Clear the administrative flags and wait out the hold.** IBCAdmin flags (`setFlag`) defer every 7-day
    decision but a seat change (kind 3), so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
-   after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days.
+   after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days. A
+   hand-over (kind 9) is deferred by flags and holds for at most 21 days from their anchors (its bounded deferral,
+   above), so a flag whose key is unavailable delays an executor replacement but never blocks it.
 4. **Execute the verified repair**, each candidate verified as pending (`verifyPending`) before it matures. Repair
    depends on two things the failure itself may have taken: an authenticated governance channel (after a channel
    loss, only a working emergency recovery restores one) and the installed transfer implementation's `gnoBusy()`
@@ -979,7 +1019,8 @@ order matters:
      executor cannot answer the decisions buffered behind it (they halt, stay buffered and drain through the new
      executor afterwards). First cancel (kind 1) every pending or buffered decision ahead of the kind 9 that the
      failed executor cannot answer: it halts and holds back everything after it. A decision the failed executor
-     reverts on is spent at recording; send it again after the replacement;
+     reverts on is spent at recording and cannot be retried (a `Redispatch` is answered as a duplicate): approve it
+     again on gno.land as a new decision, with a fresh sequence and its kind's normal delay, after the replacement;
    - a failed voucher: none can be swapped (kind 5 registers a denom once). On Ethereum, the route flags and zero
      caps (kind 4, applied at recording) stop **ingress only** (receives); returning-voucher burns bypass both, so
      a defect that mints unbacked vouchers can still be burned into gno.land release claims with genuine Ethereum
@@ -1028,7 +1069,12 @@ transient lock; the UUPS upgrade path only refuses while it is held (`_authorize
 `initializeV2` and the `multicall` wrapper take no enclosing lock (each inner call acquires its own; `initializeGno`
 acquires it). While the lock is held, IBCAdmin
 refuses `execute` (`Busy`) and its delivery (a whole revert), and `drain()` records nothing. The router holds its own lock around every packet it processes. A callee therefore
-reaches no privileged entry point, whatever state it sees.
+reaches no governed decision (no recording, no execution) and no transfer-app mutation, whatever state it sees.
+**Guardian-local actions stay reachable** under the lock, since they are a key's own and govern nothing: a token or
+sender hook that is (or calls through) a guardian or watch key can set or clear that key's flag on IBCAdmin (`setFlag`/`clearFlag`; the route flags,
+`setRouteFlag`/`clearRouteFlag`, are transfer-app entry points and refuse under the lock), and a guardian can vote to cancel an open recovery (`cancelRecovery`, IBCAdmin's own path): if that vote
+closes it, its unblock calls the locked transfer app, which refuses, so the route stays blocked
+(`RecoveryBlockKept`) until anyone calls `clearRecoveryBlock()` outside the operation.
 
 | Callee (who chooses it) | Where it is called, and how | State during the call | Under the lock | Can reach a privileged entry point |
 |---|---|---|---|---|

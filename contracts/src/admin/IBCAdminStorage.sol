@@ -79,6 +79,9 @@ library IBCAdminStorage {
     /// @notice IBCAdmin's own answer when the executor cannot answer (code not the pinned one, a malformed answer):
     /// the decision stays buffered, nothing recorded.
     uint8 internal constant HALT = 3;
+    /// @notice Less gas left than the executor's recording frame needs: nothing recorded. A delivery reverts with no
+    /// data (no receipt, no ack: the packet is relayed again); a drain stops, the decision buffered.
+    uint8 internal constant STARVED = 4;
 
     /// @notice The gas the executor gets at recording and for each call whose failure spends a decision at
     /// execution; with less than the floor left, the call is not made and the transaction reverts.
@@ -140,6 +143,9 @@ library IBCAdminStorage {
         mapping(uint32 epoch => Notice) notices;
         /// A pending seat change's anchor (kind 3 under a hold): the start of the first hold standing once it was due.
         mapping(uint32 epoch => mapping(uint64 seq => uint64)) seatAnchor;
+        /// A pending hand-over's flag anchor (kind 9 under flags): the earliest start of the flags standing when it
+        /// was first seen due and flagged, pinned then; flags defer it until this plus 21 days.
+        mapping(uint32 epoch => mapping(uint64 seq => uint64)) flagAnchor;
     }
 
     /// @notice An epoch's notice: recorded when its epoch opened by kind 10 or the emergency recovery, the client it
@@ -289,6 +295,19 @@ library IBCAdminStorage {
     }
 
     // ---------------------------------------------------------------------------------------------- flags --
+
+    /// @notice A seat change's anchor: the start of the first hold standing at or after it was `due` (ADR §7.4, day 21
+    /// of the hold, even one that began before `due`): the earliest start of the standing hold and of every recorded
+    /// hold that ended after `due` (a hold's end is exclusive: one ending at `due` no longer stood then).
+    function anchor(Layout storage l, uint64 due, uint64 standing) internal view returns (uint64 a) {
+        a = standing;
+        for (uint256 i = 0; i < l.holds.length; i++) {
+            IGuardians.Hold memory h = l.holds[i];
+            // a merged interval may span a gap no hold covered: never an anchor (a later genuine hold's start is
+            // used instead, never earlier than the true anchor)
+            if (!h.merged && h.end > due && h.start < a) a = h.start; // `end` is exclusive: ended by `due`
+        }
+    }
 
     /// @notice A flag or a hold stands on IBCAdmin, or a conflict's flag.
     function flagged(Layout storage l) internal view returns (bool) {

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
+import { IICS26RouterErrors } from "@eureka/errors/IICS26RouterErrors.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
@@ -51,7 +54,8 @@ contract RefusingExec {
 }
 
 /// @notice An executor bound as IBCAdmin's whose every other answer is malformed, by `mode` (1: 32 bytes, 2: an
-/// unknown action, 3: another string offset, 4: a string longer than the answer).
+/// unknown action, 3: another string offset, 4: a string longer than the answer, 5: trailing data, 6: dirty padding,
+/// 7: missing padding, 8: a spend with trailing data).
 contract MalformedExec {
     address internal immutable r;
     address internal immutable am;
@@ -68,10 +72,24 @@ contract MalformedExec {
 
     fallback() external {
         bytes memory ret;
-        if (mode == 1) ret = abi.encode(uint256(0));
-        else if (mode == 2) ret = abi.encode(uint256(7), uint256(0x40), uint256(0));
-        else if (mode == 3) ret = abi.encode(uint256(0), uint256(0x20), uint256(0));
-        else ret = abi.encode(uint256(0), uint256(0x40), uint256(1000));
+        if (mode == 1) {
+            ret = abi.encode(uint256(0));
+        } else if (mode == 2) {
+            ret = abi.encode(uint256(7), uint256(0x40), uint256(0));
+        } else if (mode == 3) {
+            ret = abi.encode(uint256(0), uint256(0x20), uint256(0));
+        } else if (mode == 4) {
+            ret = abi.encode(uint256(0), uint256(0x40), uint256(1000));
+        } else if (mode == 5) {
+            ret = abi.encodePacked(abi.encode(uint8(0), ""), uint256(0)); // trailing data
+        } else if (mode == 6) {
+            ret = abi.encode(uint8(0), "a");
+            ret[ret.length - 1] = 0x01; // dirty padding
+        } else if (mode == 7) {
+            ret = abi.encodePacked(uint256(0), uint256(0x40), uint256(1), bytes1("a")); // missing padding
+        } else {
+            ret = abi.encode(uint256(2), uint256(64), uint256(0), uint256(123)); // a spend with trailing data
+        }
         // solhint-disable-next-line no-inline-assembly
         assembly ("memory-safe") {
             return(add(ret, 32), mload(ret))
@@ -332,45 +350,230 @@ contract HandOverTest is ControlsFixture {
         assertEq(_execOf(), address(next));
     }
 
-    function test_kind9_deferredByAFlag() public {
-        IBCAdminExec next = _good();
-        uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
-        vm.prank(W[0]);
+    // ----------------------------------------------- deferral: flags and holds, each no longer than 21 days --
+
+    function _k9() internal returns (uint64 seq, address next) {
+        next = address(_good());
+        seq = _decidePending(S.KIND_HANDOVER, P.handover(next, next.codehash, ""));
+    }
+
+    function _flag(address key) internal {
+        vm.prank(key);
         admin.setFlag();
-        _skip(7 days);
-        vm.expectRevert(IIBCAdmin.Deferred.selector);
-        admin.execute(seq);
-        assertEq(_state(seq), S.PENDING);
-        vm.prank(W[0]);
+    }
+
+    function _unflag(address key) internal {
+        vm.prank(key);
         admin.clearFlag();
-        admin.execute(seq);
-        assertEq(_execOf(), address(next));
     }
 
-    function test_kind9_deferredByAHold() public {
-        IBCAdminExec next = _good();
-        uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
-        vm.prank(G[0]);
-        admin.setFlag();
-        vm.prank(G[1]);
-        admin.setFlag();
-        _skip(30 days);
-        vm.expectRevert(IIBCAdmin.Deferred.selector);
+    function _hold() internal {
+        _flag(G[0]);
+        _flag(G[1]);
+    }
+
+    /// @notice `execute` before `landsAt` reverts NotMature(landsAt); at `landsAt` it executes and installs `next`.
+    function _landsAt(uint64 seq, address next, uint256 landsAt) internal {
+        vm.warp(landsAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, landsAt));
+        admin.execute(seq);
+        vm.warp(landsAt);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+        assertEq(_execOf(), next);
+    }
+
+    /// @notice A lone flag defers a hand-over from its start plus 21 days, no longer: the first execution attempt
+    /// once due pins the anchor and returns (pending; a revert would undo the pin).
+    function test_kind9_loneFlag_defersUntilItsStartPlus21Days() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 1 days);
+        _flag(W[0]);
+        vm.warp(t0 + 7 days);
+        vm.expectEmit(true, true, false, true, address(admin));
+        emit IIBCAdmin.ReplacementAnchored(admin.epoch(), seq, uint64(t0 + 22 days));
+        admin.execute(seq); // pins the flag's start
+        assertEq(_state(seq), S.PENDING);
+        _landsAt(seq, next, t0 + 22 days);
+    }
+
+    /// @notice The deadlock it resolves: a watch key flags IBCAdmin and becomes unavailable (its flag never clears),
+    /// the executor breaks, recovery is disabled. The hand-over still lands 21 days after the flag.
+    function test_kind9_unavailableFlaggingKey_brokenExecutor_landsAfter21Days() public {
+        uint256 t0 = _now();
+        (, uint64 openedAt,,) = admin.recovery();
+        assertEq(openedAt, 0);
+        vm.expectRevert(IIBCAdmin.RecoveryDisabled.selector);
+        admin.executeRecovery();
+        _flag(W[1]); // and W[1] is never heard from again
+        vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 7 days);
+        admin.execute(seq);
+        _landsAt(seq, next, t0 + 21 days);
+        assertTrue(admin.flags()[5].blockNumber != 0, "W[1]'s flag still stands");
+    }
+
+    /// @notice A flag standing since long before the hand-over was due no longer defers it: it lands when due.
+    function test_kind9_flagOlderThan21DaysAtDue_landsWhenDue() public {
+        uint256 t0 = _now();
+        _flag(W[0]);
+        vm.warp(t0 + 20 days);
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 27 days);
+        admin.execute(seq);
+        assertEq(_state(seq), S.EXECUTED);
+        assertEq(_execOf(), next);
+    }
+
+    /// @notice A fresh flag set after the hand-over was due defers it from that flag's start plus 21 days.
+    function test_kind9_freshFlagAfterDue_defers() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 10 days);
+        _flag(W[0]);
+        vm.warp(t0 + 11 days);
         admin.execute(seq);
         assertEq(_state(seq), S.PENDING);
-        assertEq(_execOf(), d.ibcAdminExec);
+        _landsAt(seq, next, t0 + 31 days);
     }
 
-    /// @notice A conflicting envelope at the hand-over's number flags IBCAdmin: the hand-over is deferred.
-    function test_kind9_deferredByAConflict() public {
-        IBCAdminExec next = _good();
-        uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
-        _recvGov(_env(seq, S.KIND_HANDOVER, P.handover(address(next), bytes32(uint256(1)), "")));
+    /// @notice Cycling flags never extends the deferral: the anchor is pinned once and never reset, whatever flags
+    /// are cleared and set (by the same key or others) afterwards.
+    function test_kind9_flagCycling_neverResetsTheAnchor() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 8 days);
+        _flag(W[0]);
+        vm.warp(t0 + 9 days);
+        admin.execute(seq); // pins day 8
+        vm.warp(t0 + 10 days);
+        _unflag(W[0]);
+        vm.warp(t0 + 12 days);
+        _flag(W[1]);
+        vm.warp(t0 + 15 days);
+        _flag(W[0]);
+        _flag(W[0]); // a re-flag moves its own start, never the pinned anchor
+        vm.warp(t0 + 20 days);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 29 days));
+        admin.execute(seq);
+        _landsAt(seq, next, t0 + 29 days);
+    }
+
+    /// @notice A hold and an earlier lone flag together: each deferral applies, the later one wins (the hold's).
+    function test_kind9_holdAndFlag_bothApply() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 1 days);
+        _flag(G[0]); // a lone flag from day 1
+        vm.warp(t0 + 3 days);
+        _flag(G[1]); // a hold from day 3
+        vm.warp(t0 + 7 days);
+        admin.execute(seq); // pins both: the flag's day 1, the hold's day 3
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 3 days);
+        _landsAt(seq, next, t0 + 24 days);
+    }
+
+    /// @notice A conflict's flag has no start of its own: it counts from the first attempt once due.
+    function test_kind9_conflict_defersFromFirstSightPlus21Days() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        _recvGov(_env(seq, S.KIND_HANDOVER, P.handover(next, bytes32(uint256(1)), "")));
         assertTrue(admin.conflictBlock() != 0, "conflict");
-        _skip(7 days);
-        vm.expectRevert(IIBCAdmin.Deferred.selector);
+        vm.warp(t0 + 7 days);
         admin.execute(seq);
         assertEq(_state(seq), S.PENDING);
+        _landsAt(seq, next, t0 + 28 days);
+    }
+
+    // kind 3's hold anchor cases, for kind 9 (the same rule, IBCAdminStorage.anchor, the shared `seatAnchor`)
+
+    function test_kind9_anchor_holdBeforeDueNeverCounts() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 1 days);
+        _hold(); // days 1 to 3
+        vm.warp(t0 + 2 days);
+        _unflag(G[1]);
+        vm.warp(t0 + 20 days);
+        assertEq(admin.hold().blockNumber, 0, "the first hold ended");
+        _flag(G[1]); // the second hold, from day 20
+        vm.warp(t0 + 22 days);
+        admin.execute(seq); // pins day 20
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
+        _landsAt(seq, next, t0 + 41 days);
+    }
+
+    function test_kind9_anchor_clearAndReflagCycles_neverReset() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 8 days);
+        _hold();
+        vm.warp(t0 + 9 days);
+        admin.execute(seq);
+        uint256 floor = t0 + 8 days + 21 days;
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
+        for (uint256 k = 0; k < 3; k++) {
+            _unflag(G[1]);
+            _skip(1 days + 1); // the grace passes: the hold ends
+            assertEq(admin.hold().blockNumber, 0);
+            _flag(G[1]); // a fresh hold
+            vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, floor));
+            admin.execute(seq);
+        }
+        _landsAt(seq, next, floor);
+    }
+
+    function test_kind9_anchor_unobservedHoldCounts() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 8 days);
+        _hold();
+        vm.warp(t0 + 9 days);
+        _unflag(G[1]);
+        vm.warp(t0 + 15 days);
+        _flag(G[1]);
+        vm.warp(t0 + 16 days);
+        admin.execute(seq);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
+        _landsAt(seq, next, t0 + 29 days);
+    }
+
+    function test_kind9_anchor_holdEndingExactlyAtDue_neverCounts() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        vm.warp(t0 + 1 days);
+        _hold();
+        vm.warp(t0 + 6 days);
+        _unflag(G[1]); // the dip: the hold ends 24 hours later, exactly on day 7
+        vm.warp(t0 + 20 days);
+        _flag(G[1]);
+        assertEq(admin.holds()[0].end, t0 + 7 days);
+        vm.warp(t0 + 22 days);
+        admin.execute(seq);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
+        _landsAt(seq, next, t0 + 41 days);
+    }
+
+    function test_kind9_anchor_compressedHistory_neverEarlier() public {
+        uint256 t0 = _now();
+        (uint64 seq, address next) = _k9();
+        _flag(G[0]);
+        uint256[9] memory starts = [uint256(1), 20, 22, 24, 26, 28, 30, 32, 34];
+        for (uint256 k = 0; k < starts.length; k++) {
+            vm.warp(t0 + starts[k] * 1 days);
+            _flag(G[1]);
+            vm.warp(t0 + starts[k] * 1 days + 1 hours);
+            _unflag(G[1]);
+        }
+        vm.warp(t0 + 36 days);
+        _flag(G[1]);
+        assertTrue(admin.holds()[0].merged, "compressed");
+        admin.execute(seq); // pins
+        uint64 anchor = admin.replacementAnchor(admin.epoch(), seq);
+        assertGe(anchor, t0 + 20 days, "never anchored on the merged interval");
+        _landsAt(seq, next, uint256(anchor) + 21 days);
     }
 
     function test_kind9_cancelledByKind1() public {
@@ -421,7 +624,7 @@ contract HandOverTest is ControlsFixture {
     }
 
     function test_kind9_bufferedBehind_malformedExecutor() public {
-        for (uint256 mode = 1; mode <= 4; mode++) {
+        for (uint256 mode = 1; mode <= 8; mode++) {
             uint256 snap = vm.snapshotState();
             _handOver(address(new MalformedExec(address(router), d.accessManager, address(ics20), mode)));
             _bufferedBehindKind9();
@@ -467,5 +670,81 @@ contract HandOverTest is ControlsFixture {
         admin.execute(s + 1);
         (address x,) = admin.exec();
         assertEq(x, address(next));
+    }
+
+    // ------------------------------------------------------------------------------------- recording starvation --
+
+    function _recvWithGas(bytes memory envelope, uint256 gas) internal returns (bool ok) {
+        (ok,) = address(router).call{ gas: gas }(
+            abi.encodeCall(
+                router.recvPacket,
+                (IICS26RouterMsgs.MsgRecvPacket(_govPacket(envelope), "", IICS02ClientMsgs.Height(0, 1)))
+            )
+        );
+    }
+
+    /// @notice A delivery with too little gas to record its decision reverts whole (no data: the router keeps no
+    /// receipt and writes no ack), so a starving relayer consumes nothing: the same packet records when relayed
+    /// again with enough gas.
+    function test_starvedDelivery_noReceipt_samePacketRecordsOnRetry() public {
+        uint64 s = admin.lastSeq() + 1;
+        bytes memory env = _env(s, S.KIND_SETTINGS, P.settings(clientId, 2 days));
+        IICS26RouterMsgs.MsgRecvPacket memory m =
+            IICS26RouterMsgs.MsgRecvPacket(_govPacket(env), "", IICS02ClientMsgs.Height(0, 1));
+        vm.expectRevert(IICS26RouterErrors.IBCFailedCallback.selector);
+        router.recvPacket{ gas: 700_000 }(m);
+        assertEq(_state(s), S.NONE);
+        assertEq(_status(_recvGov(env)), S.STATUS_RECORDED, "the same packet, relayed again");
+        assertEq(_state(s), S.PENDING);
+    }
+
+    /// @notice A drain short of gas stops without undoing what the delivery recorded: a kind 9 survives, and the
+    /// decision after it stays buffered for `drain()`.
+    function test_starvedDrain_keepsTheKind9() public {
+        uint64 s = admin.lastSeq();
+        _recvGov(_env(s + 2, S.KIND_SETTINGS, P.settings(clientId, 2 days)));
+        IBCAdminExec next = _good();
+        assertTrue(
+            _recvWithGas(_env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), 700_000)
+        );
+        assertEq(_state(s + 1), S.PENDING, "the kind 9 recorded");
+        assertEq(_state(s + 2), S.BUFFERED, "the drain stopped");
+        assertEq(admin.drain(), 1);
+        assertEq(_state(s + 2), S.PENDING);
+    }
+
+    /// @notice Only standing flags anchor: a flag whose key was replaced (kind 3) keeps its stored time but no longer
+    /// stands, and never counts.
+    function test_kind9_flagOfAReplacedKey_neverAnchors() public {
+        uint256 t0 = _now();
+        uint64 seats = _decidePending(S.KIND_SEATS, P.seat1(4, makeAddr("fresh watch")));
+        vm.warp(t0 + 1 days);
+        _flag(W[0]); // seat 4
+        vm.warp(t0 + 5 days);
+        (uint64 seq, address next) = _k9(); // due on day 12
+        vm.warp(t0 + 7 days);
+        admin.execute(seats); // W[0] replaced: its flag no longer stands
+        assertEq(_state(seats), S.EXECUTED);
+        vm.warp(t0 + 10 days);
+        _flag(W[1]);
+        vm.warp(t0 + 12 days);
+        admin.execute(seq); // anchors at W[1]'s day 10, never W[0]'s day 1
+        _landsAt(seq, next, t0 + 31 days);
+    }
+
+    /// @notice `drain()` short of gas for the executor's frame stops at once, nothing recorded or counted.
+    function test_starvedDrain_stopsAtOnce() public {
+        uint64 s = admin.lastSeq();
+        _recvGov(_env(s + 2, S.KIND_SETTINGS, P.settings(clientId, 2 days)));
+        IBCAdminExec next = _good();
+        // the kind 9 records; its drain starves, leaving s + 2 buffered next
+        assertTrue(
+            _recvWithGas(_env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), 700_000)
+        );
+        assertEq(_state(s + 2), S.BUFFERED);
+        assertEq(admin.drain{ gas: 600_000 }(), 0, "starved: stops at once");
+        assertEq(_state(s + 2), S.BUFFERED);
+        assertEq(admin.drain(), 1);
+        assertEq(_state(s + 2), S.PENDING);
     }
 }

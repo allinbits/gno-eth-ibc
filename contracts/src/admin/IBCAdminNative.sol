@@ -5,6 +5,7 @@ import { IIBCAdmin } from "../interfaces/IIBCAdmin.sol";
 import { IGnoICS20Controls } from "../interfaces/IGnoICS20Controls.sol";
 import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
+import { IBCAdminExec } from "./IBCAdminExec.sol";
 
 /// @title IBCAdmin's own paths that never depend on the executor
 /// @notice Part of IBCAdmin's immutable code: IBCAdmin deploys it in its constructor and delegatecalls it at that
@@ -22,6 +23,80 @@ contract IBCAdminNative is IIBCAdmin {
     modifier delegated() {
         if (address(this) == _self) revert NotDelegated();
         _;
+    }
+
+    /// @notice The executor's verdict on a decision at recording, run with a fixed gas budget (RECORD_GAS): its
+    /// WAIT, DONE_NOW or SPEND (a revert, as undecodable parameters, spends the decision). IBCAdmin's own answers:
+    /// HALT when the executor cannot answer, its code not the pinned one or its answer not exactly the canonical
+    /// `abi.encode(uint8 action, string reason)` with a known action (length, offset, bounds and zero padding all
+    /// checked), and STARVED with less gas left than the budget needs. Neither records anything: the decision stays
+    /// buffered (and a starved delivery reverts whole), so no relayer can spend or consume a decision by starving it.
+    function atRecording(
+        uint8 kind,
+        uint64 seq,
+        bytes calldata params,
+        bool suspended
+    )
+        external
+        delegated
+        returns (uint8, string memory)
+    {
+        S.Layout storage l = S.layout();
+        address x = l.exec;
+        if (x.codehash != l.execHash) return (S.HALT, "");
+        if (gasleft() < S.RECORD_FLOOR) return (S.STARVED, "");
+        (bool ok, bytes memory ret) = x.delegatecall{ gas: S.RECORD_GAS }(
+            abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params, suspended))
+        );
+        if (!ok) return (S.SPEND, "params");
+        if (ret.length < 96) return (S.HALT, "");
+        (uint256 a, uint256 off, uint256 n) = abi.decode(ret, (uint256, uint256, uint256));
+        // decodable (a known action, the string's offset and bounds), then equal to its canonical re-encoding: no
+        // trailing data, the padding present and zero
+        if (a > S.SPEND || off != 0x40 || n > ret.length - 96) return (S.HALT, "");
+        (uint8 action, string memory reason) = abi.decode(ret, (uint8, string));
+        if (keccak256(abi.encode(action, reason)) != keccak256(ret)) return (S.HALT, "");
+        return (action, reason);
+    }
+
+    /// @notice When a pending kind 9 may land (`due`), and whether this call pinned an anchor (it then must not
+    /// revert: the caller returns, pending, before `due`). From `matureAt` (its 7 days), two deferrals, both applied:
+    /// - **under a hold**, kind 3's rule exactly: no sooner than the hold anchor plus 21 days, the anchor the start
+    ///   of the first hold standing at or after `matureAt` (`IBCAdminStorage.anchor`: the hold history, `end`
+    ///   exclusive, merged intervals never an anchor), pinned in `seatAnchor` the first time it is seen due and held;
+    /// - **under flags** (any standing flag, or a conflict's): no sooner than the flag anchor plus 21 days, the
+    ///   anchor the earliest start (`flagTime`) of the flags standing the first time it is seen due and flagged (a
+    ///   conflict's flag counting from that moment), pinned in `flagAnchor` and never reset: a flag set, cleared or
+    ///   set again later does not move it. A flag standing since before `matureAt` counts from its own start.
+    /// A deferral applies only while its cause stands: with no hold and no flag it lands at `matureAt`.
+    function handoverDue(uint32 ep, uint64 seq, uint64 matureAt) external delegated returns (uint64 due, bool pinned) {
+        S.Layout storage l = S.layout();
+        due = matureAt;
+        uint64 now_ = uint64(block.timestamp);
+        (bool holdStands,, uint64 holdStart) = S.hold(l);
+        if (holdStands) {
+            uint64 a = l.seatAnchor[ep][seq];
+            if (a == 0 && now_ >= matureAt) {
+                a = S.anchor(l, matureAt, holdStart);
+                l.seatAnchor[ep][seq] = a;
+                emit ReplacementAnchored(ep, seq, a + S.HOLD_REPLACEMENT);
+                pinned = true;
+            }
+            if (a + S.HOLD_REPLACEMENT > due) due = a + S.HOLD_REPLACEMENT;
+        }
+        if (S.flagged(l)) {
+            uint64 f = l.flagAnchor[ep][seq];
+            if (f == 0 && now_ >= matureAt) {
+                f = l.conflictBlock != 0 ? now_ : type(uint64).max;
+                for (uint256 i = 0; i < Guardians.KEYS; i++) {
+                    if (Guardians.standing(l.g.k, l.g.f, i) && l.g.f.flagTime[i] < f) f = l.g.f.flagTime[i];
+                }
+                l.flagAnchor[ep][seq] = f;
+                emit ReplacementAnchored(ep, seq, f + S.HOLD_REPLACEMENT);
+                pinned = true;
+            }
+            if (f + S.HOLD_REPLACEMENT > due) due = f + S.HOLD_REPLACEMENT;
+        }
     }
 
     /// @notice Kind 9 `(exec, codeHash, migrationCall)`, its migration call empty (IBCAdminStorage.handoverParams):
