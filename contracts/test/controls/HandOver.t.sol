@@ -123,9 +123,9 @@ contract ActingExec {
 
     fallback() external {
         bytes memory ret;
-        if (mode == 4) {
-            // the longest answer the floor's margin must cover: a spend with a MAX_REASON-byte reason
-            ret = abi.encode(uint8(2), string(new bytes(S.MAX_REASON)));
+        if (mode == 4 || mode == 7) {
+            // the longest answer the floor's margin must cover: a spend with a MAX_REASON-byte reason (4), or WAIT (7)
+            ret = mode == 4 ? abi.encode(uint8(2), string(new bytes(S.MAX_REASON))) : abi.encode(uint8(0), "");
             while (gasleft() > 1500) { }
         } else {
             S.layout().conflictBlock = 77;
@@ -854,7 +854,7 @@ contract HandOverTest is ControlsFixture {
         IBCAdminExec next = _good();
         bytes memory env = _env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
         uint256 recorded;
-        for (uint256 gas = 1_000_000; gas <= 1_400_000; gas += 1999) {
+        for (uint256 gas = 1_000_000; gas <= 1_700_000; gas += 1999) {
             uint256 snap = vm.snapshotState();
             assertTrue(_recvWithGas(env, gas), "the delivery completes");
             assertEq(_state(s + 1), S.PENDING, "the kind 9 stands");
@@ -862,5 +862,70 @@ contract HandOverTest is ControlsFixture {
             vm.revertToState(snap);
         }
         assertGt(recorded, 0, "the burning executor's answer recorded at some gas");
+    }
+
+    // ----------------------------------------- a drain never runs out of gas: maximum-size decisions behind a kind 9
+    // --
+
+    /// @notice A settings decision whose parameters are as large as an envelope allows (992 bytes, nonzero).
+    function _bigSettings() internal pure returns (bytes memory) {
+        bytes memory id = new bytes(896);
+        for (uint256 i = 0; i < id.length; i++) {
+            id[i] = "a";
+        }
+        return P.settings(string(id), 1 days);
+    }
+
+    /// @notice Two maximum-size decisions buffered behind a kind 9, an executor burning its whole frame and answering
+    /// SPEND (its `_close` clears all their parameter words) or WAIT: across a sweep of relay gas, the delivery
+    /// always completes, the kind 9 always stands, and the drain stops safely wherever the gas runs short.
+    function test_drainReserve_maxSizeDecisions_kind9AlwaysStands() public {
+        uint8[2] memory modes = [4, 7];
+        for (uint256 k = 0; k < 2; k++) {
+            uint256 snap0 = vm.snapshotState();
+            _acting(modes[k]);
+            uint64 s = admin.lastSeq();
+            _at(s + 2, S.KIND_SETTINGS, _bigSettings());
+            _at(s + 3, S.KIND_SETTINGS, _bigSettings());
+            IBCAdminExec next = _good();
+            bytes memory env = _env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
+            uint256 both;
+            for (uint256 gas = 600_000; gas <= 3_200_000; gas += 6007) {
+                uint256 snap = vm.snapshotState();
+                assertTrue(_recvWithGas(env, gas), "the delivery completes");
+                assertEq(_state(s + 1), S.PENDING, "the kind 9 stands");
+                if (_state(s + 3) != S.BUFFERED) both++;
+                vm.revertToState(snap);
+            }
+            assertGt(both, 0, "with enough gas both drain");
+            vm.revertToState(snap0);
+        }
+    }
+
+    /// @notice The same through `drain()`: whatever gas it is sent, it records what fits and stops, never reverting.
+    function test_drainReserve_directDrain_neverReverts() public {
+        uint8[2] memory modes = [4, 7];
+        for (uint256 k = 0; k < 2; k++) {
+            uint256 snap0 = vm.snapshotState();
+            _acting(modes[k]);
+            uint64 s = admin.lastSeq();
+            _at(s + 2, S.KIND_SETTINGS, _bigSettings());
+            _at(s + 3, S.KIND_SETTINGS, _bigSettings());
+            IBCAdminExec next = _good();
+            // the kind 9 records; its drain starves at once, leaving both buffered next
+            assertTrue(
+                _recvWithGas(
+                    _env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), 600_000
+                )
+            );
+            assertEq(_state(s + 2), S.BUFFERED);
+            for (uint256 gas = 100_000; gas <= 3_000_000; gas += 6007) {
+                uint256 snap = vm.snapshotState();
+                (bool ok,) = address(admin).call{ gas: gas }(abi.encodeCall(admin.drain, ()));
+                assertTrue(ok, "drain() never reverts");
+                vm.revertToState(snap);
+            }
+            vm.revertToState(snap0);
+        }
     }
 }

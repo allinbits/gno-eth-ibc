@@ -743,7 +743,15 @@ executor did there (storage writes, events, governed calls) is undone with it
   either, with the same effect.)
 - for a **drained** decision, the drain stops there without reverting: what the delivery recorded stands (a kind 9
   included), and the decision stays buffered, unrecorded and unspent, for `drain()` with enough gas
-  (`test_starvedDrain_keepsTheKind9`).
+  (`test_starvedDrain_keepsTheKind9`). Each drain step first checks a reserve (`DRAIN_RESERVE`: the floor through
+  IBCAdmin's call to the helper plus 100,000 gas for what the step spends before the helper's own check, its writes
+  and the copy of up to `MAX_ENVELOPE` bytes of cold parameters) and stops below it; the floor's margin then covers
+  the step's completion, including `_close`'s clearing of a maximum-size decision's parameters after an executor that
+  burned its whole frame. The two bounds are each sufficient on their own (defence in depth); together they keep a
+  drain from ever running out of gas once it has recorded something
+  (`test_drainReserve_maxSizeDecisions_kind9AlwaysStands`, `test_drainReserve_directDrain_neverReverts`: two
+  maximum-size decisions behind a kind 9, an executor burning its frame and answering SPEND or WAIT, swept across
+  relay gas).
 
 An executor that cannot answer (its code not the pinned one, or an answer that is not exactly the canonical
 `abi.encode(uint8 action, string reason)`: decodable with a known action, then equal to its own re-encoding, so no

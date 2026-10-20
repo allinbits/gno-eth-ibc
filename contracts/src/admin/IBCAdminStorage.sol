@@ -94,6 +94,11 @@ library IBCAdminStorage {
     /// `abi.encode(uint8, string)` of a reason of at most MAX_REASON bytes. A longer answer is never copied: it halts.
     uint256 internal constant MAX_REASON = 64;
     uint256 internal constant MAX_ANSWER = 96 + MAX_REASON;
+    /// @notice The gas a drain step must have left to start: the recording floor through IBCAdmin's call to the
+    /// helper, plus what the step spends before the helper's own floor check (its writes and the copy of a decision's
+    /// parameters, at most MAX_ENVELOPE bytes of cold storage). Below it the drain stops, the decision buffered, so a
+    /// drain step never runs out of gas before it can stop safely.
+    uint256 internal constant DRAIN_RESERVE = RECORD_FLOOR * 64 / 63 + 100_000;
     /// @notice Kind 9's `bindings()` probe of the new executor (IBCAdmin's own hand-over path), and the gas an
     /// execution must have left to start it: a caller sending less is refused (CallStarved) and the decision pends.
     uint256 internal constant BIND_GAS = 100_000;

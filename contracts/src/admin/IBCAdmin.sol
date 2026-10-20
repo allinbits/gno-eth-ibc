@@ -439,7 +439,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     function _drain(S.Layout storage l, uint32 ep) private returns (uint256 n) {
         while (n < S.DRAIN) {
             uint64 next = l.lastSeq + 1;
-            if (l.decisions[ep][next].state != S.BUFFERED) break;
+            if (l.decisions[ep][next].state != S.BUFFERED || gasleft() < S.DRAIN_RESERVE) break;
             // the executor cannot answer, or too little gas is left for it: it stays buffered for a later drain
             uint8 st = _record(l, ep, next);
             if (st == 0 || st == S.STATUS_BUFFERED) break;
