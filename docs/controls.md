@@ -719,6 +719,12 @@ one incident is never counted by another; nothing is counted on the live client.
 
 ## Execution of decisions, per kind
 
+A relayer-role revocation (kind 8, grant false) recorded while an emergency recovery is open is not applied at
+recording: it stays pending, and execution refuses it `Suspended` while the recovery stays open. Once the guardians
+cancel the recovery, anyone may execute it at once (`IBCAdminRecovery.t.sol`): it is due at its recording time,
+with no 7-day wait, and flags and holds never defer it, because a revocation only tightens. The busy, executor-pin and
+gas checks below still apply.
+
 `IBCAdmin.execute` checks, before anything runs: the decision pending, not suspended by an open recovery, not
 deferred by flags or holds, mature, the transfer app not busy (`Busy`: a transfer-app entry point is running, so a
 token or sender hook called in), for every kind dispatched through the executor (all but kind 9) the executor's code
