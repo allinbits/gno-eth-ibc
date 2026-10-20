@@ -50,6 +50,35 @@ contract RefusingExec {
     }
 }
 
+/// @notice An executor bound as IBCAdmin's whose every other answer is malformed, by `mode` (1: 32 bytes, 2: an
+/// unknown action, 3: another string offset, 4: a string longer than the answer).
+contract MalformedExec {
+    address internal immutable r;
+    address internal immutable am;
+    address internal immutable t;
+    uint256 internal immutable mode;
+
+    constructor(address r_, address am_, address t_, uint256 mode_) {
+        (r, am, t, mode) = (r_, am_, t_, mode_);
+    }
+
+    function bindings() external view returns (address, address, address) {
+        return (r, am, t);
+    }
+
+    fallback() external {
+        bytes memory ret;
+        if (mode == 1) ret = abi.encode(uint256(0));
+        else if (mode == 2) ret = abi.encode(uint256(7), uint256(0x40), uint256(0));
+        else if (mode == 3) ret = abi.encode(uint256(0), uint256(0x20), uint256(0));
+        else ret = abi.encode(uint256(0), uint256(0x40), uint256(1000));
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            return(add(ret, 32), mload(ret))
+        }
+    }
+}
+
 /// @notice `bindings()` answers IBCAdmin's own after burning `burn` gas, or another answer by `mode`.
 contract OddBindings {
     address internal immutable r;
@@ -352,5 +381,91 @@ contract HandOverTest is ControlsFixture {
         admin.execute(seq);
         assertEq(_state(seq), S.CANCELLED);
         assertEq(_execOf(), d.ibcAdminExec);
+    }
+
+    // ------------------------------------------------------------------- a broken executor never blocks kind 9 --
+
+    /// @notice Delivers `kind` at `seq` and returns the ack's status.
+    function _at(uint64 seq, uint8 kind, bytes memory params) internal returns (uint8) {
+        return _status(_recvGov(_env(seq, kind, params)));
+    }
+
+    /// @notice A decision buffered behind the kind 9: the kind 9's delivery records it and stops the drain at the
+    /// buffered decision the broken executor cannot answer (nothing recorded, nothing spent); kind 9 replaces the
+    /// executor, and the buffered decision then drains through the new one.
+    function _bufferedBehindKind9() internal {
+        uint64 s = admin.lastSeq();
+        assertEq(_at(s + 2, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED);
+        IBCAdminExec next = _good();
+        assertEq(_at(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), S.STATUS_RECORDED);
+        assertEq(admin.lastSeq(), s + 1, "the kind 9 recorded");
+        assertEq(_state(s + 2), S.BUFFERED, "the decision behind it stays buffered");
+        assertEq(admin.decision(admin.epoch(), s + 2).recordedTime, 0, "nothing recorded");
+        assertEq(admin.decision(admin.epoch(), s + 2).recordedBlock, 0, "nothing recorded");
+        assertEq(admin.drain(), 0, "a drain stops at it");
+        assertEq(_state(s + 2), S.BUFFERED);
+        _skip(7 days);
+        admin.execute(s + 1);
+        (address x,) = admin.exec();
+        assertEq(x, address(next), "replaced");
+        assertEq(admin.drain(), 1, "drains through the new executor");
+        assertEq(_state(s + 2), S.PENDING);
+        _skip(7 days);
+        admin.execute(s + 2);
+        assertEq(ctl.quarantineSeconds(clientId), 2 days);
+    }
+
+    function test_kind9_bufferedBehind_foreignExecutor() public {
+        vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
+        _bufferedBehindKind9();
+    }
+
+    function test_kind9_bufferedBehind_malformedExecutor() public {
+        for (uint256 mode = 1; mode <= 4; mode++) {
+            uint256 snap = vm.snapshotState();
+            _handOver(address(new MalformedExec(address(router), d.accessManager, address(ics20), mode)));
+            _bufferedBehindKind9();
+            vm.revertToState(snap);
+        }
+    }
+
+    /// @notice A delivered decision the broken executor cannot answer is acknowledged buffered, never spent; a kind 9
+    /// behind it waits, so gno.land cancels the stuck decision (the tombstones apply on arrival and nothing in the
+    /// delivery reverts), the kind 9 records, and the replacement follows.
+    function test_kind9_haltedDecisionAhead_cancelledThenReplaced() public {
+        vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
+        uint64 s = admin.lastSeq();
+        _skip(1 hours);
+        uint64 silenceFrom = admin.lastRecordTime();
+        assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED, "halted, buffered");
+        assertEq(admin.lastSeq(), s);
+        assertEq(_state(s + 1), S.BUFFERED);
+        assertEq(admin.lastRecordTime(), silenceFrom, "the channel's silence unchanged");
+        assertEq(admin.decision(admin.epoch(), s + 1).recordedBlock, 0);
+        IBCAdminExec next = _good();
+        assertEq(_at(s + 2, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), S.STATUS_BUFFERED);
+        _at(s + 3, S.KIND_CANCEL, P.cancel1(s + 1, s + 1));
+        assertEq(_state(s + 1), S.CANCELLED);
+        assertEq(_state(s + 2), S.PENDING, "the kind 9 recorded");
+        assertEq(admin.lastSeq(), s + 3);
+        _skip(7 days);
+        admin.execute(s + 2);
+        (address x,) = admin.exec();
+        assertEq(x, address(next));
+    }
+
+    /// @notice An executor that reverts at recording answers like malformed parameters: the decision behind the kind
+    /// 9 is spent (a revert is indistinguishable from undecodable parameters), and the kind 9 records and executes.
+    function test_kind9_bufferedBehind_revertingExecutor_spent() public {
+        _handOver(address(new RevertingExec(address(router), d.accessManager, address(ics20))));
+        uint64 s = admin.lastSeq();
+        _at(s + 2, S.KIND_SETTINGS, P.settings(clientId, 2 days));
+        IBCAdminExec next = _good();
+        assertEq(_at(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), S.STATUS_RECORDED);
+        assertEq(_state(s + 2), S.SPENT);
+        _skip(7 days);
+        admin.execute(s + 1);
+        (address x,) = admin.exec();
+        assertEq(x, address(next));
     }
 }

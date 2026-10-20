@@ -455,7 +455,19 @@ one incident is never counted by another; nothing is counted on the live client.
   components" below), and an accurate `gnoBusy()` (see "The transfer app's busy view is a repair dependency"). Kind 9 is IBCAdmin's own: IBCAdmin records and executes it itself (its execution in
   `IBCAdminNative`, IBCAdmin's immutable code) and never delegatecalls the installed executor for it, at recording
   or at execution, and its execution skips the executor pin check (`ForeignExec`) that every executor-dispatched
-  kind has, so an executor that reverts everything, refuses kind 9 or no longer matches its pin is still replaced
+  kind has, so an executor that reverts everything, refuses kind 9 or no longer matches its pin is still replaced.
+  Nor can the executor block a kind 9's **recording** through the decisions around it: a delivery drains the
+  buffered decisions that follow, and when the executor cannot answer one (its code is not the pinned one, or its
+  answer is not exactly `abi.encode(uint8 action, string reason)` with a known action) that decision is **halted**:
+  nothing is recorded, nothing spent, it stays buffered, the drain stops there without reverting, and the
+  delivery's own recording, the kind 9's, stands. Once kind 9 has replaced the executor, `drain()` records it through
+  the new one (`test_kind9_bufferedBehind_foreignExecutor`, `test_kind9_bufferedBehind_malformedExecutor`). A
+  halted decision **ahead** of the kind 9 holds it back (decisions record in order): gno.land cancels the halted
+  decision (kind 1, whose tombstones apply on arrival, and a tombstoned decision is recorded as cancelled without the
+  executor), and the kind 9 then records (`test_kind9_haltedDecisionAhead_cancelledThenReplaced`). An executor that
+  **reverts** at recording is not halted: a revert is indistinguishable from undecodable parameters, so the decision
+  is spent as before (`test_kind9_bufferedBehind_revertingExecutor_spent`); gno.land sends it again after the
+  replacement
   (`test_kind9_replacesAnExecutorThatRevertsEverything`, `test_kind9_replacesAnExecutorThatRefusesKind9`,
   `test_kind9_replacesAForeignExecutor`). It keeps the envelope, sequence binding, 7-day delay, deferral by flags,
   holds and conflicts, suspension while a recovery is open, cancellation by kind 1 and spent-on-refusal of every
@@ -683,8 +695,10 @@ not sufficient transaction gas limits. Each of these execution checks reverts an
 gas retries it. One exception does not revert: a seat change (kind 3) whose first held execution pins its anchor
 returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording through the executor (`_atRecording`, every kind 2 to 13 but kind 9)
 has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 10,000; with less gas the delivery reverts
-`ExecutionStarved` and the recording is rolled back, but
-the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
+`ExecutionStarved` and the recording is rolled back. An executor that cannot answer (its code not the pinned one,
+or a malformed answer) halts the decision instead: it stays buffered, unrecorded and unspent (a delivered one is
+acknowledged `status 2`, buffered), and a drain stops there without reverting until a kind 9 has replaced the
+executor. After an `ExecutionStarved` revert the router keeps the packet's receipt and commits an error ack, so relaying the same packet again is a no-op. An
 envelope that was never recorded is retried by a source-side redispatch, in a fresh packet from gno.land; work
 already buffered on Ethereum is recorded by `drain()` called with enough gas (a drained decision of an executor kind
 goes through the same frame and floor). A cancel (kind 1), an unknown kind, an oversize envelope or a malformed cancel marked bad (spent), a
@@ -961,7 +975,11 @@ order matters:
      (the one the deployment manifest last recorded and its release's run verified) only if it meets the current requirements (for the transfer app, a
      controls version at least the running one's, and a compatible storage layout: kind 7 refuses an older
      controls version), otherwise to a compatible fixed build;
-   - a failed executor: a kind 9 hand-over to a verified executor;
+   - a failed executor: a kind 9 hand-over to a verified executor. Its delivery records it even when the failed
+     executor cannot answer the decisions buffered behind it (they halt, stay buffered and drain through the new
+     executor afterwards). First cancel (kind 1) every pending or buffered decision ahead of the kind 9 that the
+     failed executor cannot answer: it halts and holds back everything after it. A decision the failed executor
+     reverts on is spent at recording; send it again after the replacement;
    - a failed voucher: none can be swapped (kind 5 registers a denom once). On Ethereum, the route flags and zero
      caps (kind 4, applied at recording) stop **ingress only** (receives); returning-voucher burns bypass both, so
      a defect that mints unbacked vouchers can still be burned into gno.land release claims with genuine Ethereum

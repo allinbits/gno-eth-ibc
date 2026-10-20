@@ -358,6 +358,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     function _record(S.Layout storage l, uint32 ep, uint64 seq) private returns (uint8) {
         Decision storage d = l.decisions[ep][seq];
         uint64 now_ = uint64(block.timestamp);
+        uint64 prevTime = l.lastRecordTime;
         l.lastSeq = seq;
         l.lastRecordTime = now_;
         d.recordedTime = now_;
@@ -371,6 +372,17 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         // kind 9 is IBCAdmin's own, never the executor's, so a broken executor can always be replaced
         (uint8 action, string memory reason) =
             kind == S.KIND_HANDOVER ? S.handoverParams(d.params) : _atRecording(l, kind, seq, d.params, suspended);
+        if (action == S.HALT) {
+            // the executor cannot answer (its code is not the pinned one, or its answer is malformed): nothing is
+            // recorded and the decision stays buffered, never spent, for a later drain (after a kind 9 replaced the
+            // executor); a drain stops here instead of reverting, so a delivery's own recording stands
+            l.lastSeq = seq - 1;
+            l.lastRecordTime = prevTime;
+            d.recordedTime = 0;
+            d.recordedBlock = 0;
+            d.state = S.BUFFERED;
+            return S.STATUS_BUFFERED;
+        }
         if (action == S.DONE_NOW) return _close(ep, seq, d, S.EXECUTED, "");
         if (action == S.SPEND) return _close(ep, seq, d, S.SPENT, reason);
         d.state = S.PENDING;
@@ -414,12 +426,17 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         private
         returns (uint8, string memory)
     {
-        address x = _exec(l);
+        address x = l.exec;
+        if (x.codehash != l.execHash) return (S.HALT, "");
         if (gasleft() < S.RECORD_FLOOR) revert ExecutionStarved();
         (bool ok, bytes memory ret) = x.delegatecall{ gas: S.RECORD_GAS }(
             abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params, suspended))
         );
         if (!ok) return (S.SPEND, "params");
+        // exactly `abi.encode(uint8 action, string reason)` with a known action, or no answer at all (HALT)
+        if (ret.length < 96) return (S.HALT, "");
+        (uint256 a, uint256 off, uint256 n) = abi.decode(ret, (uint256, uint256, uint256));
+        if (a > S.SPEND || off != 0x40 || n > ret.length - 96) return (S.HALT, "");
         return abi.decode(ret, (uint8, string));
     }
 
@@ -427,7 +444,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         while (n < S.DRAIN) {
             uint64 next = l.lastSeq + 1;
             if (l.decisions[ep][next].state != S.BUFFERED) break;
-            _record(l, ep, next);
+            if (_record(l, ep, next) == S.STATUS_BUFFERED) break; // the executor cannot answer: it stays buffered
             n++;
         }
     }

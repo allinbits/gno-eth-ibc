@@ -76,6 +76,9 @@ library IBCAdminStorage {
     uint8 internal constant WAIT = 0;
     uint8 internal constant DONE_NOW = 1;
     uint8 internal constant SPEND = 2;
+    /// @notice IBCAdmin's own answer when the executor cannot answer (code not the pinned one, a malformed answer):
+    /// the decision stays buffered, nothing recorded.
+    uint8 internal constant HALT = 3;
 
     /// @notice The gas the executor gets at recording and for each call whose failure spends a decision at
     /// execution; with less than the floor left, the call is not made and the transaction reverts.
