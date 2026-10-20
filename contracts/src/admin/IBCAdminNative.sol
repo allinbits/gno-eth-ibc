@@ -20,6 +20,10 @@ contract IBCAdminNative is IIBCAdmin {
 
     address private immutable _self = address(this);
 
+    /// @notice The executor's answer at recording failed validation: reverted so that whatever the executor did in the
+    /// frame is undone; IBCAdmin reads it as HALT (the decision stays buffered, nothing recorded or applied).
+    error Halted();
+
     modifier delegated() {
         if (address(this) == _self) revert NotDelegated();
         _;
@@ -41,21 +45,37 @@ contract IBCAdminNative is IIBCAdmin {
         delegated
         returns (uint8, string memory)
     {
+        // kind 9 is IBCAdmin's own: its parameters checked here, never by the executor
+        if (kind == S.KIND_HANDOVER) return S.handoverParams(params);
         S.Layout storage l = S.layout();
         address x = l.exec;
         if (x.codehash != l.execHash) return (S.HALT, "");
         if (gasleft() < S.RECORD_FLOOR) return (S.STARVED, "");
-        (bool ok, bytes memory ret) = x.delegatecall{ gas: S.RECORD_GAS }(
-            abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params, suspended))
-        );
+        bytes memory data = abi.encodeCall(IBCAdminExec.atRecording, (kind, seq, params, suspended));
+        uint256 budget = S.RECORD_GAS;
+        bool ok;
+        uint256 size;
+        // the answer's size is read before anything is copied: a hostile answer cannot spend the floor's margin
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            ok := delegatecall(budget, x, add(data, 32), mload(data), 0, 0)
+            size := returndatasize()
+        }
+        // a revert undid the executor's own effects; as undecodable parameters, it spends the decision
         if (!ok) return (S.SPEND, "params");
-        if (ret.length < 96) return (S.HALT, "");
+        // from here a refusal reverts (Halted), undoing whatever the executor did in this frame
+        if (size < 96 || size > S.MAX_ANSWER) revert Halted();
+        bytes memory ret = new bytes(size);
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            returndatacopy(add(ret, 32), 0, size)
+        }
         (uint256 a, uint256 off, uint256 n) = abi.decode(ret, (uint256, uint256, uint256));
         // decodable (a known action, the string's offset and bounds), then equal to its canonical re-encoding: no
         // trailing data, the padding present and zero
-        if (a > S.SPEND || off != 0x40 || n > ret.length - 96) return (S.HALT, "");
+        if (a > S.SPEND || off != 0x40 || n > size - 96) revert Halted();
         (uint8 action, string memory reason) = abi.decode(ret, (uint8, string));
-        if (keccak256(abi.encode(action, reason)) != keccak256(ret)) return (S.HALT, "");
+        if (keccak256(abi.encode(action, reason)) != keccak256(ret)) revert Halted();
         return (action, reason);
     }
 

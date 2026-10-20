@@ -80,7 +80,7 @@ attribution terms extend to works that use those files.
 - **`gno.storage.IBCAdmin`** (`IBCAdminStorage.Layout`): epoch, last seq, epoch client, last record time, conflict
   flag, executor and its code hash, decisions and tombstones keyed by epoch, guardian keys and flags, hold history,
   recovery state, `setupDone`, the decision that last set each setting (`appliedSeq`), gno.land's chain id, the client
-  ids kind 6 added (`enrolled`, the only ids kind 10 may move a route to), each epoch's notice, and each pending seat change's anchor (`seatAnchor`).
+  ids kind 6 added (`enrolled`, the only ids kind 10 may move a route to), each epoch's notice, each pending seat change's or hand-over's hold anchor (`seatAnchor[epoch][seq]`, shared by kinds 3 and 9), and each pending hand-over's flag anchor (`flagAnchor[epoch][seq]`, kind 9).
 
 ## Roles (AccessManager)
 
@@ -123,7 +123,8 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   3 duplicate, 4 conflict, 5 spent. A cancel beyond the window is acknowledged `status 2, redispatch 1`.
 - A conflict (other bytes at a recorded or buffered number) keeps the first bytes and sets IBCAdmin's conflict
   flag, which defers every 7-day decision except a seat change (kind 3, which only a hold delays, by its anchor
-  rule). The flag's block is refreshed on every conflict, and a kind 2 unpause
+  rule) and a hand-over (kind 9, which flags, a conflict's included, and holds defer no longer than their anchors
+  plus 21 days). The flag's block is refreshed on every conflict, and a kind 2 unpause
   clears it only when the latest conflict came strictly before the unpause was recorded. Guardian flags work the
   same way: setting one again refreshes its block. Hold and dip moments keep their first block, but only to measure
   how long a hold has lasted; no unpause is compared against them.
@@ -242,7 +243,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
 | §5.4 unknown kind / bad params recorded and spent; a decision's parameters must be exactly the canonical `abi.encode` of its tuple (decoded, re-encoded and compared: trailing data, offsets or padding otherwise are spent at recording); a decision failing its checks at execution spent (no code, another code hash, a refused call, failed after-checks, rolled back) | `IBCAdmin._record`, `execute`; `IBCAdminExec.atRecording`, `_codeIs`, `_call`, `_selfStep` |
 | no one spends a decision by starving it of gas: recording, refusable calls and self-steps run with fixed budgets and floors | `IBCAdmin._atRecording`; `IBCAdminExec._call`, `_selfStep` |
 | §5.4 kind delays: cancel / kind 4 tightening / kind 8 revoke / kind 11 lengthening at recording; unpause 24 h; others 7 d | `IBCAdminExec.atRecording`, `IBCAdmin.execute`, `_delay` |
-| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days; kind 9 under the same hold rule (the same anchor, `seatAnchor`) and deferred by flags no longer than its **flag anchor** plus 21 days (below). The anchor is the start of the first hold standing at or after the seat change was due (its 7 days passed), even one that began before: the earliest start of the standing hold and of every recorded hold that ended strictly after the due time, so a hold that ended before the change was due never counts, and one nobody observed still does (gno.land anchors at the hold standing at its first deferring `Execute`; both rules avoid an anchor earlier than the ideal one, while history compression and observation timing can make either chain's wait the longer). A hold's end is exclusive: one whose dip grace expires exactly at the due time had ended then and never anchors (`test_kind3_anchor_holdEndingExactlyAtDue_neverCounts`, `testFuzz_anchorAtTheDueBoundary`). The first `execute` that finds a hold standing once the change's ordinary maturity (its 7 days) has passed pins it (`replacementAnchor`, `ReplacementAnchored`); if that moment is before the anchor plus 21 days, it returns without reverting (a revert would undo the pin) and the decision stays pending; at or after that deadline, it pins and executes at once. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold from day 1, standing when the change is due, → day 22, day 21 of the hold (`test_kind3_throughAHold_noSoonerThanDay21`). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both, marked `merged`: a merged interval may span a gap no hold covered, so it **never** supplies an anchor; a later genuine hold's start (or the standing hold's) is used instead, never earlier than the true anchor (`test_kind3_anchor_compressedHistory_neverEarlier`; the hold fuzz checks every execution against its own, uncompressed record of the holds) | `IBCAdmin.execute`, `_anchor`, `replacementAnchor`; `IBCAdminStorage.hold`, `noteHoldEnd` |
+| §6.6/§7.4 7-day kinds deferred by flags and holds; kind 3 through flags, and under a hold no sooner than its **anchor** plus 21 days; kind 9 under the same hold rule (the same anchor, `seatAnchor`) and deferred by flags no longer than its **flag anchor** plus 21 days (below). The anchor is the start of the first hold standing at or after the seat change was due (its 7 days passed), even one that began before: the earliest start of the standing hold and of every recorded hold that ended strictly after the due time, so a hold that ended before the change was due never counts, and one nobody observed still does (gno.land anchors at the hold standing at its first deferring `Execute`; both rules avoid an anchor earlier than the ideal one, while history compression and observation timing can make either chain's wait the longer). A hold's end is exclusive: one whose dip grace expires exactly at the due time had ended then and never anchors (`test_kind3_anchor_holdEndingExactlyAtDue_neverCounts`, `testFuzz_anchorAtTheDueBoundary`). The first `execute` that finds a hold standing once the change's ordinary maturity (its 7 days) has passed pins it (`replacementAnchor`, `ReplacementAnchored`); if that moment is before the anchor plus 21 days, it returns without reverting (a revert would undo the pin) and the decision stays pending; at or after that deadline, it pins and executes at once. Later holds never move it: a guardian clearing, waiting out the 24-hour grace and flagging again restarts nothing, and the change lands from the anchor plus 21 days whatever hold stands then (`test_kind3_anchor_clearAndReflagCycles_neverReset`). Examples: recorded on day 0, a hold on days 1 to 3 and another from day 20 → day 41 (`test_kind3_anchor_holdBeforeDueNeverCounts`); a single hold from day 10 → day 31 (`test_kind3_anchor_singleStandingHold`); a hold from day 1, standing when the change is due, → day 22, day 21 of the hold (`test_kind3_throughAHold_noSoonerThanDay21`). The hold history keeps eight holds, a ninth merging the two oldest into one spanning both, marked `merged`: a merged interval may span a gap no hold covered, so it **never** supplies an anchor; a later genuine hold's start (or the standing hold's) is used instead, never earlier than the true anchor (`test_kind3_anchor_compressedHistory_neverEarlier`; the hold fuzz checks every execution against its own, uncompressed record of the holds) | `IBCAdmin.execute`, `replacementAnchor`; `IBCAdminStorage.anchor`, `hold`, `noteHoldEnd`; `IBCAdminNative.handoverDue` (kind 9) |
 | §7.4 unpause spent under a hold of its object (a route: its flags or refunds flags); kind 2's parameters need a non-empty client id for object 1 (a route) and an empty one for object 2 (IBCAdmin), spent at recording otherwise | `IBCAdminExec._unpause` |
 | kind 3 replaces 1 to 4 pairs of distinct, valid seats with distinct resulting keys (spent at recording otherwise), at most 2 guardian seats, never a current key; both key copies follow; a replaced seat loses its recovery approval | `Guardians.checkReplace`; `IBCAdminExec._seats` |
 | kind 4 limits, "no field loosens" rule; an older decision maturing later never overwrites a newer setting (kinds 4, 11). Bounds (spent otherwise): a non-zero token, `dayCap` and `refundCap` at most 2^128 − 1 (`LeakyBucket.MAX_CAP`), and `sendMin <= sendMax` when `sendMax` is set. A zero `dayCap` refuses every receive, a zero `maxPerMessage` too, and a zero `refundCap` queues every refund; kind 11's quarantine is at most 365 days | `IBCAdminExec._validLimits`, `_loosens`; `IBCAdminStorage.supersede` |
@@ -502,8 +503,9 @@ one incident is never counted by another; nothing is counted on the live client.
     defer it at all. A live malicious key can still flag before the due time and so set the anchor no earlier than
     its flag, but only once per hand-over; kind 3 replaces such a key while the executor works.
 
-  The first attempt that pins an anchor returns, pending (a revert would undo the pin, as for kind 3); later ones
-  revert `NotMature` with the landing time (`ReplacementAnchored` carries it). **No new power**: under a lone flag,
+  The first attempt that pins an anchor returns, pending, if it is still before the landing time (a revert would
+  undo the pin, as for kind 3); if the anchors already lie 21 days or more in the past it executes in the same call.
+  Later attempts before the landing time revert `NotMature` with it (`ReplacementAnchored` carries it). **No new power**: under a lone flag,
   governance can already replace the flagging seat (kind 3, not deferred by flags, 7 days) and then hand over (7
   more), 14 days in all; 21 days is longer
   (`test_kind9_unavailableFlaggingKey_brokenExecutor_landsAfter21Days`, `test_kind9_flagCycling_neverResetsTheAnchor`,
@@ -721,10 +723,19 @@ gas left for the kind's frame: at least floor(frame × 64 / 63) + 60,000 at that
 replace) and has its own floor of 161,587 gas (`CallStarved`); it keeps every other check: sequencing, cancellation,
 recovery suspension, deferral and maturity. The frame budgets in the table below are therefore
 not sufficient transaction gas limits. Each of these execution checks reverts and leaves the decision **pending**: calling `execute` again with enough
-gas retries it. One exception does not revert: a seat change (kind 3) whose first held execution pins its anchor
-returns, pending, before the anchor plus 21 days (a revert would undo the pin; see the kind 3 rule above). Recording starvation is different. Recording through the executor (`IBCAdminNative.atRecording`, kinds 2 to 8 and
-10 to 13) has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 10,000, checked before the executor is
-called. With less gas left:
+gas retries it. One exception does not revert: a seat change (kind 3) or a hand-over (kind 9) whose first held (or,
+for kind 9, flagged) execution pins an anchor returns, pending, when the effective landing time (the anchor plus 21
+days, or the later of both anchors for kind 9) is still ahead; otherwise it executes in the same call (a revert would
+undo the pin; see the kind 3 rule and kind 9's bounded deferral above). Later attempts before the landing time revert
+`NotMature` with it. Recording starvation is different. Recording through the executor (`IBCAdminNative.atRecording`, kinds 2 to 8 and
+10 to 13) has its own 1M frame (`RECORD_GAS`) and floor, 1M × 64 / 63 + 100,000, checked before the executor is
+called. The margin past the frame budgets everything after it: the answer's copy and validation and the recording's
+own writes, so a recording that passed the floor never runs out of gas afterwards. The answer's size is read before
+it is copied and bounded (`MAX_ANSWER`: the canonical encoding of a reason of at most `MAX_REASON`, 64 bytes); a
+larger one is never copied and halts. A halt reverts the helper's frame (`IBCAdminNative.Halted`), so whatever the
+executor did there (storage writes, events, governed calls) is undone with it
+(`test_haltedAnswer_undoesTheExecutorsEffects`, `test_hugeAnswer_halts_kind9Ahead_stands`,
+`test_gasBurningAnswer_kind9Ahead_alwaysStands`); an executor that reverts is spent as before. With less gas left:
 - for the **delivered** decision, the delivery reverts with **no data**, as a busy-hook delivery does: eureka's
   router turns an empty revert into `IBCFailedCallback` and reverts the whole transaction, so no receipt is kept and
   no ack written. A relayer that front-runs with too little gas consumes nothing; the same packet is relayed again
@@ -736,8 +747,8 @@ called. With less gas left:
 
 An executor that cannot answer (its code not the pinned one, or an answer that is not exactly the canonical
 `abi.encode(uint8 action, string reason)`: decodable with a known action, then equal to its own re-encoding, so no
-trailing data and the padding present and zero) halts the decision likewise: it stays buffered, unrecorded and
-unspent (a delivered one is acknowledged `status 2`, buffered), and a drain stops there without reverting until a
+trailing data and the padding present and zero, at most `MAX_ANSWER` bytes) halts the decision likewise: whatever
+the executor did in its frame is undone, and the decision stays buffered, unrecorded and unspent (a delivered one is acknowledged `status 2`, buffered), and a drain stops there without reverting until a
 kind 9 has replaced the executor. Work already buffered on Ethereum is recorded by `drain()` called with enough gas.
 A cancel (kind 1), an unknown kind, an oversize envelope or a malformed cancel marked bad (spent), a
 tombstoned decision (cancelled) and kind 9 (its parameter check, IBCAdminStorage.handoverParams) are recorded inline,
@@ -991,7 +1002,8 @@ executor is refused on chain already: through a proxy its `bindings()` answer ze
 bindings are right but whose code is not a build of its source.
 
 **Live code that fails after execution** cannot be cancelled (kind 1 acts only on pending decisions). An IBCAdmin
-hold defers every 7-day decision, the repair's included (a seat change only until its anchor plus 21 days), so the
+hold defers every 7-day decision, the repair's included (a seat change and a hand-over only until their anchors plus
+21 days, and a hand-over's deferral by flags is bounded the same way), so the
 order matters:
 1. **Cancel unsafe pending decisions** (kind 1): every pending decision that relies on the failed code or would
    install unverified code.
@@ -1001,7 +1013,7 @@ order matters:
    on IBCAdmin: route flags defer no governance, but **refunds flags defer every refund-paying kind 12** (it stays
    pending); they last while the guardians keep them (kind 2 clears them only when no hold of theirs stands).
 3. **Clear the administrative flags and wait out the hold.** IBCAdmin flags (`setFlag`) defer every 7-day
-   decision but a seat change (kind 3), so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
+   decision but a seat change (kind 3) and, for at most 21 days from its flag anchor, a hand-over (kind 9), so any set during the incident are cleared by their owners (`clearFlag`), and the hold ends 24 hours
    after fewer than two guardian flags stand. The repair decision, recorded meanwhile, still waits its 7 days. A
    hand-over (kind 9) is deferred by flags and holds for at most 21 days from their anchors (its bounded deferral,
    above), so a flag whose key is unavailable delays an executor replacement but never blocks it.

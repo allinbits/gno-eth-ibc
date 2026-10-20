@@ -377,9 +377,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         if (S.isTombstoned(l, ep, seq)) return _close(ep, seq, d, S.CANCELLED, "");
         // while an emergency recovery is open, an authority change waits even where it would act at recording
         bool suspended = l.recovery.openedAt != 0 && S.suspendedByRecovery(kind);
-        // kind 9 is IBCAdmin's own, never the executor's, so a broken executor can always be replaced
-        (uint8 action, string memory reason) =
-            kind == S.KIND_HANDOVER ? S.handoverParams(d.params) : _atRecording(kind, seq, d.params, suspended);
+        // in IBCAdminNative: kind 9 checked there itself, never by the executor (a broken one is always replaceable)
+        (uint8 action, string memory reason) = _atRecording(kind, seq, d.params, suspended);
         if (action >= S.HALT) {
             // the executor cannot answer (its code is not the pinned one, or its answer is malformed): nothing is
             // recorded and the decision stays buffered, never spent, for a later drain (after a kind 9 replaced the
@@ -685,7 +684,15 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Runs IBCAdmin's own executor-independent code (IBCAdminNative, fixed at construction) as this contract.
     function _native(bytes memory call) private returns (bytes memory) {
-        return _delegateTo(native, call);
+        (bool ok, bytes memory ret) = native.delegatecall(call);
+        if (ok) return ret;
+        // the executor's answer at recording refused: the frame reverted (`Halted`), undoing whatever the executor
+        // did in it, and the verdict is HALT (the decision stays buffered)
+        if (ret.length == 4 && bytes4(ret) == IBCAdminNative.Halted.selector) return abi.encode(S.HALT, "");
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            revert(add(ret, 32), mload(ret))
+        }
     }
 
     /// @notice Runs the executor's code as this contract; a revert there reverts here with its own reason.

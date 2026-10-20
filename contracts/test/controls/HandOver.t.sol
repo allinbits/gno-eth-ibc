@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import { Vm } from "forge-std/Vm.sol";
 import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
 import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
 import { IICS26RouterErrors } from "@eureka/errors/IICS26RouterErrors.sol";
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
+import { IGnoICS20Controls } from "../../src/interfaces/IGnoICS20Controls.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
@@ -89,6 +91,51 @@ contract MalformedExec {
             ret = abi.encodePacked(uint256(0), uint256(0x40), uint256(1), bytes1("a")); // missing padding
         } else {
             ret = abi.encode(uint256(2), uint256(64), uint256(0), uint256(123)); // a spend with trailing data
+        }
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            return(add(ret, 32), mload(ret))
+        }
+    }
+}
+
+/// @notice An executor bound as IBCAdmin's that acts at recording (an IBCAdmin storage write, an event, a governed
+/// call with IBCAdmin's authority), then answers by `mode`: 1 malformed (32 bytes), 2 oversize (MAX_ANSWER + 32
+/// bytes), 3 huge (512 KiB), 4 burning nearly all its frame's gas and then answering the longest spend, 5 an
+/// unknown action, 6
+/// trailing data.
+contract ActingExec {
+    event Acted();
+
+    address internal immutable r;
+    address internal immutable am;
+    address internal immutable t;
+    uint256 internal immutable mode;
+    string internal client;
+
+    constructor(address r_, address am_, address t_, uint256 mode_, string memory client_) {
+        (r, am, t, mode, client) = (r_, am_, t_, mode_, client_);
+    }
+
+    function bindings() external view returns (address, address, address) {
+        return (r, am, t);
+    }
+
+    fallback() external {
+        bytes memory ret;
+        if (mode == 4) {
+            // the longest answer the floor's margin must cover: a spend with a MAX_REASON-byte reason
+            ret = abi.encode(uint8(2), string(new bytes(S.MAX_REASON)));
+            while (gasleft() > 1500) { }
+        } else {
+            S.layout().conflictBlock = 77;
+            emit Acted();
+            IGnoICS20Controls(t).setQuarantine(client, 5 days);
+            if (mode == 1) ret = abi.encode(uint256(0));
+            else if (mode == 2) ret = new bytes(S.MAX_ANSWER + 32);
+            else if (mode == 3) ret = new bytes(512 * 1024);
+            else if (mode == 5) ret = abi.encode(uint256(7), uint256(0x40), uint256(0));
+            else ret = abi.encodePacked(abi.encode(uint8(0), ""), uint256(0));
         }
         // solhint-disable-next-line no-inline-assembly
         assembly ("memory-safe") {
@@ -746,5 +793,74 @@ contract HandOverTest is ControlsFixture {
         assertEq(_state(s + 2), S.BUFFERED);
         assertEq(admin.drain(), 1);
         assertEq(_state(s + 2), S.PENDING);
+    }
+
+    // --------------------------------------------------- a halted answer is undone; the answer's copy is bounded --
+
+    function _acting(uint256 mode) internal returns (address x) {
+        x = address(new ActingExec(address(router), d.accessManager, address(ics20), mode, clientId));
+        _handOver(x);
+        assertEq(_execOf(), x);
+    }
+
+    /// @notice An executor that acts at recording (a storage write, an event, a governed call) and then answers
+    /// malformed or oversize: the answer halts the decision and everything the executor did is undone with its frame;
+    /// the decision stays buffered and a cancel then records it as cancelled.
+    function test_haltedAnswer_undoesTheExecutorsEffects() public {
+        uint8[4] memory modes = [1, 2, 5, 6];
+        for (uint256 k = 0; k < modes.length; k++) {
+            uint256 snap = vm.snapshotState();
+            _acting(modes[k]);
+            uint64 q = ctl.quarantineSeconds(clientId);
+            uint64 s = admin.lastSeq();
+            vm.recordLogs();
+            assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED, "halted");
+            Vm.Log[] memory logs = vm.getRecordedLogs();
+            for (uint256 i = 0; i < logs.length; i++) {
+                assertTrue(logs[i].topics[0] != ActingExec.Acted.selector, "its event undone");
+            }
+            assertEq(admin.conflictBlock(), 0, "its storage write undone");
+            assertEq(ctl.quarantineSeconds(clientId), q, "its governed call undone");
+            assertEq(_state(s + 1), S.BUFFERED);
+            _at(s + 2, S.KIND_CANCEL, P.cancel1(s + 1, s + 1));
+            assertEq(_state(s + 1), S.CANCELLED);
+            assertEq(admin.lastSeq(), s + 2);
+            vm.revertToState(snap);
+        }
+    }
+
+    /// @notice A huge answer is never copied: it halts, and a kind 9 recorded ahead of it in the same delivery stands
+    /// (copying it would cost more than the floor's margin and revert the whole delivery).
+    function test_hugeAnswer_halts_kind9Ahead_stands() public {
+        _acting(3);
+        uint64 s = admin.lastSeq();
+        _at(s + 2, S.KIND_SETTINGS, P.settings(clientId, 2 days));
+        IBCAdminExec next = _good();
+        assertTrue(
+            _recvWithGas(_env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), 1_500_000)
+        );
+        assertEq(_state(s + 1), S.PENDING, "the kind 9 recorded");
+        assertEq(_state(s + 2), S.BUFFERED, "the huge answer halted");
+        assertEq(admin.conflictBlock(), 0);
+    }
+
+    /// @notice An executor burning nearly all its frame: whatever gas a relayer sends, the delivery either stops the
+    /// drain before the executor (starved) or completes the recording within the floor's margin; it never runs out
+    /// of gas after the floor, so a kind 9 recorded ahead of it always stands.
+    function test_gasBurningAnswer_kind9Ahead_alwaysStands() public {
+        _acting(4);
+        uint64 s = admin.lastSeq();
+        _at(s + 2, S.KIND_SETTINGS, P.settings(clientId, 2 days));
+        IBCAdminExec next = _good();
+        bytes memory env = _env(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
+        uint256 recorded;
+        for (uint256 gas = 1_000_000; gas <= 1_400_000; gas += 1999) {
+            uint256 snap = vm.snapshotState();
+            assertTrue(_recvWithGas(env, gas), "the delivery completes");
+            assertEq(_state(s + 1), S.PENDING, "the kind 9 stands");
+            if (_state(s + 2) == S.SPENT) recorded++;
+            vm.revertToState(snap);
+        }
+        assertGt(recorded, 0, "the burning executor's answer recorded at some gas");
     }
 }

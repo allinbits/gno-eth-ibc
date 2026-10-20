@@ -86,7 +86,14 @@ library IBCAdminStorage {
     /// @notice The gas the executor gets at recording and for each call whose failure spends a decision at
     /// execution; with less than the floor left, the call is not made and the transaction reverts.
     uint256 internal constant RECORD_GAS = 1_000_000;
-    uint256 internal constant RECORD_FLOOR = RECORD_GAS * 64 / 63 + 10_000;
+    /// The floor's margin past the executor's frame (100,000) budgets what follows it: the answer's bounded copy and
+    /// validation in IBCAdminNative and the recording's own writes and events in IBCAdmin, so a recording that passed
+    /// the floor never runs out of gas afterwards.
+    uint256 internal constant RECORD_FLOOR = RECORD_GAS * 64 / 63 + 100_000;
+    /// @notice The longest reason an executor's answer at recording may carry, so the longest answer: the canonical
+    /// `abi.encode(uint8, string)` of a reason of at most MAX_REASON bytes. A longer answer is never copied: it halts.
+    uint256 internal constant MAX_REASON = 64;
+    uint256 internal constant MAX_ANSWER = 96 + MAX_REASON;
     /// @notice Kind 9's `bindings()` probe of the new executor (IBCAdmin's own hand-over path), and the gas an
     /// execution must have left to start it: a caller sending less is refused (CallStarved) and the decision pends.
     uint256 internal constant BIND_GAS = 100_000;
