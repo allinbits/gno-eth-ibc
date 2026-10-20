@@ -101,8 +101,8 @@ contract MalformedExec {
 
 /// @notice An executor bound as IBCAdmin's that acts at recording (an IBCAdmin storage write, an event, a governed
 /// call with IBCAdmin's authority), then answers by `mode`: 1 malformed (32 bytes), 2 oversize (MAX_ANSWER + 32
-/// bytes), 3 huge (512 KiB), 4 burning nearly all its frame's gas and then answering the longest spend, 5 an
-/// unknown action, 6
+/// bytes), 3 huge (512 KiB), 4 burning nearly all its frame's gas and then answering the longest spend (7: WAIT),
+/// 5 an unknown action, 8 acting and answering a canonical WAIT (the positive control), 6
 /// trailing data.
 contract ActingExec {
     event Acted();
@@ -111,10 +111,23 @@ contract ActingExec {
     address internal immutable am;
     address internal immutable t;
     uint256 internal immutable mode;
-    string internal client;
+    // the route it acts on, in code (immutables), never storage: the executor runs as IBCAdmin, whose storage it reads
+    bytes32 internal immutable clientWord;
+    uint256 internal immutable clientLen;
 
     constructor(address r_, address am_, address t_, uint256 mode_, string memory client_) {
-        (r, am, t, mode, client) = (r_, am_, t_, mode_, client_);
+        (r, am, t, mode) = (r_, am_, t_, mode_);
+        require(bytes(client_).length <= 32, "short client id");
+        clientWord = bytes32(bytes(client_));
+        clientLen = bytes(client_).length;
+    }
+
+    function _client() internal view returns (string memory c) {
+        bytes memory b = new bytes(clientLen);
+        for (uint256 i = 0; i < clientLen; i++) {
+            b[i] = clientWord[i];
+        }
+        c = string(b);
     }
 
     function bindings() external view returns (address, address, address) {
@@ -130,12 +143,13 @@ contract ActingExec {
         } else {
             S.layout().conflictBlock = 77;
             emit Acted();
-            IGnoICS20Controls(t).setQuarantine(client, 5 days);
+            IGnoICS20Controls(t).setQuarantine(_client(), 5 days);
             if (mode == 1) ret = abi.encode(uint256(0));
             else if (mode == 2) ret = new bytes(S.MAX_ANSWER + 32);
             else if (mode == 3) ret = new bytes(512 * 1024);
             else if (mode == 5) ret = abi.encode(uint256(7), uint256(0x40), uint256(0));
-            else ret = abi.encodePacked(abi.encode(uint8(0), ""), uint256(0));
+            else if (mode == 6) ret = abi.encodePacked(abi.encode(uint8(0), ""), uint256(0));
+            else ret = abi.encode(uint8(0), ""); // 8: the positive control, a canonical WAIT
         }
         // solhint-disable-next-line no-inline-assembly
         assembly ("memory-safe") {
@@ -803,8 +817,10 @@ contract HandOverTest is ControlsFixture {
         assertEq(_execOf(), x);
     }
 
-    /// @notice An executor that acts at recording (a storage write, an event, a governed call) and then answers
-    /// malformed or oversize: the answer halts the decision and everything the executor did is undone with its frame;
+    /// @notice An executor that acts at recording (a storage write, an event, a governed call on the route) and then
+    /// answers malformed or oversize: the answer halts the decision and everything the executor did is undone with its
+    /// frame (`test_actingExecutor_canonicalAnswer_effectsStand` is the positive control: answering canonically, the
+    /// same effects stand);
     /// the decision stays buffered and a cancel then records it as cancelled.
     function test_haltedAnswer_undoesTheExecutorsEffects() public {
         uint8[4] memory modes = [1, 2, 5, 6];
@@ -812,13 +828,10 @@ contract HandOverTest is ControlsFixture {
             uint256 snap = vm.snapshotState();
             _acting(modes[k]);
             uint64 q = ctl.quarantineSeconds(clientId);
+            assertTrue(q != 5 days, "the executor's call would change it");
             uint64 s = admin.lastSeq();
-            vm.recordLogs();
+            // (its event is not checked: Foundry's recordLogs keeps logs of reverted frames, which the chain drops)
             assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED, "halted");
-            Vm.Log[] memory logs = vm.getRecordedLogs();
-            for (uint256 i = 0; i < logs.length; i++) {
-                assertTrue(logs[i].topics[0] != ActingExec.Acted.selector, "its event undone");
-            }
             assertEq(admin.conflictBlock(), 0, "its storage write undone");
             assertEq(ctl.quarantineSeconds(clientId), q, "its governed call undone");
             assertEq(_state(s + 1), S.BUFFERED);
@@ -927,5 +940,25 @@ contract HandOverTest is ControlsFixture {
             }
             vm.revertToState(snap0);
         }
+    }
+
+    /// @notice The positive control of the rollback test: the same acting executor answering canonically does change
+    /// the route (and IBCAdmin's storage, and emits), with no halt, so the rollback test's assertions are not vacuous.
+    function test_actingExecutor_canonicalAnswer_effectsStand() public {
+        _acting(8);
+        assertTrue(ctl.quarantineSeconds(clientId) != 5 days);
+        uint64 s = admin.lastSeq();
+        bytes memory env = _env(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days));
+        vm.recordLogs();
+        assertTrue(_recvWithGas(env, 30_000_000));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool acted;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == ActingExec.Acted.selector) acted = true;
+        }
+        assertTrue(acted, "its event stands");
+        assertEq(admin.conflictBlock(), 77, "its storage write stands");
+        assertEq(ctl.quarantineSeconds(clientId), 5 days, "its governed call on the same route stands");
+        assertEq(_state(s + 1), S.PENDING);
     }
 }

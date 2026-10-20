@@ -592,7 +592,12 @@ one incident is never counted by another; nothing is counted on the live client.
   exist, not to be active), or a kind 6 client and a kind 10. Otherwise the frozen or expired client refuses every
   proof, so new proof-based processing on the route stops (acks, timeouts, receives, redemptions); refunds already
   owed, queued or parked, stay claimable (`claim`, `claimParked`) subject to their ordinary gates, backing and meter.
-  The rest of the escrow's backing can become permanently stranded. A fresh deployment cannot recover it. Enabling
+  The rest of the escrow's backing can become permanently stranded. A fresh deployment cannot recover it. A client
+  failure does **not** stop outbound sends: neither the transfer app's send path nor the router's `sendPacket`
+  checks whether the route's verifier is frozen or expired, so new escrowed sends keep leaving (and their acks and
+  timeouts on Ethereum wait for the client to be repaired, since their processing needs its proofs). Guardians
+  contain them by flagging the route (`setRouteFlag`: receives and escrowed sends stop); returning-voucher burns stay
+  available (an exit, never paused). Enabling
   recovery narrows this but does not remove it: a recovery that a defective recovery module or transfer app blocks
   leaves the same stranding (the next item).
 - **Repair after a channel loss needs working recovery and transfer components (accepted residual, accepted by the
@@ -747,8 +752,14 @@ executor did there (storage writes, events, governed calls) is undone with it
   IBCAdmin's call to the helper plus 100,000 gas for what the step spends before the helper's own check, its writes
   and the copy of up to `MAX_ENVELOPE` bytes of cold parameters) and stops below it; the floor's margin then covers
   the step's completion, including `_close`'s clearing of a maximum-size decision's parameters after an executor that
-  burned its whole frame. The two bounds are each sufficient on their own (defence in depth); together they keep a
-  drain from ever running out of gas once it has recorded something
+  burned its whole frame. The two bounds guard different work: `_record` writes the recording state and copies the
+  stored parameters **before** the helper's floor check, so the floor alone cannot protect that work in a low-gas
+  drain; the reserve guards entry into each step, and the floor's margin covers completion after the executor call.
+  Together they keep a drain from ever running out of gas once it has recorded something. (In the tests below a
+  mutant removing only the reserve survives: with the present 100,000-gas margin, the gas a step has left after the
+  previous step's completion happens to cover the next step's writes and copy, so the sweeps cannot tell. That shows
+  the margin's slack under these constants, not that the reserve is redundant: the reserve, not the floor, is what
+  guards a step's pre-floor work by construction, and removing it together with a smaller margin is caught.)
   (`test_drainReserve_maxSizeDecisions_kind9AlwaysStands`, `test_drainReserve_directDrain_neverReverts`: two
   maximum-size decisions behind a kind 9, an executor burning its frame and answering SPEND or WAIT, swept across
   relay gas).
