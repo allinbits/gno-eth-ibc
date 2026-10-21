@@ -202,7 +202,7 @@ contract DeployGnoIBC is Script {
         });
         // an enabled recovery's public delay is long (IBCAdmin refuses less, too)
         require(
-            p.recovery.delay == 0 || p.recovery.delay >= 30 days, "RECOVERY_DELAY: zero (disabled) or 30 days or more"
+            p.recovery.delay == 0 || p.recovery.delay >= 1 hours, "RECOVERY_DELAY: zero (disabled) or 1 hour or more (testnet build)"
         );
         // a cancellation never needs more guardians than an approval: approvers can always close what they opened
         require(

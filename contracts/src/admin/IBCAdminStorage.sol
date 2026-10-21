@@ -52,7 +52,7 @@ library IBCAdminStorage {
 
     /// @notice An enabled emergency recovery's shortest public delay (ADR §7.12 step 3, "a long public delay"):
     /// the time everyone has to see an opened recovery and the guardians to cancel it.
-    uint64 internal constant MIN_RECOVERY_DELAY = 30 days;
+    uint64 internal constant MIN_RECOVERY_DELAY = 1 hours; // testnet: production is 30 days
 
     /// @notice The most items a kind 12 settles.
     uint256 internal constant MAX_SETTLE_ITEMS = 8;
@@ -107,9 +107,9 @@ library IBCAdminStorage {
     /// @notice 24 hours: the unpause delay and the dip's grace.
     uint64 internal constant DAY = 1 days;
     /// @notice The decision delay.
-    uint64 internal constant WEEK = 7 days;
+    uint64 internal constant WEEK = 1 hours; // testnet: production is 7 days
     /// @notice A guardian replacement lands through a hold no sooner than this after the hold's start.
-    uint64 internal constant HOLD_REPLACEMENT = 21 days;
+    uint64 internal constant HOLD_REPLACEMENT = 3 hours; // testnet: production is 21 days
 
     /// @notice The emergency route replacement (§7.12): each guardian seat approves one proposal (its hash); a
     /// proposal opens once enough seats approve it while the route is eligible, and executes after the delay unless
