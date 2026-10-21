@@ -248,14 +248,14 @@ contract HandOverTest is ControlsFixture {
     /// @notice Hands over to `x` through IBCAdmin's path; returns the decision's number.
     function _handOver(address x) internal returns (uint64 seq) {
         seq = _decidePending(S.KIND_HANDOVER, P.handover(x, x.codehash, ""));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(seq);
     }
 
     /// @notice Executes `seq` after its week, expecting it spent for `reason`, the pin unchanged.
     function _expectSpent(uint64 seq, string memory reason) internal {
         address before = _execOf();
-        _skip(7 days);
+        _skip((7 * TD));
         vm.expectEmit(true, true, false, true, address(admin));
         emit IIBCAdmin.DecisionSpent(admin.epoch(), seq, S.KIND_HANDOVER, reason);
         admin.execute(seq);
@@ -274,7 +274,7 @@ contract HandOverTest is ControlsFixture {
         assertEq(status, S.STATUS_SPENT, "broken executor");
         IBCAdminExec next = _good();
         uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
-        _skip(7 days);
+        _skip((7 * TD));
         vm.expectEmit(address(admin));
         emit IIBCAdmin.ExecReplaced(address(next), address(next).codehash);
         vm.expectEmit(true, true, false, true, address(admin));
@@ -285,7 +285,7 @@ contract HandOverTest is ControlsFixture {
         assertEq(x, address(next));
         assertEq(h, address(next).codehash);
         uint64 later = _decidePending(S.KIND_SETTINGS, P.settings(clientId, 2 days));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(later);
         assertEq(_state(later), S.EXECUTED);
         assertEq(ctl.quarantineSeconds(clientId), 2 days);
@@ -388,7 +388,7 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_starvedCaller_pends() public {
         address x = _odd(0, 90_000);
         uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(x, x.codehash, ""));
-        _skip(7 days);
+        _skip((7 * TD));
         vm.expectRevert(IIBCAdmin.CallStarved.selector);
         admin.execute{ gas: 115_000 }(seq);
         assertEq(_state(seq), S.PENDING);
@@ -402,8 +402,8 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_waitsItsWeek() public {
         IBCAdminExec next = _good();
         uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
-        uint64 due = admin.decision(admin.epoch(), seq).recordedTime + 7 days;
-        _skip(7 days - 1);
+        uint64 due = admin.decision(admin.epoch(), seq).recordedTime + (7 * TD);
+        _skip((7 * TD) - 1);
         vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, due));
         admin.execute(seq);
         _skip(1);
@@ -449,14 +449,14 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_loneFlag_defersUntilItsStartPlus21Days() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _flag(W[0]);
-        vm.warp(t0 + 7 days);
+        vm.warp(t0 + (7 * TD));
         vm.expectEmit(true, true, false, true, address(admin));
-        emit IIBCAdmin.ReplacementAnchored(admin.epoch(), seq, uint64(t0 + 22 days));
+        emit IIBCAdmin.ReplacementAnchored(admin.epoch(), seq, uint64(t0 + (22 * TD)));
         admin.execute(seq); // pins the flag's start
         assertEq(_state(seq), S.PENDING);
-        _landsAt(seq, next, t0 + 22 days);
+        _landsAt(seq, next, t0 + (22 * TD));
     }
 
     /// @notice The deadlock it resolves: a watch key flags IBCAdmin and becomes unavailable (its flag never clears),
@@ -470,9 +470,9 @@ contract HandOverTest is ControlsFixture {
         _flag(W[1]); // and W[1] is never heard from again
         vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 7 days);
+        vm.warp(t0 + (7 * TD));
         admin.execute(seq);
-        _landsAt(seq, next, t0 + 21 days);
+        _landsAt(seq, next, t0 + (21 * TD));
         assertTrue(admin.flags()[5].blockNumber != 0, "W[1]'s flag still stands");
     }
 
@@ -480,9 +480,9 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_flagOlderThan21DaysAtDue_landsWhenDue() public {
         uint256 t0 = _now();
         _flag(W[0]);
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 27 days);
+        vm.warp(t0 + (27 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
         assertEq(_execOf(), next);
@@ -492,12 +492,12 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_freshFlagAfterDue_defers() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 10 days);
+        vm.warp(t0 + (10 * TD));
         _flag(W[0]);
-        vm.warp(t0 + 11 days);
+        vm.warp(t0 + (11 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.PENDING);
-        _landsAt(seq, next, t0 + 31 days);
+        _landsAt(seq, next, t0 + (31 * TD));
     }
 
     /// @notice Cycling flags never extends the deferral: the anchor is pinned once and never reset, whatever flags
@@ -505,35 +505,35 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_flagCycling_neverResetsTheAnchor() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 8 days);
+        vm.warp(t0 + (8 * TD));
         _flag(W[0]);
-        vm.warp(t0 + 9 days);
+        vm.warp(t0 + (9 * TD));
         admin.execute(seq); // pins day 8
-        vm.warp(t0 + 10 days);
+        vm.warp(t0 + (10 * TD));
         _unflag(W[0]);
-        vm.warp(t0 + 12 days);
+        vm.warp(t0 + (12 * TD));
         _flag(W[1]);
-        vm.warp(t0 + 15 days);
+        vm.warp(t0 + (15 * TD));
         _flag(W[0]);
         _flag(W[0]); // a re-flag moves its own start, never the pinned anchor
-        vm.warp(t0 + 20 days);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 29 days));
+        vm.warp(t0 + (20 * TD));
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (29 * TD)));
         admin.execute(seq);
-        _landsAt(seq, next, t0 + 29 days);
+        _landsAt(seq, next, t0 + (29 * TD));
     }
 
     /// @notice A hold and an earlier lone flag together: each deferral applies, the later one wins (the hold's).
     function test_kind9_holdAndFlag_bothApply() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _flag(G[0]); // a lone flag from day 1
-        vm.warp(t0 + 3 days);
+        vm.warp(t0 + (3 * TD));
         _flag(G[1]); // a hold from day 3
-        vm.warp(t0 + 7 days);
+        vm.warp(t0 + (7 * TD));
         admin.execute(seq); // pins both: the flag's day 1, the hold's day 3
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 3 days);
-        _landsAt(seq, next, t0 + 24 days);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (3 * TD));
+        _landsAt(seq, next, t0 + (24 * TD));
     }
 
     /// @notice A conflict's flag has no start of its own: it counts from the first attempt once due.
@@ -542,10 +542,10 @@ contract HandOverTest is ControlsFixture {
         (uint64 seq, address next) = _k9();
         _recvGov(_env(seq, S.KIND_HANDOVER, P.handover(next, bytes32(uint256(1)), "")));
         assertTrue(admin.conflictBlock() != 0, "conflict");
-        vm.warp(t0 + 7 days);
+        vm.warp(t0 + (7 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.PENDING);
-        _landsAt(seq, next, t0 + 28 days);
+        _landsAt(seq, next, t0 + (28 * TD));
     }
 
     // kind 3's hold anchor cases, for kind 9 (the same rule, IBCAdminStorage.anchor, the shared `seatAnchor`)
@@ -553,31 +553,31 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_anchor_holdBeforeDueNeverCounts() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _hold(); // days 1 to 3
-        vm.warp(t0 + 2 days);
+        vm.warp(t0 + (2 * TD));
         _unflag(G[1]);
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         assertEq(admin.hold().blockNumber, 0, "the first hold ended");
         _flag(G[1]); // the second hold, from day 20
-        vm.warp(t0 + 22 days);
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq); // pins day 20
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
-        _landsAt(seq, next, t0 + 41 days);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (20 * TD));
+        _landsAt(seq, next, t0 + (41 * TD));
     }
 
     function test_kind9_anchor_clearAndReflagCycles_neverReset() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 8 days);
+        vm.warp(t0 + (8 * TD));
         _hold();
-        vm.warp(t0 + 9 days);
+        vm.warp(t0 + (9 * TD));
         admin.execute(seq);
-        uint256 floor = t0 + 8 days + 21 days;
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
+        uint256 floor = t0 + (8 * TD) + (21 * TD);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (8 * TD));
         for (uint256 k = 0; k < 3; k++) {
             _unflag(G[1]);
-            _skip(1 days + 1); // the grace passes: the hold ends
+            _skip((1 * TD) + 1); // the grace passes: the hold ends
             assertEq(admin.hold().blockNumber, 0);
             _flag(G[1]); // a fresh hold
             vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, floor));
@@ -589,32 +589,32 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_anchor_unobservedHoldCounts() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 8 days);
+        vm.warp(t0 + (8 * TD));
         _hold();
-        vm.warp(t0 + 9 days);
+        vm.warp(t0 + (9 * TD));
         _unflag(G[1]);
-        vm.warp(t0 + 15 days);
+        vm.warp(t0 + (15 * TD));
         _flag(G[1]);
-        vm.warp(t0 + 16 days);
+        vm.warp(t0 + (16 * TD));
         admin.execute(seq);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
-        _landsAt(seq, next, t0 + 29 days);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (8 * TD));
+        _landsAt(seq, next, t0 + (29 * TD));
     }
 
     function test_kind9_anchor_holdEndingExactlyAtDue_neverCounts() public {
         uint256 t0 = _now();
         (uint64 seq, address next) = _k9();
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _hold();
-        vm.warp(t0 + 6 days);
+        vm.warp(t0 + (6 * TD));
         _unflag(G[1]); // the dip: the hold ends 24 hours later, exactly on day 7
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         _flag(G[1]);
-        assertEq(admin.holds()[0].end, t0 + 7 days);
-        vm.warp(t0 + 22 days);
+        assertEq(admin.holds()[0].end, t0 + (7 * TD));
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
-        _landsAt(seq, next, t0 + 41 days);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (20 * TD));
+        _landsAt(seq, next, t0 + (41 * TD));
     }
 
     function test_kind9_anchor_compressedHistory_neverEarlier() public {
@@ -623,25 +623,25 @@ contract HandOverTest is ControlsFixture {
         _flag(G[0]);
         uint256[9] memory starts = [uint256(1), 20, 22, 24, 26, 28, 30, 32, 34];
         for (uint256 k = 0; k < starts.length; k++) {
-            vm.warp(t0 + starts[k] * 1 days);
+            vm.warp(t0 + starts[k] * (1 * TD));
             _flag(G[1]);
-            vm.warp(t0 + starts[k] * 1 days + 1 hours);
+            vm.warp(t0 + starts[k] * (1 * TD) + (1 * TD / 24));
             _unflag(G[1]);
         }
-        vm.warp(t0 + 36 days);
+        vm.warp(t0 + (36 * TD));
         _flag(G[1]);
         assertTrue(admin.holds()[0].merged, "compressed");
         admin.execute(seq); // pins
         uint64 anchor = admin.replacementAnchor(admin.epoch(), seq);
-        assertGe(anchor, t0 + 20 days, "never anchored on the merged interval");
-        _landsAt(seq, next, uint256(anchor) + 21 days);
+        assertGe(anchor, t0 + (20 * TD), "never anchored on the merged interval");
+        _landsAt(seq, next, uint256(anchor) + (21 * TD));
     }
 
     function test_kind9_cancelledByKind1() public {
         IBCAdminExec next = _good();
         uint64 seq = _decidePending(S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, ""));
         _recvGov(_env(seq + 1, S.KIND_CANCEL, P.cancel1(seq, seq)));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.CANCELLED);
         assertEq(_execOf(), d.ibcAdminExec);
@@ -668,13 +668,13 @@ contract HandOverTest is ControlsFixture {
         assertEq(admin.decision(admin.epoch(), s + 2).recordedBlock, 0, "nothing recorded");
         assertEq(admin.drain(), 0, "a drain stops at it");
         assertEq(_state(s + 2), S.BUFFERED);
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(s + 1);
         (address x,) = admin.exec();
         assertEq(x, address(next), "replaced");
         assertEq(admin.drain(), 1, "drains through the new executor");
         assertEq(_state(s + 2), S.PENDING);
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(s + 2);
         assertEq(ctl.quarantineSeconds(clientId), 2 days);
     }
@@ -699,7 +699,7 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_haltedDecisionAhead_cancelledThenReplaced() public {
         vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
         uint64 s = admin.lastSeq();
-        _skip(1 hours);
+        _skip((1 * TD / 24));
         uint64 silenceFrom = admin.lastRecordTime();
         assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED, "halted, buffered");
         assertEq(admin.lastSeq(), s);
@@ -712,7 +712,7 @@ contract HandOverTest is ControlsFixture {
         assertEq(_state(s + 1), S.CANCELLED);
         assertEq(_state(s + 2), S.PENDING, "the kind 9 recorded");
         assertEq(admin.lastSeq(), s + 3);
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(s + 2);
         (address x,) = admin.exec();
         assertEq(x, address(next));
@@ -727,7 +727,7 @@ contract HandOverTest is ControlsFixture {
         IBCAdminExec next = _good();
         assertEq(_at(s + 1, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), S.STATUS_RECORDED);
         assertEq(_state(s + 2), S.SPENT);
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(s + 1);
         (address x,) = admin.exec();
         assertEq(x, address(next));
@@ -779,18 +779,18 @@ contract HandOverTest is ControlsFixture {
     function test_kind9_flagOfAReplacedKey_neverAnchors() public {
         uint256 t0 = _now();
         uint64 seats = _decidePending(S.KIND_SEATS, P.seat1(4, makeAddr("fresh watch")));
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _flag(W[0]); // seat 4
-        vm.warp(t0 + 5 days);
+        vm.warp(t0 + (5 * TD));
         (uint64 seq, address next) = _k9(); // due on day 12
-        vm.warp(t0 + 7 days);
+        vm.warp(t0 + (7 * TD));
         admin.execute(seats); // W[0] replaced: its flag no longer stands
         assertEq(_state(seats), S.EXECUTED);
-        vm.warp(t0 + 10 days);
+        vm.warp(t0 + (10 * TD));
         _flag(W[1]);
-        vm.warp(t0 + 12 days);
+        vm.warp(t0 + (12 * TD));
         admin.execute(seq); // anchors at W[1]'s day 10, never W[0]'s day 1
-        _landsAt(seq, next, t0 + 31 days);
+        _landsAt(seq, next, t0 + (31 * TD));
     }
 
     /// @notice `drain()` short of gas for the executor's frame stops at once, nothing recorded or counted.
@@ -886,7 +886,7 @@ contract HandOverTest is ControlsFixture {
         for (uint256 i = 0; i < id.length; i++) {
             id[i] = "a";
         }
-        return P.settings(string(id), 1 days);
+        return P.settings(string(id), (1 * TD));
     }
 
     /// @notice Two maximum-size decisions buffered behind a kind 9, an executor burning its whole frame and answering

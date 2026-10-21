@@ -2673,8 +2673,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         vm.expectRevert(IIBCAdmin.RecoveryState.selector);
         _adminWith(1, 3, 3);
         vm.expectRevert(IIBCAdmin.RecoveryState.selector);
-        _adminWith(30 days - 1, 3, 3);
-        _adminWith(30 days, 3, 3);
+        _adminWith(S.MIN_RECOVERY_DELAY - 1, 3, 3);
+        _adminWith(S.MIN_RECOVERY_DELAY, 3, 3);
     }
 
     // ============================================================================================= round 18 ==

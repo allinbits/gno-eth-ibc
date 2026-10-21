@@ -39,11 +39,11 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
                 (bool done,) = address(admin)
                     .call(op == 0 ? abi.encodeCall(admin.setFlag, ()) : abi.encodeCall(admin.clearFlag, ()));
                 done;
-            } else if ((r >> 24) % 8 == 0 && _now() < recorded + 6 days) {
+            } else if ((r >> 24) % 8 == 0 && _now() < recorded + (6 * TD)) {
                 // the boundaries: a flag cleared now starts a dip whose grace ends exactly when the change is due
-                vm.warp(recorded + 6 days);
+                vm.warp(recorded + (6 * TD));
             } else {
-                uint256[4] memory dts = [uint256(1 hours), 12 hours, 1 days, 3 days];
+                uint256[4] memory dts = [uint256((1 * TD / 24)), (12 * TD / 24), (1 * TD), (3 * TD)];
                 _skip(dts[(r >> 16) % 4]);
             }
 
@@ -58,7 +58,7 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
             // that cleared the flag, with no time passing); any other end is the moment it is observed
             if (gn != 0 && gEnd[gn - 1] == 0 && (!holdStands || h.time != gStart[gn - 1])) {
                 gEnd[gn - 1] =
-                    dipStart != 0 && _now() >= uint256(dipStart) + 1 days ? dipStart + 1 days : uint64(_now());
+                    dipStart != 0 && _now() >= uint256(dipStart) + (1 * TD) ? dipStart + (1 * TD) : uint64(_now());
                 dipStart = 0;
             }
             if (holdStands && (gn == 0 || gStart[gn - 1] != h.time)) gStart[gn++] = h.time;
@@ -74,11 +74,11 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
             // can only be early: a safe lower bound)
             uint64 lower;
             for (uint256 k = 0; k < gn && lower == 0; k++) {
-                if (gEnd[k] == 0 || gEnd[k] > recorded + 7 days) lower = gStart[k];
+                if (gEnd[k] == 0 || gEnd[k] > recorded + (7 * TD)) lower = gStart[k];
             }
 
             if (!settingsDone) {
-                bool should = _now() >= recorded + 7 days && !flagged && !holdStands;
+                bool should = _now() >= recorded + (7 * TD) && !flagged && !holdStands;
                 (bool ok,) = address(admin).call(abi.encodeCall(admin.execute, (settings)));
                 assertEq(ok, should, "a 7-day decision runs exactly when matured and unflagged");
                 settingsDone = ok;
@@ -92,13 +92,13 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
                 if (anchor != 0) assertEq(pinned, anchor, "an anchor never moves");
                 // the anchor is the start of a hold: one standing at or after the due time (it may have begun before)
                 if (pinned != 0) assertLe(pinned, _now(), "anchored at a hold already started");
-                bool due = _now() >= recorded + 7 days;
+                bool due = _now() >= recorded + (7 * TD);
                 // independently of IBCAdmin's anchor: under a hold, never before the true anchor plus 21 days
-                if (ok && holdStands) assertGe(_now(), uint256(lower) + 21 days, "never before the true anchor + 21");
+                if (ok && holdStands) assertGe(_now(), uint256(lower) + (21 * TD), "never before the true anchor + 21");
                 if (pinned != 0) assertGe(pinned, lower, "never anchored before the first qualifying hold");
                 // lands exactly when due with no hold standing, or under a hold from its anchor plus 21 days
-                bool should = due && (!holdStands || (pinned != 0 && _now() >= uint256(pinned) + 21 days));
-                assertEq(ok, should, "a replacement lands exactly when due and unheld, or at its anchor plus 21 days");
+                bool should = due && (!holdStands || (pinned != 0 && _now() >= uint256(pinned) + (21 * TD)));
+                assertEq(ok, should, "a replacement lands exactly when due and unheld, or at its anchor plus (21 * TD)");
                 seatsDone = ok;
             }
         }
@@ -113,9 +113,9 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
         uint256 t0 = _now();
         uint64 seq = admin.lastSeq() + 1;
         _recvGov(_env(seq, S.KIND_SEATS, P.seat1(3, makeAddr("fresh"))));
-        uint256 due = t0 + 7 days;
-        uint256 clearAt = t0 + 6 days + (x % 5) * 1 hours - 2 hours;
-        vm.warp(t0 + 1 days);
+        uint256 due = t0 + (7 * TD);
+        uint256 clearAt = t0 + (6 * TD) + (x % 5) * (1 * TD / 24) - (2 * TD / 24);
+        vm.warp(t0 + (1 * TD));
         vm.prank(G[0]);
         admin.setFlag();
         vm.prank(G[1]);
@@ -123,13 +123,13 @@ contract IBCAdminHoldFuzzTest is ControlsFixture {
         vm.warp(clearAt);
         vm.prank(G[1]);
         admin.clearFlag();
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         vm.prank(G[1]);
         admin.setFlag();
-        vm.warp(t0 + 22 days);
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq);
-        uint256 end = clearAt + 1 days; // the first hold's exclusive end
-        uint256 expected = end > due ? t0 + 1 days : t0 + 20 days;
+        uint256 end = clearAt + (1 * TD); // the first hold's exclusive end
+        uint256 expected = end > due ? t0 + (1 * TD) : t0 + (20 * TD);
         assertEq(admin.replacementAnchor(admin.epoch(), seq), expected, "the anchor at the due-time boundary");
     }
 }

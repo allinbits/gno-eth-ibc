@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { IBCAdminStorage } from "../../src/admin/IBCAdminStorage.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 import { ERC20Mock } from "@openzeppelin-contracts/mocks/token/ERC20Mock.sol";
@@ -31,6 +32,9 @@ import { MockLightClient } from "../utils/MockLightClient.sol";
 abstract contract ControlsFixture is Test, DeployGnoIBC {
     string internal constant CP = "ethereum-1";
     string internal constant GNO_SENDER = "g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5";
+    /// @notice A day of the testnet build's decision clocks (IBCAdminStorage.DAY: 1 days / 168 here, 1 days in
+    /// production); the timeline tests count in it, so they hold whatever the build.
+    uint64 internal constant TD = IBCAdminStorage.DAY;
     uint256 internal constant GNOT_MAX = 25_000e6;
     uint256 internal constant GNOT_DAY = 100_000e6;
 

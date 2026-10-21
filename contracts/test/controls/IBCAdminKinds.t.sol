@@ -48,7 +48,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     }
 
     function _executeAfterWeek(uint64 seq) internal {
-        _skip(7 days - 1);
+        _skip((7 * TD) - 1);
         vm.expectRevert();
         admin.execute(seq);
         _skip(1);
@@ -72,9 +72,9 @@ contract IBCAdminKindsTest is ControlsFixture {
         _skip(12);
         vm.prank(W[0]); // after the recording: stays
         ctl.setRouteFlag(clientId);
-        _skip(1 days - 13);
+        _skip((1 * TD) - 13);
         vm.expectRevert(
-            abi.encodeWithSelector(IIBCAdmin.NotMature.selector, admin.decision(1, seq).recordedTime + 1 days)
+            abi.encodeWithSelector(IIBCAdmin.NotMature.selector, admin.decision(1, seq).recordedTime + (1 * TD))
         );
         admin.execute(seq);
         _skip(1);
@@ -91,7 +91,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         ctl.setRouteFlag(clientId);
         _skip(12);
         uint64 seq = _decidePending(S.KIND_UNPAUSE, P.unpause(1, clientId));
-        _skip(1 days);
+        _skip((1 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.SPENT);
         assertTrue(ctl.routePaused(clientId));
@@ -103,7 +103,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.setFlag();
         _skip(12);
         uint64 unpause = _decidePending(S.KIND_UNPAUSE, P.unpause(2, ""));
-        _skip(7 days);
+        _skip((7 * TD));
         vm.expectRevert(IIBCAdmin.Deferred.selector);
         admin.execute(shorten);
         admin.execute(unpause); // an unpause is not deferred by flags
@@ -119,7 +119,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.setFlag();
         _skip(12);
         uint64 seq = _decidePending(S.KIND_UNPAUSE, P.unpause(2, ""));
-        _skip(1 days);
+        _skip((1 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.SPENT);
         assertTrue(admin.hold().blockNumber != 0);
@@ -162,15 +162,15 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_throughAHold_noSoonerThanDay21() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(1, makeAddr("fresh")));
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _hold(); // from day 1, before the replacement is due (day 7)
-        vm.warp(t0 + 7 days);
+        vm.warp(t0 + (7 * TD));
         admin.execute(seq); // pins the anchor: the hold's start
         assertEq(_state(seq), S.PENDING);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 1 days);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 22 days));
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (1 * TD));
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (22 * TD)));
         admin.execute(seq);
-        vm.warp(t0 + 22 days);
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
         // the replacement cleared a holder's flag: one guardian flag is left, the hold ends at once
@@ -184,22 +184,22 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_anchor_holdBeforeDueNeverCounts() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _hold(); // days 1 to 3
-        vm.warp(t0 + 2 days);
+        vm.warp(t0 + (2 * TD));
         vm.prank(G[1]);
         admin.clearFlag();
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         assertEq(admin.hold().blockNumber, 0, "the first hold ended");
         vm.prank(G[1]);
         admin.setFlag(); // the second hold, from day 20
-        vm.warp(t0 + 22 days);
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq); // pins day 20
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
-        vm.warp(t0 + 41 days - 1);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 41 days));
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (20 * TD));
+        vm.warp(t0 + (41 * TD) - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (41 * TD)));
         admin.execute(seq);
-        vm.warp(t0 + 41 days);
+        vm.warp(t0 + (41 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
     }
@@ -209,24 +209,24 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_anchor_attemptBeforeDue_pinsNothing() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _hold(); // days 1 to 3
-        vm.warp(t0 + 2 days);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 7 days));
+        vm.warp(t0 + (2 * TD));
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (7 * TD)));
         admin.execute(seq); // before due: nothing pinned
         assertEq(admin.replacementAnchor(admin.epoch(), seq), 0);
         vm.prank(G[1]);
         admin.clearFlag();
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         vm.prank(G[1]);
         admin.setFlag(); // the hold from day 20
-        vm.warp(t0 + 22 days);
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
-        vm.warp(t0 + 41 days - 1);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 41 days));
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (20 * TD));
+        vm.warp(t0 + (41 * TD) - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (41 * TD)));
         admin.execute(seq);
-        vm.warp(t0 + 41 days);
+        vm.warp(t0 + (41 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
     }
@@ -237,16 +237,16 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_anchor_clearAndReflagCycles_neverReset() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
-        vm.warp(t0 + 8 days);
+        vm.warp(t0 + (8 * TD));
         _hold(); // the first hold after day 7, from day 8
-        vm.warp(t0 + 9 days);
+        vm.warp(t0 + (9 * TD));
         admin.execute(seq);
-        uint256 floor = t0 + 8 days + 21 days;
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
+        uint256 floor = t0 + (8 * TD) + (21 * TD);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (8 * TD));
         for (uint256 k = 0; k < 3; k++) {
             vm.prank(G[1]);
             admin.clearFlag();
-            _skip(1 days + 1); // the grace passes: the hold ends
+            _skip((1 * TD) + 1); // the grace passes: the hold ends
             assertEq(admin.hold().blockNumber, 0);
             vm.prank(G[1]);
             admin.setFlag(); // a fresh hold
@@ -256,7 +256,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         }
         vm.warp(floor);
         admin.execute(seq);
-        assertEq(_state(seq), S.EXECUTED, "lands at anchor + 21 days under a fresh hold");
+        assertEq(_state(seq), S.EXECUTED, "lands at anchor + (21 * TD) under a fresh hold");
     }
 
     /// @notice A hold nobody observed still anchors: a hold on days 8 to 10 (after the replacement was due), then
@@ -264,18 +264,18 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_anchor_unobservedHoldCounts() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
-        vm.warp(t0 + 8 days);
+        vm.warp(t0 + (8 * TD));
         _hold();
-        vm.warp(t0 + 9 days);
+        vm.warp(t0 + (9 * TD));
         vm.prank(G[1]);
         admin.clearFlag();
-        vm.warp(t0 + 15 days);
+        vm.warp(t0 + (15 * TD));
         vm.prank(G[1]);
         admin.setFlag();
-        vm.warp(t0 + 16 days);
+        vm.warp(t0 + (16 * TD));
         admin.execute(seq);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 8 days);
-        vm.warp(t0 + 29 days);
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (8 * TD));
+        vm.warp(t0 + (29 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
     }
@@ -285,14 +285,14 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_anchor_singleStandingHold() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
-        vm.warp(t0 + 10 days);
+        vm.warp(t0 + (10 * TD));
         _hold();
-        vm.warp(t0 + 11 days);
+        vm.warp(t0 + (11 * TD));
         admin.execute(seq);
-        vm.warp(t0 + 31 days - 1);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 31 days));
+        vm.warp(t0 + (31 * TD) - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (31 * TD)));
         admin.execute(seq);
-        vm.warp(t0 + 31 days);
+        vm.warp(t0 + (31 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
     }
@@ -302,22 +302,22 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind3_anchor_holdEndingExactlyAtDue_neverCounts() public {
         uint256 t0 = _now();
         uint64 seq = _decidePending(S.KIND_SEATS, P.seat1(3, makeAddr("fresh")));
-        vm.warp(t0 + 1 days);
+        vm.warp(t0 + (1 * TD));
         _hold();
-        vm.warp(t0 + 6 days);
+        vm.warp(t0 + (6 * TD));
         vm.prank(G[1]);
         admin.clearFlag(); // the dip: the hold ends 24 hours later, exactly on day 7
-        vm.warp(t0 + 20 days);
+        vm.warp(t0 + (20 * TD));
         vm.prank(G[1]);
         admin.setFlag(); // a new hold from day 20 (the first one's end is recorded now)
-        assertEq(admin.holds()[0].end, t0 + 7 days, "the first hold ended exactly at the due time");
-        vm.warp(t0 + 22 days);
+        assertEq(admin.holds()[0].end, t0 + (7 * TD), "the first hold ended exactly at the due time");
+        vm.warp(t0 + (22 * TD));
         admin.execute(seq);
-        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + 20 days);
-        vm.warp(t0 + 41 days - 1);
-        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + 41 days));
+        assertEq(admin.replacementAnchor(admin.epoch(), seq), t0 + (20 * TD));
+        vm.warp(t0 + (41 * TD) - 1);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, t0 + (41 * TD)));
         admin.execute(seq);
-        vm.warp(t0 + 41 days);
+        vm.warp(t0 + (41 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
     }
@@ -333,24 +333,24 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.setFlag(); // stays set: each G[1] flag makes a hold
         uint256[9] memory starts = [uint256(1), 20, 22, 24, 26, 28, 30, 32, 34];
         for (uint256 k = 0; k < starts.length; k++) {
-            vm.warp(t0 + starts[k] * 1 days);
+            vm.warp(t0 + starts[k] * (1 * TD));
             vm.prank(G[1]);
             admin.setFlag();
-            vm.warp(t0 + starts[k] * 1 days + 1 hours);
+            vm.warp(t0 + starts[k] * (1 * TD) + (1 * TD / 24));
             vm.prank(G[1]);
             admin.clearFlag();
         }
-        vm.warp(t0 + 36 days);
+        vm.warp(t0 + (36 * TD));
         vm.prank(G[1]);
         admin.setFlag(); // a hold standing at the first attempt; the history now holds a merged interval
         assertTrue(admin.holds()[0].merged, "compressed");
         admin.execute(seq); // pins
         uint64 anchor = admin.replacementAnchor(admin.epoch(), seq);
-        assertGe(anchor, t0 + 20 days, "never anchored on the merged interval");
-        vm.warp(t0 + 41 days - 1);
+        assertGe(anchor, t0 + (20 * TD), "never anchored on the merged interval");
+        vm.warp(t0 + (41 * TD) - 1);
         vm.expectRevert();
         admin.execute(seq);
-        vm.warp(uint256(anchor) + 21 days);
+        vm.warp(uint256(anchor) + (21 * TD));
         admin.execute(seq);
         assertEq(_state(seq), S.EXECUTED);
     }
@@ -361,7 +361,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.setFlag();
         vm.prank(G[1]);
         admin.setFlag();
-        _skip(30 days);
+        _skip((30 * TD));
         vm.expectRevert(IIBCAdmin.Deferred.selector);
         admin.execute(seq);
         // the holders clear their flags: the hold stands until 24 hours after the dip
@@ -371,7 +371,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         admin.clearFlag();
         vm.expectRevert(IIBCAdmin.Deferred.selector);
         admin.execute(seq);
-        _skip(1 days);
+        _skip((1 * TD));
         admin.execute(seq);
     }
 
@@ -387,7 +387,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         // a key that took another seat by execution time
         uint64 a = _decidePending(S.KIND_SEATS, P.seat1(0, makeAddr("x")));
         uint64 b = _decidePending(S.KIND_SEATS, P.seat1(1, makeAddr("x")));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(a);
         admin.execute(b);
         assertEq(_state(b), S.SPENT);
@@ -408,7 +408,7 @@ contract IBCAdminKindsTest is ControlsFixture {
             _decidePending(S.KIND_LIMITS, P.limits(clientId, address(ugnot), GNOT_MAX * 2, GNOT_DAY, GNOT_DAY, 0, 0));
         vm.prank(W[1]);
         admin.setFlag();
-        _skip(7 days);
+        _skip((7 * TD));
         vm.expectRevert(IIBCAdmin.Deferred.selector);
         admin.execute(seq);
         vm.prank(W[1]);
@@ -443,7 +443,7 @@ contract IBCAdminKindsTest is ControlsFixture {
             _decidePending(S.KIND_LIMITS, P.limits(clientId, address(ugnot), GNOT_MAX * 2, GNOT_DAY, GNOT_DAY, 0, 0));
         (uint64 tighten,) = _decide(S.KIND_LIMITS, P.limits(clientId, address(ugnot), 1, GNOT_DAY, GNOT_DAY, 0, 0));
         assertEq(_state(tighten), S.EXECUTED);
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(loosen);
         assertEq(_state(loosen), S.SPENT);
         assertEq(ctl.limits(clientId, address(ugnot)).limits.maxPerMessage, 1);
@@ -452,7 +452,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind11_olderShorteningNeverUndoesANewerLengthening() public {
         uint64 shorten = _decidePending(S.KIND_SETTINGS, P.settings(clientId, 1 days));
         _decide(S.KIND_SETTINGS, P.settings(clientId, 14 days));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(shorten);
         assertEq(_state(shorten), S.SPENT);
         assertEq(ctl.quarantineSeconds(clientId), 14 days);
@@ -461,7 +461,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_starvedExecution_pendsInsteadOfSpending() public {
         GnoVoucher v = new GnoVoucher("Foo", "FOO", 6, address(ics20), "transfer/client-0/ufoo");
         uint64 seq = _decidePending(S.KIND_VOUCHER, P.voucher(clientId, "ufoo", address(v), address(v).codehash));
-        _skip(7 days);
+        _skip((7 * TD));
         for (uint256 g = 150_000; g < 1_100_000; g += 50_000) {
             (bool ok,) = address(admin).call{ gas: g }(abi.encodeCall(admin.execute, (seq)));
             if (ok) break;
@@ -490,7 +490,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         uint64 taken = _decidePending(S.KIND_VOUCHER, P.voucher(clientId, "ugnot", address(v), address(v).codehash));
         address later = makeAddr("not deployed yet");
         uint64 pendingCode = _decidePending(S.KIND_VOUCHER, P.voucher(clientId, "ubar", later, address(v).codehash));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(wrongHash);
         admin.execute(wrongIcs20);
         admin.execute(taken);
@@ -518,7 +518,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         uint64 badId = _decidePending(
             S.KIND_CLIENT, P.client(1, "client-77", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
         );
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(add);
         admin.execute(migrate);
         admin.execute(badId);
@@ -556,7 +556,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         uint64 a = _decidePending(S.KIND_UPGRADE, P.upgrade(address(router), routerImpl, routerImpl.codehash, ""));
         address beacon = IICS20Transfer(address(ics20)).getEscrowBeacon();
         uint64 b = _decidePending(S.KIND_UPGRADE, P.upgrade(beacon, escrowImpl, escrowImpl.codehash, ""));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(a);
         admin.execute(b);
         assertEq(_state(a), S.EXECUTED);
@@ -582,7 +582,7 @@ contract IBCAdminKindsTest is ControlsFixture {
                 abi.encodeWithSignature("initializeGno(address[6])", G[0], G[1], G[2], G[3], W[0], W[1])
             )
         );
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(notAProxy);
         admin.execute(wrongHash);
         assertEq(_state(notAProxy), S.SPENT);
@@ -615,7 +615,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         );
         bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
         bytes32 before = vm.load(address(ics20), implSlot);
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(direct);
         admin.execute(viaMulticall);
         assertEq(_state(direct), S.SPENT);
@@ -681,7 +681,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_executorCodeIsPinned() public {
         uint64 seq = _decidePending(S.KIND_SETTINGS, P.settings(clientId, 1 days));
         vm.etch(d.ibcAdminExec, address(new MockLightClient()).code);
-        _skip(7 days);
+        _skip((7 * TD));
         vm.expectRevert(IIBCAdmin.ForeignExec.selector);
         admin.execute(seq);
     }
@@ -697,7 +697,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         );
         uint64 stale = _decidePending(S.KIND_SETTINGS, P.settings(clientId, 1 days));
         uint64 replace = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-2"));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(add);
         admin.execute(replace);
 
@@ -732,7 +732,7 @@ contract IBCAdminKindsTest is ControlsFixture {
         _proveDelivered(out);
         uint64 settle = _decidePending(S.KIND_SETTLE, P.settle1(clientId, out.sequence, 3, 0));
         uint64 reopen = _decidePending(S.KIND_REOPEN, P.reopen("gnoland-2"));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(settle);
         admin.execute(reopen);
         assertEq(_state(reopen), S.EXECUTED);
@@ -742,7 +742,7 @@ contract IBCAdminKindsTest is ControlsFixture {
     function test_kind10_checks() public {
         uint64 notGov = _decidePending(S.KIND_ROUTE, P.route("other-1", "gnoland-2"));
         uint64 unknownNew = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-404"));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(notGov);
         admin.execute(unknownNew);
         assertEq(_state(notGov), S.SPENT);
@@ -962,11 +962,11 @@ contract IBCAdminKindsTest is ControlsFixture {
         assertTrue(ctl.refundsHold(clientId).blockNumber != 0);
         uint64 seats = _decidePending(S.KIND_SEATS, P.seat1(0, makeAddr("fresh")));
         uint64 unpause = _decidePending(S.KIND_UNPAUSE, P.unpause(1, clientId));
-        _skip(7 days - 2 hours);
+        _skip((7 * TD) - (2 * TD / 24));
         vm.prank(G[1]);
         ctl.clearRefundsFlag(clientId); // a dip: the hold stands for its grace
         assertTrue(ctl.refundsHold(clientId).blockNumber != 0, "the dip's grace");
-        _skip(2 hours + 1);
+        _skip((2 * TD / 24) + 1);
         admin.execute(seats); // G0 replaced during the dip
         assertEq(_state(seats), S.EXECUTED);
         assertEq(ctl.refundsHold(clientId).blockNumber, 0, "the hold ended at once");
@@ -1029,7 +1029,7 @@ contract IBCAdminKindsTest is ControlsFixture {
             S.KIND_CLIENT, P.client(1, "gnoland-6", "ethereum-6", _prefix(), address(later), address(later).codehash)
         );
         uint64 route = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-6"));
-        _skip(7 days);
+        _skip((7 * TD));
         admin.execute(add);
         admin.execute(migrate);
         admin.execute(enroll);
