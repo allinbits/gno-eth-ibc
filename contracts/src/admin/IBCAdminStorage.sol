@@ -104,12 +104,13 @@ library IBCAdminStorage {
     uint256 internal constant BIND_GAS = 100_000;
     uint256 internal constant HANDOVER_FLOOR = BIND_GAS * 64 / 63 + 60_000;
 
-    /// @notice 24 hours: the unpause delay and the dip's grace.
-    uint64 internal constant DAY = 1 days;
+    /// @notice 24 hours: the unpause delay and the dip's grace. Testnet build: a day of block time divided by 168,
+    /// as the gno.land devnet build divides its decision clocks (decisions.Factor); production is 1 days.
+    uint64 internal constant DAY = 1 days / 168;
     /// @notice The decision delay.
-    uint64 internal constant WEEK = 1 hours; // testnet: production is 7 days
+    uint64 internal constant WEEK = 7 * DAY; // testnet: 7 * DAY as in production (7 days), 59 min 58 s here
     /// @notice A guardian replacement lands through a hold no sooner than this after the hold's start.
-    uint64 internal constant HOLD_REPLACEMENT = 3 hours; // testnet: production is 21 days
+    uint64 internal constant HOLD_REPLACEMENT = 21 * DAY; // testnet: 21 * DAY as in production (21 days), about 3 h here
 
     /// @notice The emergency route replacement (§7.12): each guardian seat approves one proposal (its hash); a
     /// proposal opens once enough seats approve it while the route is eligible, and executes after the delay unless
