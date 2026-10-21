@@ -25,7 +25,7 @@ library GnoTransferStorage {
     uint256 internal constant MAX_PAYLOAD = 262_144;
 
     /// @notice Grace of a route hold's dip (24 hours, §7.4).
-    uint64 internal constant GRACE = 1 days / 168; // testnet build: production is 1 days
+    uint64 internal constant GRACE = 514 seconds; // testnet build: 1 days / 168 rounded down; production is 1 days
 
     /// @notice One route's flags (pause and refunds hold) and settings.
     struct Route {

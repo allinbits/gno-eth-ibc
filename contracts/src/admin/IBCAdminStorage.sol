@@ -106,7 +106,7 @@ library IBCAdminStorage {
 
     /// @notice 24 hours: the unpause delay and the dip's grace. Testnet build: a day of block time divided by 168,
     /// as the gno.land devnet build divides its decision clocks (decisions.Factor); production is 1 days.
-    uint64 internal constant DAY = 1 days / 168;
+    uint64 internal constant DAY = 514 seconds; // 1 days / 168, rounded down
     /// @notice The decision delay.
     uint64 internal constant WEEK = 7 * DAY; // testnet: 7 * DAY as in production (7 days), 59 min 58 s here
     /// @notice A guardian replacement lands through a hold no sooner than this after the hold's start.
