@@ -41,14 +41,19 @@ func TrustedState(ctx context.Context, g *gno.Client, o TrustOptions) (gnoibc.Cl
 // trustedState builds the initial states from a trusted header. The client's
 // revision number is the one the chain id carries (ibc.ParseChainID): gno.land
 // stamps its own heights with it, and every proof height Ethereum verifies
-// must match it.
+// must match it. A chain id whose revision overflows is refused rather than
+// trusted at revision 0.
 func trustedState(sh *types.SignedHeader, o TrustOptions) (gnoibc.ClientState, gnoibc.ConsensusState, error) {
 	if len(sh.AppHash) != 32 || len(sh.NextValidatorsHash) != 32 {
 		return gnoibc.ClientState{}, gnoibc.ConsensusState{}, fmt.Errorf("header %d lacks a 32-byte app or next validators hash", sh.Height)
 	}
+	revision, err := ibc.ParseChainID(sh.ChainID)
+	if err != nil {
+		return gnoibc.ClientState{}, gnoibc.ConsensusState{}, err
+	}
 	cs := gnoibc.ClientState{
 		ChainId:        sh.ChainID,
-		RevisionNumber: ibc.ParseChainID(sh.ChainID),
+		RevisionNumber: revision,
 		LatestHeight:   uint64(sh.Height),
 		TrustLevel:     gnoibc.TrustThreshold{Numerator: 1, Denominator: 3},
 		TrustingPeriod: uint64(o.TrustingPeriod / time.Second),
