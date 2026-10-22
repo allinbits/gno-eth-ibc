@@ -54,6 +54,11 @@ type Deployment struct {
 	GnoChainID           string         `json:"gnoChainId"`
 	ClientID             string         `json:"clientId"`
 	CounterpartyClientID string         `json:"counterpartyClientId"`
+	// DeployBlock is the block the deployment script forked from, at or
+	// before its first transaction: the router's logs are scanned from
+	// there, since it wrote none earlier. A record without one (0) scans
+	// from genesis; `relayer relay -from-block` sets it for such a record.
+	DeployBlock uint64 `json:"deployBlock"`
 }
 
 // LoadDeployment reads a deployment file.
@@ -78,6 +83,11 @@ type Client struct {
 	From    common.Address
 
 	Router, Transfer, LightClient *bind.BoundContract
+
+	// Logs serves the log scans (EC, unless a test substitutes it).
+	Logs LogSource
+	// logChunk is the block range of one eth_getLogs (see DefaultLogChunk).
+	logChunk uint64
 }
 
 // Dial connects to rpcURL. hexKey (0x-optional) signs transactions.
@@ -90,7 +100,7 @@ func Dial(ctx context.Context, rpcURL, hexKey string, dep *Deployment) (*Client,
 	if err != nil {
 		return nil, fmt.Errorf("chain id: %w", err)
 	}
-	c := &Client{EC: ec, ChainID: id, Dep: dep}
+	c := &Client{EC: ec, Logs: ec, ChainID: id, Dep: dep}
 	if hexKey != "" {
 		if c.key, err = crypto.HexToECDSA(strings.TrimPrefix(hexKey, "0x")); err != nil {
 			return nil, fmt.Errorf("private key: %w", err)

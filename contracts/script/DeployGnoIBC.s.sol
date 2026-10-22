@@ -133,6 +133,9 @@ contract DeployGnoIBC is Script {
         j.serialize("ibcAdminExec", d.ibcAdminExec);
         j.serialize("gnoChainId", p.clientState.chainId);
         j.serialize("counterpartyClientId", p.counterparty);
+        // the block the script forked from, at or before its first transaction: the relayer scans the router's
+        // logs from there (public RPCs refuse one eth_getLogs from genesis)
+        j.serialize("deployBlock", block.number);
         // the activating kind 4's parameters (P.limits encoding), for gno.land's governance
         j.serialize(
             "activationKind4Params",

@@ -27,9 +27,18 @@ Secrets come from the environment only: `GNO_MNEMONIC` signs gno.land transactio
 relayer trust -gno-rpc URL [-height H] [-trusting-period 336h] [-max-clock-drift 30s] -out deployments/trust.json
 relayer gno-create-eth-client -gno-rpc URL -evm-chain-id 31337 [-router 0x..] -out gno-client.json
 relayer gno-register-counterparty -gno-rpc URL -client ethereum-1 -counterparty client-0
-relayer relay -gno-rpc URL -eth-rpc URL -deployment contracts/deployments/local.json [-from H] [-to H] [-follow] [-out relay.json]
+relayer relay -gno-rpc URL -eth-rpc URL -deployment contracts/deployments/local.json [-from H] [-to H] [-from-block B] [-follow] [-out relay.json]
 relayer erc20-balance -eth-rpc URL -deployment ... -denom transfer/client-0/ugnot -owner 0x..
 ```
+
+`trust` creates the client at the revision its chain id carries (`{name}-{N}` is revision N, as
+gno.land's `types.ParseChainID`; anything else is 0). Proof heights then carry the revision the
+deployed client's state holds, read from `getClientState`, whatever the chain id derives: an older
+client keeps the revision it was created with.
+
+The router's logs (`SendPacket`, `WriteAcknowledgement`) are scanned from the deployment's
+`deployBlock` (written by `DeployGnoIBC.s.sol`; `-from-block` sets it for a record without one), in
+chunks that halve when the RPC refuses the range, newest first when one event is wanted.
 
 ## gno.land → EVM
 

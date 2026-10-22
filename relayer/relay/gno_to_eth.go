@@ -197,7 +197,7 @@ func (r *GnoToEth) RelayPacket(ctx context.Context, p ibc.Packet, q int64) (Rela
 	}
 	var ackBlock *big.Int
 	if receipt != ([32]byte{}) {
-		acks, blk, err := r.Eth.WrittenAck(ctx, p.DestinationClient, p.Sequence, 0)
+		acks, blk, err := r.Eth.WrittenAck(ctx, p.DestinationClient, p.Sequence)
 		if err != nil {
 			return rel, err
 		}
