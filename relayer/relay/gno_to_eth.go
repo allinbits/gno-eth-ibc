@@ -150,10 +150,28 @@ func (r *GnoToEth) UpdateClient(ctx context.Context, target int64) (*types.Recei
 	return rcpt, nil
 }
 
+// proofHeight is where Ethereum verifies a proof of gno's state after height
+// h: h+1, whose AppHash commits to it, at the revision GnoLightClient's
+// client state carries. A client is created at the revision its chain id
+// derives (ibc.ParseChainID), but the client's own state is what every proof
+// height must match: an existing client keeps the revision it was deployed
+// with.
+func (r *GnoToEth) proofHeight(ctx context.Context, h int64) (ibc.Height, error) {
+	cs, err := r.Eth.LightClientState(ctx)
+	if err != nil {
+		return ibc.Height{}, err
+	}
+	return ibc.Height{RevisionNumber: cs.RevisionNumber, RevisionHeight: uint64(h + 1)}, nil
+}
+
 // RelayPacket proves p's commitment at gno height q (against the AppHash of
 // q+1, which the light client must hold) and submits recvPacket.
 func (r *GnoToEth) RelayPacket(ctx context.Context, p ibc.Packet, q int64) (Relayed, error) {
-	rel := Relayed{Packet: p, ProofHeight: ibc.Height{RevisionNumber: 0, RevisionHeight: uint64(q + 1)}}
+	height, err := r.proofHeight(ctx, q)
+	if err != nil {
+		return Relayed{Packet: p}, err
+	}
+	rel := Relayed{Packet: p, ProofHeight: height}
 	key := gno.PacketCommitmentKey(p.SourceClient, p.Sequence)
 	value, ops, err := r.Gno.ProveKey(ctx, key, q)
 	if err != nil {

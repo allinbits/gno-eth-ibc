@@ -307,5 +307,6 @@ The rotated case caches the new set (its next set is itself), hence its cost.
   against a next consensus state is needed.
 * No consensus state pruning and no client upgrades / recovery.
 * The chain ID is fixed; there is no revision-format handling (`revisionNumber` is a constant of the
-  client state that every proof height must carry).
+  client state that every proof height must carry; `relayer trust` derives it from the chain id,
+  `{name}-{N}` giving N, as gno.land does).
 * Validator sets are passed in full on every update; with large sets, calldata grows linearly.

@@ -39,7 +39,11 @@ func (r *GnoToEth) RelayGnoAck(ctx context.Context, p ibc.Packet, ack []byte, h 
 	if err != nil {
 		return err
 	}
-	rcpt, err := r.Eth.AckPacket(ctx, p, ack, proof, ibc.Height{RevisionHeight: uint64(h + 1)})
+	height, err := r.proofHeight(ctx, h)
+	if err != nil {
+		return err
+	}
+	rcpt, err := r.Eth.AckPacket(ctx, p, ack, proof, height)
 	if err != nil {
 		return err
 	}
