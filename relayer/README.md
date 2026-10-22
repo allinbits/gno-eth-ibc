@@ -32,9 +32,9 @@ relayer erc20-balance -eth-rpc URL -deployment ... -denom transfer/client-0/ugno
 ```
 
 `trust` creates the client at the revision its chain id carries (`{name}-{N}` is revision N, as
-gno.land's `types.ParseChainID`; anything else is 0). Proof heights then carry the revision the
-deployed client's state holds, read from `getClientState`, whatever the chain id derives: an older
-client keeps the revision it was created with.
+gno.land's `types.ParseChainID`; anything else is 0; a revision past MaxUint64 is refused). Proof
+heights then carry the revision the deployed client's state holds, read from `getClientState`,
+whatever the chain id derives: an older client keeps the revision it was created with.
 
 The router's logs (`SendPacket`, `WriteAcknowledgement`) are scanned from the deployment's
 `deployBlock` (written by `DeployGnoIBC.s.sol`; `-from-block` sets it for a record without one), in
@@ -54,7 +54,8 @@ For the `send_packet` events of the core realm (`gno.land/r/aib/ibc/core`) on th
    are not cached;
 3. query `"/pv/vm:gno.land/r/aib/ibc/core:" || client || 0x01 || seq_be` in the `main` store at
    height `q` with `prove=true`, check the value is the packet's commitment, encode the two ICS23 ops;
-4. `ICS26Router.recvPacket(packet, proof, {0, q+1})`, then read the `WriteAcknowledgement` event and
+4. `ICS26Router.recvPacket(packet, proof, {clientState.revisionNumber, q+1})`, with the revision
+   read from the deployed client (`getClientState`), then read the `WriteAcknowledgement` event and
    check `getCommitment(keccak256(client || 0x03 || seq))` equals the ack commitment;
 5. hand the ack to the `AckRelayer`.
 

@@ -197,6 +197,45 @@ func TestWrittenAckNone(t *testing.T) {
 	}
 }
 
+// The deployment block bounds the scan: a match below it belongs to an older
+// deployment and is neither returned nor queried for.
+func TestWrittenAckIgnoresAMatchBelowTheDeployment(t *testing.T) {
+	src := &fakeLogs{head: 25_000, maxRange: 3_000, logs: []types.Log{ackLog(t, 3_000, "client-0", 3, "older deployment")}}
+	c := &Client{Logs: src, Dep: &Deployment{ICS26Router: router, DeployBlock: 4_000}}
+	if acks, block, err := c.WrittenAck(context.Background(), "client-0", 3); err == nil {
+		t.Fatalf("got %q at block %d from below the deployment block", acks, block)
+	}
+	if len(src.ranges) == 0 {
+		t.Fatal("no range was queried")
+	}
+	for _, r := range src.ranges {
+		if r[0] < 4_000 {
+			t.Errorf("range %v reaches below the deployment block", r)
+		}
+	}
+}
+
+func TestWrittenAckDeploymentBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		block uint64
+		found bool
+	}{
+		{4_000, true},  // at the deployment block: inside the scan
+		{3_999, false}, // one block below it: outside
+	} {
+		src := &fakeLogs{head: 25_000, maxRange: 3_000, logs: []types.Log{ackLog(t, tc.block, "client-0", 3, "ack")}}
+		c := &Client{Logs: src, Dep: &Deployment{ICS26Router: router, DeployBlock: 4_000}}
+		acks, block, err := c.WrittenAck(context.Background(), "client-0", 3)
+		if tc.found {
+			if err != nil || block != tc.block || len(acks) != 1 || string(acks[0]) != "ack" {
+				t.Errorf("match at %d: got %q at block %d, %v; want [ack] at %d", tc.block, acks, block, err, tc.block)
+			}
+		} else if err == nil {
+			t.Errorf("match at %d: got %q at block %d, want none", tc.block, acks, block)
+		}
+	}
+}
+
 func TestSendPacketsAcrossChunks(t *testing.T) {
 	ev := RouterABI.Events["SendPacket"]
 	sendLog := func(block, seq uint64) types.Log {

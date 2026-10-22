@@ -19,9 +19,19 @@ func TestParseChainID(t *testing.T) {
 		{"-1", 0},
 		{"x--1", 0},
 		{"", 0},
+		{"x-18446744073709551615", 18446744073709551615},
 	} {
-		if got := ParseChainID(tc.chainID); got != tc.want {
-			t.Errorf("ParseChainID(%q) = %d, want %d", tc.chainID, got, tc.want)
+		got, err := ParseChainID(tc.chainID)
+		if err != nil || got != tc.want {
+			t.Errorf("ParseChainID(%q) = %d, %v, want %d", tc.chainID, got, err, tc.want)
+		}
+	}
+}
+
+func TestParseChainIDOverflow(t *testing.T) {
+	for _, id := range []string{"x-18446744073709551616", "gnoland-99999999999999999999"} {
+		if got, err := ParseChainID(id); err == nil {
+			t.Errorf("ParseChainID(%q) = %d, want an error", id, got)
 		}
 	}
 }
