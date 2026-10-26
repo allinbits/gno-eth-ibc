@@ -91,9 +91,6 @@ interface IIBCAdmin {
     error RecoveryDisabled();
     /// @notice A kind 14 from gno.land disabled the emergency recovery for good: nothing opens or executes one again.
     error RecoveryPermanentlyDisabled();
-    /// @notice A frame of the executor's code left a disabled recovery enabled again, or a proposal open: refused,
-    /// the frame undone.
-    error RecoveryReenabled();
     error RecoveryNotEligible();
     error RecoveryState();
     error NotGuardian();

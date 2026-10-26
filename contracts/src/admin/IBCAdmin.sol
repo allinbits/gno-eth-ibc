@@ -56,8 +56,10 @@ import { IBCAdminNative } from "./IBCAdminNative.sol";
 /// spent under a hold of its object. The kinds' logic runs in IBCAdminExec, delegatecalled at a pinned code hash and
 /// replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor (IBCAdminNative).
 /// Kind 14, the permanent disable of the emergency recovery, is IBCAdmin's own too: a 7-day kind deferred by flags
-/// and holds and suspended while a recovery is open, after which no executor or upgrade can enable the recovery
-/// again (`IBCAdminStorage.recoveryDisabled`, `keepRecoveryOff`).
+/// and holds and suspended while a recovery is open, after which the guardians' recovery entry points stay closed
+/// whatever code is installed later: the latch is in IBCAdminNative's own storage, which no executor can write.
+/// (An executor is governance-installed code with IBCAdmin's full authority: governance can always replace its own
+/// route; what is closed for good is the guardians' path.)
 
 /// @notice The transfer app's reentrancy lock, read by IBCAdmin.
 interface IGnoICS20Busy {
@@ -132,7 +134,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         ics20 = c.ics20;
         deployer = msg.sender;
         launchCheck = address(new IBCAdminLaunchCheck());
-        native = address(new IBCAdminNative());
+        address nat = address(new IBCAdminNative());
+        native = nat;
         (_recoveryDelay, _recoveryThreshold, _recoveryCancelThreshold, _recoverySilence, _recoveryHoldPeriod) =
         (rc.delay, rc.threshold, rc.cancelThreshold, rc.silence, rc.holdPeriod);
 
@@ -146,8 +149,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         l.lastRecordTime = uint64(block.timestamp);
         l.exec = c.exec;
         l.execHash = c.exec.codehash;
-        // a deployment without the recovery starts as if a kind 14 had applied: one bit says "off for good"
-        if (rc.delay == 0) l.recoveryDisabled = true;
+        // a deployment without the recovery starts as if a kind 14 had applied: the latch says "off for good"
+        if (rc.delay == 0) IBCAdminNative(nat).latch();
         emit EpochOpened(1, c.govClientId);
     }
 
@@ -602,7 +605,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
     /// before any recovery call reaches the executor's recovery module.
     function _recoveryConfig() private view returns (RecoveryConfig memory) {
         if (_recoveryDelay == 0) revert RecoveryDisabled();
-        if (S.layout().recoveryDisabled) revert RecoveryPermanentlyDisabled();
+        if (_latched()) revert RecoveryPermanentlyDisabled();
         return RecoveryConfig(
             _recoveryDelay, _recoveryThreshold, _recoveryCancelThreshold, _recoverySilence, _recoveryHoldPeriod
         );
@@ -707,12 +710,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return _delegateTo(_exec(l), call);
     }
 
-    /// @notice Runs `target`'s code as this contract; a revert there reverts here with its own reason. Every frame of
-    /// the executor's code (and of its recovery module) passes here, nested ones included: with the recovery off
-    /// before it, a frame that leaves it on again, or a proposal open, reverts whole (`keepRecoveryOff`).
+    /// @notice Runs `target`'s code as this contract; a revert there reverts here with its own reason.
     function _delegateTo(address target, bytes memory call) private returns (bytes memory) {
-        S.Layout storage l = S.layout();
-        bool off = l.recoveryDisabled;
         (bool ok, bytes memory ret) = target.delegatecall(call);
         if (!ok) {
             // solhint-disable-next-line no-inline-assembly
@@ -720,7 +719,6 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
                 revert(add(ret, 32), mload(ret))
             }
         }
-        if (off) S.keepRecoveryOff(l);
         return ret;
     }
 
@@ -791,7 +789,12 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Whether the emergency recovery is off for good: disabled by a kind 14, or never enabled (delay zero).
     function recoveryDisabled() external view returns (bool) {
-        return S.layout().recoveryDisabled;
+        return _latched();
+    }
+
+    /// @notice IBCAdminNative's latch, the one authority on the permanent disable (never IBCAdmin's own storage).
+    function _latched() private view returns (bool) {
+        return IBCAdminNative(native).recoveryDisabledLatched();
     }
 
     function recoveryConfig() external view returns (RecoveryConfig memory) {

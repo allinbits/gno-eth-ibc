@@ -4,29 +4,31 @@ pragma solidity ^0.8.28;
 import { IIBCAdmin } from "../../src/interfaces/IIBCAdmin.sol";
 import { IBCAdminStorage as S } from "../../src/admin/IBCAdminStorage.sol";
 import { IBCAdminExec } from "../../src/admin/IBCAdminExec.sol";
+import { IBCAdminNative } from "../../src/admin/IBCAdminNative.sol";
+import { IBCAdmin } from "../../src/admin/IBCAdmin.sol";
 import { GovParams as P } from "../utils/GovParams.sol";
 import { MockLightClient } from "../utils/MockLightClient.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
-/// @notice Where IBCAdminStorage puts the disabled bit: a contract with only that layout, read slot by slot.
-contract LayoutProbe {
-    function setBit() external {
-        S.layout().recoveryDisabled = true;
-    }
-}
-
-/// @notice An executor bound as IBCAdmin's that tries to switch a disabled recovery back on by writing IBCAdmin's
-/// storage (it runs as IBCAdmin): `mode` 1 at recording, 2 at execution, 3 opens a proposal at execution. Every other
-/// answer is an honest one (wait at recording, done at execution). Its recovery module is itself, and would open a
-/// proposal if it were ever reached.
+/// @notice An executor bound as IBCAdmin's that attacks the permanent disable from inside its own frames (it runs as
+/// IBCAdmin, with IBCAdmin's storage and authority), at recording (`mode` 1) or at execution (`mode` 2), else
+/// honest (wait at recording, done at execution):
+/// - trace (a): it executes the pending kind 14 `disableSeq` itself, from inside the frame (when non-zero);
+/// - then it zeroes every storage word a disabled bit could live in (IBCAdmin's slot 0, the layout's next free one);
+/// - trace (b): it fakes an open, mature proposal and re-enters the guardians' entry points, reporting their answers
+///   (`Probe`), then restores the proposal state.
+/// Its recovery module is itself; reaching it would open a proposal.
 contract ReenablingExec {
+    event Probe(bytes4 approve, bytes4 execute, bool disabled);
+
     address internal immutable r;
     address internal immutable am;
     address internal immutable t;
     uint256 internal immutable mode;
+    uint64 internal immutable disableSeq;
 
-    constructor(address r_, address am_, address t_, uint256 mode_) {
-        (r, am, t, mode) = (r_, am_, t_, mode_);
+    constructor(address r_, address am_, address t_, uint256 mode_, uint64 disableSeq_) {
+        (r, am, t, mode, disableSeq) = (r_, am_, t_, mode_, disableSeq_);
     }
 
     function bindings() external view returns (address, address, address) {
@@ -43,21 +45,39 @@ contract ReenablingExec {
     }
 
     function atRecording(uint8, uint64, bytes calldata, bool) external returns (uint8, string memory) {
-        if (mode == 1) S.layout().recoveryDisabled = false;
+        if (mode == 1) _attack();
         return (S.WAIT, "");
     }
 
     function run(uint8, uint64, bytes calldata, uint64) external returns (string memory) {
-        if (mode == 2) S.layout().recoveryDisabled = false;
-        if (mode == 3) S.layout().recovery.openedAt = uint64(block.timestamp);
+        if (mode == 2) _attack();
         return "";
     }
 
-    /// @notice The "recovery module": anything reaching it switches the recovery on and opens a proposal.
-    fallback() external {
+    function _attack() private {
+        if (disableSeq != 0) IBCAdmin(address(this)).execute(disableSeq);
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            sstore(0, 0)
+            sstore(add(0xc7b243561409e24cdf9051e7d85f7a9f9509cfb6b2d07b504ea2d9365e700c00, 42), 0)
+        }
         S.Layout storage l = S.layout();
-        l.recoveryDisabled = false;
-        l.recovery.openedAt = uint64(block.timestamp);
+        (l.recovery.proposal, l.recovery.openedAt) = (bytes32(uint256(1)), 1);
+        IIBCAdmin.RecoveryProposal memory p;
+        bytes4 a = _try(abi.encodeCall(IBCAdmin.approveRecovery, (p)));
+        bytes4 e = _try(abi.encodeCall(IBCAdmin.executeRecovery, ()));
+        (l.recovery.proposal, l.recovery.openedAt) = (bytes32(0), 0);
+        emit Probe(a, e, IBCAdmin(address(this)).recoveryDisabled());
+    }
+
+    function _try(bytes memory call) private returns (bytes4) {
+        (bool ok, bytes memory ret) = address(this).call(call);
+        return ok || ret.length < 4 ? bytes4(0) : bytes4(ret);
+    }
+
+    /// @notice The "recovery module": anything reaching it opens a proposal.
+    fallback() external {
+        S.layout().recovery.openedAt = uint64(block.timestamp);
     }
 }
 
@@ -66,8 +86,8 @@ contract ReenablingExec {
 /// nothing opens or executes a recovery again, pending approvals are gone, and no executor can switch it back on.
 contract RecoveryDisableTest is ControlsFixture {
     uint64 internal constant DELAY = 30 days;
-    /// @notice The bit's slot: `IBCAdminStorage.SLOT + 42`, offset 0 (test_bitSlot).
-    uint256 internal constant BIT_SLOT = uint256(S.SLOT) + 42;
+    event Probe(bytes4 approve, bytes4 execute, bool disabled);
+
     MockLightClient internal attested;
 
     function _recovery() internal pure override returns (IIBCAdmin.RecoveryConfig memory) {
@@ -140,19 +160,21 @@ contract RecoveryDisableTest is ControlsFixture {
         assertEq(now_, x, "handed over");
     }
 
-    // ------------------------------------------------------------------------------------------------ layout --
+    // ------------------------------------------------------------------------------------------------- latch --
 
-    /// @notice The bit is the layout's last field, appended: slot SLOT + 42, nothing else written with it.
-    function test_bitSlot() public {
-        LayoutProbe probe = new LayoutProbe();
-        probe.setBit();
-        for (uint256 i = 0; i < 64; i++) {
-            bytes32 v = vm.load(address(probe), bytes32(uint256(S.SLOT) + i));
-            assertEq(v, i == 42 ? bytes32(uint256(1)) : bytes32(0));
-        }
-        assertEq(vm.load(address(admin), bytes32(BIT_SLOT)), bytes32(0), "enabled at launch");
+    /// @notice The latch is IBCAdminNative's own storage: only IBCAdmin sets it, directly; nobody else, and a
+    /// delegated call cannot even read it.
+    function test_latch_onlyIBCAdmin() public {
+        IBCAdminNative n = IBCAdminNative(admin.native());
+        assertFalse(n.recoveryDisabledLatched(), "enabled at launch");
+        vm.prank(alice);
+        vm.expectRevert(IIBCAdmin.NotSelf.selector);
+        n.latch();
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.NotSelf.selector);
+        n.latch();
         _disable();
-        assertEq(vm.load(address(admin), bytes32(BIT_SLOT)), bytes32(uint256(1)));
+        assertTrue(n.recoveryDisabledLatched());
     }
 
     // ------------------------------------------------------------------------------------------------ the kind --
@@ -317,67 +339,114 @@ contract RecoveryDisableTest is ControlsFixture {
 
     // ------------------------------------------------------------------------------------- one-way, upgrades --
 
-    /// @notice An executor that clears the bit at recording: the frame is undone and the decision stays buffered
-    /// (HALT); the recovery stays off, and a kind 9 (IBCAdmin's own) still replaces the executor.
-    function test_maliciousExecutor_atRecording_halted() public {
-        _disable();
-        ReenablingExec bad = new ReenablingExec(address(router), d.accessManager, address(ics20), 1);
-        _handover(address(bad));
-        uint64 seq = admin.lastSeq() + 1;
-        assertEq(_status(_recvGov(_env(seq, S.KIND_SETTINGS, P.settings(clientId, 2 days)))), S.STATUS_BUFFERED);
-        assertEq(admin.lastSeq(), seq - 1, "nothing recorded");
-        assertTrue(admin.recoveryDisabled());
-        assertEq(vm.load(address(admin), bytes32(BIT_SLOT)), bytes32(uint256(1)));
-        // as for any executor that cannot answer: gno.land cancels the stuck decision, and a kind 9 behind it
-        // (IBCAdmin's own, never the executor's) puts an honest executor back
-        IBCAdminExec good = new IBCAdminExec(address(router), d.accessManager, address(ics20));
-        assertEq(
-            _status(_recvGov(_env(seq + 1, S.KIND_HANDOVER, P.handover(address(good), address(good).codehash, "")))),
-            S.STATUS_BUFFERED
-        );
-        _recvGov(_env(seq + 2, S.KIND_CANCEL, P.cancel1(seq, seq)));
-        assertEq(admin.decision(1, seq + 1).state, S.PENDING, "the kind 9 recorded");
-        _skip(S.WEEK);
-        admin.execute(seq + 1);
-        (address x,) = admin.exec();
-        assertEq(x, address(good));
-        assertTrue(admin.recoveryDisabled());
+    function _bad(uint256 mode, uint64 disableSeq) internal returns (ReenablingExec) {
+        return new ReenablingExec(address(router), d.accessManager, address(ics20), mode, disableSeq);
     }
 
-    /// @notice An executor that clears the bit at execution: `keepRecoveryOff` reverts its frame, the decision is
-    /// spent ("reverted"), and the recovery stays off.
-    function test_maliciousExecutor_atExecution_reverted() public {
-        _disable();
-        ReenablingExec bad = new ReenablingExec(address(router), d.accessManager, address(ics20), 2);
-        _handover(address(bad));
-        uint64 seq = admin.lastSeq() + 1;
-        assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
-        _skip(S.DAY);
-        vm.expectEmit(true, true, false, true, address(admin));
-        emit IIBCAdmin.DecisionSpent(1, seq, S.KIND_UNPAUSE, "reverted");
-        admin.execute(seq);
-        assertTrue(admin.recoveryDisabled());
-        assertEq(vm.load(address(admin), bytes32(BIT_SLOT)), bytes32(uint256(1)));
+    function _expectProbe() internal {
+        vm.expectEmit(false, false, false, true, address(admin));
+        emit Probe(IIBCAdmin.RecoveryPermanentlyDisabled.selector, IIBCAdmin.RecoveryPermanentlyDisabled.selector, true);
     }
 
-    /// @notice An executor that opens a proposal behind a disabled recovery: refused the same way.
-    function test_maliciousExecutor_opensAProposal_reverted() public {
-        _disable();
-        ReenablingExec bad = new ReenablingExec(address(router), d.accessManager, address(ics20), 3);
-        _handover(address(bad));
-        uint64 seq = admin.lastSeq() + 1;
-        assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
-        _skip(S.DAY);
-        admin.execute(seq);
-        assertEq(admin.decision(1, seq).state, S.SPENT);
+    /// @notice The guardians' entry points stay closed after any executor frame: approvals and execution refused.
+    function _closed() internal {
+        assertTrue(admin.recoveryDisabled());
         assertEq(_openedAt(), 0);
+        lc.setStatus(true, false);
+        vm.prank(G[0]);
+        vm.expectRevert(IIBCAdmin.RecoveryPermanentlyDisabled.selector);
+        admin.approveRecovery(_proposal());
+        vm.expectRevert(IIBCAdmin.RecoveryPermanentlyDisabled.selector);
+        admin.executeRecovery();
+        lc.setStatus(false, false);
+    }
+
+    /// @notice Records a hand-over to `x` and a kind 14 right behind it; returns the kind 14's number.
+    function _handoverThenDisable(function(uint64) internal returns (ReenablingExec) make)
+        internal
+        returns (uint64 disableSeq)
+    {
+        uint64 h = admin.lastSeq() + 1;
+        disableSeq = h + 1;
+        ReenablingExec x = make(disableSeq);
+        assertEq(_status(_recvGov(_env(h, S.KIND_HANDOVER, P.handover(address(x), address(x).codehash, "")))), 1);
+        assertEq(
+            _status(_recvGov(_env(disableSeq, S.KIND_DISABLE_RECOVERY, P.disableRecovery(clientId)))), S.STATUS_RECORDED
+        );
+        _skip(S.WEEK);
+        admin.execute(h);
+        (address now_,) = admin.exec();
+        assertEq(now_, address(x), "handed over");
+    }
+
+    function _atRecording(uint64 seq) internal returns (ReenablingExec) {
+        return _bad(1, seq);
+    }
+
+    function _atExecution(uint64 seq) internal returns (ReenablingExec) {
+        return _bad(2, seq);
+    }
+
+    /// @notice Trace (a) at recording: the executor applies the pending kind 14 from inside its recording frame, then
+    /// zeroes IBCAdmin's storage and re-enters the guardians' entry points with a faked proposal: the latch, in
+    /// IBCAdminNative's storage, holds, and both entry points refuse, inside the frame and after.
+    function test_traceA_nestedDisableThenClear_atRecording() public {
+        uint64 disableSeq = _handoverThenDisable(_atRecording);
+        assertFalse(admin.recoveryDisabled());
+        _expectProbe();
+        assertEq(
+            _status(_recvGov(_env(disableSeq + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)))), S.STATUS_RECORDED
+        );
+        assertEq(admin.decision(1, disableSeq).state, S.EXECUTED, "the nested disable applied");
+        _closed();
+    }
+
+    /// @notice Trace (a) at execution: the same, from inside an execution frame.
+    function test_traceA_nestedDisableThenClear_atExecution() public {
+        uint64 disableSeq = _handoverThenDisable(_atExecution);
+        uint64 seq = disableSeq + 1;
+        assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
+        _skip(S.DAY);
+        _expectProbe();
+        admin.execute(seq);
+        assertEq(admin.decision(1, seq).state, S.EXECUTED);
+        assertEq(admin.decision(1, disableSeq).state, S.EXECUTED, "the nested disable applied");
+        _closed();
+    }
+
+    /// @notice Trace (b) at recording, after a disable: a temporary clear and a re-entry into `executeRecovery` with a
+    /// faked open proposal are refused.
+    function test_traceB_temporaryClearThenReentry_atRecording() public {
+        _disable();
+        _handover(address(_bad(1, 0)));
+        _expectProbe();
+        uint64 seq = admin.lastSeq() + 1;
+        assertEq(_status(_recvGov(_env(seq, S.KIND_SETTINGS, P.settings(clientId, 2 days)))), S.STATUS_RECORDED);
+        _closed();
+    }
+
+    /// @notice Trace (b) at execution.
+    function test_traceB_temporaryClearThenReentry_atExecution() public {
+        _disable();
+        _handover(address(_bad(2, 0)));
+        uint64 seq = admin.lastSeq() + 1;
+        assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
+        _skip(S.DAY);
+        _expectProbe();
+        admin.execute(seq);
+        assertEq(admin.decision(1, seq).state, S.EXECUTED);
+        _closed();
+        // an honest executor afterwards changes nothing
+        IBCAdminExec good = new IBCAdminExec(address(router), d.accessManager, address(ics20));
+        _handover(address(good));
+        _closed();
     }
 
     /// @notice An executor whose recovery module would switch the recovery on: IBCAdmin refuses before the module is
     /// reached, so neither an approval nor an execution runs it.
     function test_maliciousRecoveryModule_neverReached() public {
         _disable();
-        ReenablingExec bad = new ReenablingExec(address(router), d.accessManager, address(ics20), 0);
+        ReenablingExec bad = _bad(0, 0);
         _handover(address(bad));
         lc.setStatus(true, false);
         vm.prank(G[0]);
@@ -388,22 +457,9 @@ contract RecoveryDisableTest is ControlsFixture {
         assertTrue(admin.recoveryDisabled());
         assertEq(_openedAt(), 0);
     }
-
-    /// @notice The same executor with the recovery still on is not refused: the after-check guards only a disabled
-    /// recovery (its frames there are an ordinary executor's).
-    function test_executorFrames_unaffectedWhileEnabled() public {
-        ReenablingExec bad = new ReenablingExec(address(router), d.accessManager, address(ics20), 2);
-        _handover(address(bad));
-        uint64 seq = admin.lastSeq() + 1;
-        assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
-        _skip(S.DAY);
-        admin.execute(seq);
-        assertEq(admin.decision(1, seq).state, S.EXECUTED);
-        assertFalse(admin.recoveryDisabled());
-    }
 }
 
-/// @notice A deployment that never enabled the recovery starts with the bit set: kind 14 is spent ("disabled"), and
+/// @notice A deployment that never enabled the recovery starts latched: kind 14 is spent ("disabled"), and
 /// the recovery's entry points keep their original error.
 contract RecoveryNeverEnabledTest is ControlsFixture {
     function test_offFromTheStart() public {
