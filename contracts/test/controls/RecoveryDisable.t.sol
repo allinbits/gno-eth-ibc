@@ -126,7 +126,7 @@ contract RecoveryDisableTest is ControlsFixture {
 
     function _disable() internal returns (uint64 seq) {
         seq = _recordDisable();
-        _skip(7 days);
+        _skip(S.WEEK);
         admin.execute(seq);
         assertTrue(admin.recoveryDisabled());
     }
@@ -134,7 +134,7 @@ contract RecoveryDisableTest is ControlsFixture {
     function _handover(address x) internal {
         uint64 seq = admin.lastSeq() + 1;
         assertEq(_status(_recvGov(_env(seq, S.KIND_HANDOVER, P.handover(x, x.codehash, "")))), S.STATUS_RECORDED);
-        _skip(7 days);
+        _skip(S.WEEK);
         admin.execute(seq);
         (address now_,) = admin.exec();
         assertEq(now_, x, "handed over");
@@ -165,7 +165,7 @@ contract RecoveryDisableTest is ControlsFixture {
         _approve(1); // two approvals: below the threshold, and the route is healthy
         uint64 seq = _recordDisable();
         assertEq(admin.decision(1, seq).kind, 14);
-        _skip(7 days - 1);
+        _skip(S.WEEK - 1);
         vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotMature.selector, uint64(_now() + 1)));
         admin.execute(seq);
         _skip(1);
@@ -202,7 +202,7 @@ contract RecoveryDisableTest is ControlsFixture {
         lc.setStatus(false, false);
         uint64 next = admin.lastSeq() + 1;
         assertEq(_status(_recvGov(_env(next, S.KIND_SETTINGS, P.settings(clientId, 1 days)))), S.STATUS_RECORDED);
-        _skip(7 days);
+        _skip(S.WEEK);
         admin.execute(next);
         assertEq(admin.decision(1, next).state, S.EXECUTED);
     }
@@ -210,7 +210,7 @@ contract RecoveryDisableTest is ControlsFixture {
     /// @notice Deferred by a flag and by a hold, like every 7-day kind; it lands once they are gone.
     function test_deferredByFlagsAndHolds() public {
         uint64 seq = _recordDisable();
-        _skip(7 days);
+        _skip(S.WEEK);
         vm.prank(W[0]);
         admin.setFlag();
         vm.expectRevert(IIBCAdmin.Deferred.selector);
@@ -230,7 +230,7 @@ contract RecoveryDisableTest is ControlsFixture {
         admin.clearFlag();
         vm.expectRevert(IIBCAdmin.Deferred.selector);
         admin.execute(seq); // the hold's dip grace
-        _skip(1 days);
+        _skip(S.DAY);
         admin.execute(seq);
         assertTrue(admin.recoveryDisabled());
     }
@@ -240,7 +240,7 @@ contract RecoveryDisableTest is ControlsFixture {
     function test_waitsWhileARecoveryIsOpen_thenAppliesAfterACancel() public {
         _open();
         uint64 seq = _recordDisable(); // recorded while open: it waits
-        _skip(7 days);
+        _skip(S.WEEK);
         vm.expectRevert(IIBCAdmin.Suspended.selector);
         admin.execute(seq);
         assertEq(admin.decision(1, seq).state, S.PENDING);
@@ -267,7 +267,7 @@ contract RecoveryDisableTest is ControlsFixture {
         // the old client's id names nothing in epoch 2: spent
         assertEq(_status(_recvGov(_env(1, S.KIND_DISABLE_RECOVERY, P.disableRecovery(clientId)))), S.STATUS_SPENT);
         assertEq(_status(_recvGov(_env(2, S.KIND_DISABLE_RECOVERY, P.disableRecovery("gnoland-7")))), S.STATUS_RECORDED);
-        _skip(7 days);
+        _skip(S.WEEK);
         admin.execute(2);
         assertTrue(admin.recoveryDisabled());
     }
@@ -277,7 +277,7 @@ contract RecoveryDisableTest is ControlsFixture {
     function test_secondDisable_spent() public {
         uint64 a = _recordDisable();
         uint64 b = _recordDisable();
-        _skip(7 days);
+        _skip(S.WEEK);
         admin.execute(a);
         vm.expectEmit(true, true, false, true, address(admin));
         emit IIBCAdmin.DecisionSpent(1, b, 14, "disabled");
@@ -337,7 +337,7 @@ contract RecoveryDisableTest is ControlsFixture {
         );
         _recvGov(_env(seq + 2, S.KIND_CANCEL, P.cancel1(seq, seq)));
         assertEq(admin.decision(1, seq + 1).state, S.PENDING, "the kind 9 recorded");
-        _skip(7 days);
+        _skip(S.WEEK);
         admin.execute(seq + 1);
         (address x,) = admin.exec();
         assertEq(x, address(good));
@@ -352,7 +352,7 @@ contract RecoveryDisableTest is ControlsFixture {
         _handover(address(bad));
         uint64 seq = admin.lastSeq() + 1;
         assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
-        _skip(1 days);
+        _skip(S.DAY);
         vm.expectEmit(true, true, false, true, address(admin));
         emit IIBCAdmin.DecisionSpent(1, seq, S.KIND_UNPAUSE, "reverted");
         admin.execute(seq);
@@ -367,7 +367,7 @@ contract RecoveryDisableTest is ControlsFixture {
         _handover(address(bad));
         uint64 seq = admin.lastSeq() + 1;
         assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
-        _skip(1 days);
+        _skip(S.DAY);
         admin.execute(seq);
         assertEq(admin.decision(1, seq).state, S.SPENT);
         assertEq(_openedAt(), 0);
@@ -396,7 +396,7 @@ contract RecoveryDisableTest is ControlsFixture {
         _handover(address(bad));
         uint64 seq = admin.lastSeq() + 1;
         assertEq(_status(_recvGov(_env(seq, S.KIND_UNPAUSE, P.unpause(2, "")))), S.STATUS_RECORDED);
-        _skip(1 days);
+        _skip(S.DAY);
         admin.execute(seq);
         assertEq(admin.decision(1, seq).state, S.EXECUTED);
         assertFalse(admin.recoveryDisabled());
