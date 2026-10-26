@@ -162,11 +162,8 @@ library IBCAdminStorage {
         /// A pending hand-over's flag anchor (kind 9 under flags): the earliest start of the flags standing when it
         /// was first seen due and flagged, pinned then; flags defer it until this plus 21 days.
         mapping(uint32 epoch => mapping(uint64 seq => uint64)) flagAnchor;
-        /// The emergency recovery is off for good: set by kind 14 (or at construction when the deployment disabled
-        /// it) and never cleared. Appended last (the layout is append-only): slot `SLOT + 42`, offset 0. IBCAdmin and
-        /// IBCAdminNative read it before any recovery call reaches the executor's recovery module, and refuse every
-        /// executor frame that leaves it cleared or a proposal open (`keepRecoveryOff`).
-        bool recoveryDisabled;
+        // The emergency recovery's permanent disable is not here: it is a latch in IBCAdminNative's own storage
+        // (`IBCAdminNative.latch`), which no executor frame, running in this layout, can write back.
     }
 
     /// @notice An epoch's notice: recorded when its epoch opened by kind 10 or the emergency recovery, the client it
@@ -293,9 +290,14 @@ library IBCAdminStorage {
     /// @notice Kind 14's checks (IBCAdmin's own, never the executor's), at recording and again at execution: the
     /// parameters exactly the canonical `abi.encode(string clientId)` ("params"), `clientId` the current epoch's
     /// client, the router's client of gno.land that the decision travelled over ("client"), and the recovery not
-    /// off already ("disabled": a second disable, or one sent to a deployment that never enabled it, is refused and
-    /// spent, never a silent no-op). Never reverts: malformed bytes are an answer.
-    function disableRecoveryCheck(Layout storage l, bytes memory p) internal view returns (string memory) {
+    /// off already, `latched` being IBCAdminNative's latch ("disabled": a second disable, or one sent to a deployment
+    /// that never enabled it, is refused and spent, never a silent no-op). Never reverts: malformed bytes are an
+    /// answer.
+    function disableRecoveryCheck(Layout storage l, bytes memory p, bool latched)
+        internal
+        view
+        returns (string memory)
+    {
         uint256 n = p.length;
         if (n < 64 || n % 32 != 0) return "params";
         uint256 off;
@@ -310,16 +312,8 @@ library IBCAdminStorage {
         // the padding zero: equal to its canonical re-encoding
         if (keccak256(abi.encode(id)) != keccak256(p)) return "params";
         if (keccak256(bytes(id)) != keccak256(bytes(l.govClient))) return "client";
-        if (l.recoveryDisabled) return "disabled";
+        if (latched) return "disabled";
         return "";
-    }
-
-    /// @notice After a frame that ran the executor's code as IBCAdmin (or anything it delegatecalled), with the
-    /// recovery off before it: refused unless it is still off and no proposal stands open. The executor runs with
-    /// IBCAdmin's storage, so it could write the bit; this check, in IBCAdmin's immutable code, undoes any frame that
-    /// tries (the frame reverts whole), whatever executor a kind 9 installs.
-    function keepRecoveryOff(Layout storage l) internal view {
-        if (!l.recoveryDisabled || l.recovery.openedAt != 0) revert IIBCAdmin.RecoveryReenabled();
     }
 
     /// @notice Kind 9's recording check (IBCAdmin's own, never the executor's): the parameters exactly the canonical

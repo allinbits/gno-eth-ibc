@@ -20,6 +20,15 @@ contract IBCAdminNative is IIBCAdmin {
     uint256 internal constant UNBLOCK_GAS = 200_000;
 
     address private immutable _self = address(this);
+    /// @notice The IBCAdmin that deployed this helper: the only caller of `latch`.
+    address private immutable _admin = msg.sender;
+
+    /// @notice The emergency recovery's permanent disable, in this contract's OWN storage: written only by `latch`,
+    /// called directly (never delegated) by IBCAdmin, with no path that clears it. The executor runs by delegatecall
+    /// in IBCAdmin's storage and can never write this contract's, so no executor, whatever kind 9 installs, can
+    /// re-enable the recovery. Never read or written by the delegated functions below (they run in IBCAdmin's
+    /// storage): they ask this contract by a call (`_latched`).
+    bool private _recoveryLatch;
 
     /// @notice The executor's answer at recording failed validation: reverted so that whatever the executor did in the
     /// frame is undone; IBCAdmin reads it as HALT (the decision stays buffered, nothing recorded or applied).
@@ -50,10 +59,9 @@ contract IBCAdminNative is IIBCAdmin {
         if (kind == S.KIND_HANDOVER) return S.handoverParams(params);
         S.Layout storage l = S.layout();
         if (kind == S.KIND_DISABLE_RECOVERY) {
-            string memory why = S.disableRecoveryCheck(l, params);
+            string memory why = S.disableRecoveryCheck(l, params, _latched());
             return bytes(why).length == 0 ? (S.WAIT, "") : (S.SPEND, why);
         }
-        bool wasOff = l.recoveryDisabled;
         address x = l.exec;
         if (x.codehash != l.execHash) return (S.HALT, "");
         if (gasleft() < S.RECORD_FLOOR) return (S.STARVED, "");
@@ -69,8 +77,6 @@ contract IBCAdminNative is IIBCAdmin {
         }
         // a revert undid the executor's own effects; as undecodable parameters, it spends the decision
         if (!ok) return (S.SPEND, "params");
-        // an executor that wrote a disabled recovery back on (or opened a proposal): the frame undone, HALT
-        if (wasOff && (!l.recoveryDisabled || l.recovery.openedAt != 0)) revert Halted();
         // from here a refusal reverts (Halted), undoing whatever the executor did in this frame
         if (size < 96 || size > S.MAX_ANSWER) revert Halted();
         bytes memory ret = new bytes(size);
@@ -182,20 +188,39 @@ contract IBCAdminNative is IIBCAdmin {
     }
 
     /// @notice Kind 14 at execution: its checks again (`IBCAdminStorage.disableRecoveryCheck`, a failure spends it),
-    /// then the emergency recovery is off for good: the bit set and every pending approval cleared. IBCAdmin never
-    /// executes it while a proposal is open (kind 14 is suspended then); were one open, it reverts and pends. Nothing
-    /// clears the bit: no kind writes it, IBCAdmin reads it before any recovery call reaches the executor's module,
-    /// and it refuses every executor frame that leaves it cleared (`keepRecoveryOff`, and HALT at recording).
+    /// then the emergency recovery is off for good: the latch set (a call from IBCAdmin to this contract) and every
+    /// pending approval cleared. IBCAdmin never executes it while a proposal is open (kind 14 is suspended then);
+    /// were one open, it reverts and pends.
     function disableRecovery(uint32 ep, uint64 seq, bytes calldata p) external delegated returns (string memory) {
         S.Layout storage l = S.layout();
-        string memory why = S.disableRecoveryCheck(l, p);
+        string memory why = S.disableRecoveryCheck(l, p, _latched());
         if (bytes(why).length != 0) return why;
         S.Recovery storage r = l.recovery;
         if (r.openedAt != 0) revert Suspended();
-        l.recoveryDisabled = true;
+        IBCAdminNative(_self).latch();
         S.closeRecovery(r);
         emit EmergencyRecoveryDisabled(ep, seq);
         return "";
+    }
+
+    /// @notice Sets the permanent disable. Only IBCAdmin calls it, directly (a delegated or any other call refuses):
+    /// kind 14's execution, and the constructor of a deployment without the recovery. There is no way back. Code
+    /// running as IBCAdmin (an executor) can call it too, which only disables, never re-enables.
+    function latch() external {
+        if (address(this) != _self || msg.sender != _admin) revert NotSelf();
+        _recoveryLatch = true;
+    }
+
+    /// @notice Whether the permanent disable is set (asked at this contract's own address).
+    function recoveryDisabledLatched() external view returns (bool) {
+        if (address(this) != _self) revert NotSelf();
+        return _recoveryLatch;
+    }
+
+    /// @notice The latch, from a delegated function: asked of this contract by a call, never read from IBCAdmin's
+    /// storage.
+    function _latched() private view returns (bool) {
+        return IBCAdminNative(_self).recoveryDisabledLatched();
     }
 
     /// @notice Before a proposal opens, a guardian withdraws its approval; once open, it votes to cancel, and
