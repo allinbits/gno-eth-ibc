@@ -13,7 +13,8 @@ import { Guardians } from "../lib/Guardians.sol";
 import { IBCAdminStorage as S } from "./IBCAdminStorage.sol";
 import { IBCAdminChecks } from "./IBCAdminChecks.sol";
 
-/// @title The emergency route replacement of ADR §7.12 (optional, off unless IBCAdmin enables it)
+/// @title The emergency route replacement of ADR §7.12 (enabled at launch; IBCAdmin refuses every call to it once a
+/// kind 14 disabled it, or when the deployment never enabled it)
 /// @notice Deployed by IBCAdminExec (so pinned with it) and delegatecalled by IBCAdmin, as IBCAdmin: a guardian
 /// supermajority's proposal of an attested client opens only while the route is eligible, then blocks the route's
 /// receives and suspends the authority-changing kinds; only guardians cancel it; after the long delay anyone executes

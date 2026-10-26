@@ -71,6 +71,9 @@ library IBCAdminStorage {
     uint8 internal constant KIND_SETTINGS = 11;
     uint8 internal constant KIND_SETTLE = 12;
     uint8 internal constant KIND_REOPEN = 13;
+    /// @notice Kind 14: disables the emergency recovery (§7.12) for good. IBCAdmin's own kind (IBCAdminNative), like
+    /// kind 9: recorded, checked and executed without the executor.
+    uint8 internal constant KIND_DISABLE_RECOVERY = 14;
 
     // atRecording's answer
     uint8 internal constant WAIT = 0;
@@ -159,6 +162,11 @@ library IBCAdminStorage {
         /// A pending hand-over's flag anchor (kind 9 under flags): the earliest start of the flags standing when it
         /// was first seen due and flagged, pinned then; flags defer it until this plus 21 days.
         mapping(uint32 epoch => mapping(uint64 seq => uint64)) flagAnchor;
+        /// The emergency recovery is off for good: set by kind 14 (or at construction when the deployment disabled
+        /// it) and never cleared. Appended last (the layout is append-only): slot `SLOT + 42`, offset 0. IBCAdmin and
+        /// IBCAdminNative read it before any recovery call reaches the executor's recovery module, and refuse every
+        /// executor frame that leaves it cleared or a proposal open (`keepRecoveryOff`).
+        bool recoveryDisabled;
     }
 
     /// @notice An epoch's notice: recorded when its epoch opened by kind 10 or the emergency recovery, the client it
@@ -271,13 +279,47 @@ library IBCAdminStorage {
     }
 
     function knownKind(uint8 kind) internal pure returns (bool) {
-        return kind >= KIND_CANCEL && kind <= KIND_REOPEN;
+        return kind >= KIND_CANCEL && kind <= KIND_DISABLE_RECOVERY;
     }
 
     /// @notice Kinds suspended while an emergency recovery is open: those that change authority (§7.12; kind 10,
-    /// the route replacement, conservatively too).
+    /// the route replacement, conservatively too), and kind 14, which waits rather than closing a proposal the
+    /// guardians opened: if the guardians cancel it, the disable applies after it; if it executes, its epoch switch
+    /// abandons the disable with the rest of the old epoch, and gno.land sends it again in the new one.
     function suspendedByRecovery(uint8 kind) internal pure returns (bool) {
-        return kind == KIND_SEATS || (kind >= KIND_CLIENT && kind <= KIND_ROUTE);
+        return kind == KIND_SEATS || (kind >= KIND_CLIENT && kind <= KIND_ROUTE) || kind == KIND_DISABLE_RECOVERY;
+    }
+
+    /// @notice Kind 14's checks (IBCAdmin's own, never the executor's), at recording and again at execution: the
+    /// parameters exactly the canonical `abi.encode(string clientId)` ("params"), `clientId` the current epoch's
+    /// client, the router's client of gno.land that the decision travelled over ("client"), and the recovery not
+    /// off already ("disabled": a second disable, or one sent to a deployment that never enabled it, is refused and
+    /// spent, never a silent no-op). Never reverts: malformed bytes are an answer.
+    function disableRecoveryCheck(Layout storage l, bytes memory p) internal view returns (string memory) {
+        uint256 n = p.length;
+        if (n < 64 || n % 32 != 0) return "params";
+        uint256 off;
+        uint256 len;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            off := mload(add(p, 32))
+            len := mload(add(p, 64))
+        }
+        if (off != 32 || len > n - 64 || n != 64 + (len + 31) / 32 * 32) return "params";
+        string memory id = abi.decode(p, (string));
+        // the padding zero: equal to its canonical re-encoding
+        if (keccak256(abi.encode(id)) != keccak256(p)) return "params";
+        if (keccak256(bytes(id)) != keccak256(bytes(l.govClient))) return "client";
+        if (l.recoveryDisabled) return "disabled";
+        return "";
+    }
+
+    /// @notice After a frame that ran the executor's code as IBCAdmin (or anything it delegatecalled), with the
+    /// recovery off before it: refused unless it is still off and no proposal stands open. The executor runs with
+    /// IBCAdmin's storage, so it could write the bit; this check, in IBCAdmin's immutable code, undoes any frame that
+    /// tries (the frame reverts whole), whatever executor a kind 9 installs.
+    function keepRecoveryOff(Layout storage l) internal view {
+        if (!l.recoveryDisabled || l.recovery.openedAt != 0) revert IIBCAdmin.RecoveryReenabled();
     }
 
     /// @notice Kind 9's recording check (IBCAdmin's own, never the executor's): the parameters exactly the canonical

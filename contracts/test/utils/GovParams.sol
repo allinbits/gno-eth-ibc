@@ -151,4 +151,9 @@ library GovParams {
     function reopen(string memory clientId) internal pure returns (bytes memory) {
         return abi.encode(clientId);
     }
+
+    /// @notice Kind 14 `(string clientId)`: the current epoch's client of gno.land.
+    function disableRecovery(string memory clientId) internal pure returns (bytes memory) {
+        return abi.encode(clientId);
+    }
 }

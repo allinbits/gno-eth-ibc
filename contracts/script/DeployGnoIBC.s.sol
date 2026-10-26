@@ -59,9 +59,13 @@ import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol
 ///   LAUNCH_ACTIVE               testing only (refused on mainnet): install the activation limits at launch, so test
 ///                               networks transfer before gno.land binds
 ///   QUARANTINE_SECONDS          the route's quarantine after a validator-set transition; default 7 days
-///   RECOVERY_DELAY              the emergency recovery's delay; 0 (default) deploys it disabled, else at least 30 days
-/// (§7.12). RECOVERY_THRESHOLD, RECOVERY_CANCEL_THRESHOLD, RECOVERY_SILENCE, RECOVERY_HOLD_PERIOD  its other settings
-///                               (approval at least 3 of 4 guardians, cancellation at least 2)
+///   RECOVERY_DELAY              the emergency recovery's delay (§7.12); default 30 days, the launch value: it
+///                               launches enabled, and only a kind 14 from gno.land disables it, for good. At least 30
+///                               days (a testnet build's own floor is shorter); 0 deploys it disabled from the start,
+///                               refused on mainnet. RECOVERY_THRESHOLD (default 3), RECOVERY_CANCEL_THRESHOLD (default
+///                               3), RECOVERY_SILENCE (default 30 days), RECOVERY_HOLD_PERIOD (default 14 days): its
+///                               other settings (approval and cancellation 3 or 4 of the 4 guardians, cancellation at
+///                               most approval; a zero silence or hold period disables that criterion)
 ///   DEPLOYMENTS_FILE            output JSON; default deployments/<chainid>.json
 /// Run: forge script script/DeployGnoIBC.s.sol --rpc-url $ETH_RPC_URL --broadcast
 contract DeployGnoIBC is Script {
@@ -197,12 +201,14 @@ contract DeployGnoIBC is Script {
         }
         p.quarantineSeconds = _u64(vm.envOr("QUARANTINE_SECONDS", uint256(7 days)), "QUARANTINE_SECONDS");
         p.recovery = IIBCAdmin.RecoveryConfig({
-            delay: _u64(vm.envOr("RECOVERY_DELAY", uint256(0)), "RECOVERY_DELAY"),
+            delay: _u64(vm.envOr("RECOVERY_DELAY", uint256(30 days)), "RECOVERY_DELAY"),
             threshold: _u8(vm.envOr("RECOVERY_THRESHOLD", uint256(3)), "RECOVERY_THRESHOLD"),
             cancelThreshold: _u8(vm.envOr("RECOVERY_CANCEL_THRESHOLD", uint256(3)), "RECOVERY_CANCEL_THRESHOLD"),
             silence: _u64(vm.envOr("RECOVERY_SILENCE", uint256(30 days)), "RECOVERY_SILENCE"),
             holdPeriod: _u64(vm.envOr("RECOVERY_HOLD_PERIOD", uint256(14 days)), "RECOVERY_HOLD_PERIOD")
         });
+        // the recovery launches enabled on mainnet (ADR §13); a test network may still deploy without it
+        require(block.chainid != 1 || p.recovery.delay != 0, "RECOVERY_DELAY: the recovery launches enabled on mainnet");
         // an enabled recovery's public delay is long (IBCAdmin refuses less, too)
         require(
             p.recovery.delay == 0 || p.recovery.delay >= 1 hours, "RECOVERY_DELAY: zero (disabled) or 1 hour or more (testnet build)"

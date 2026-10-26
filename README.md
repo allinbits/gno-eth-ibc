@@ -62,15 +62,15 @@ deployment and its checks). Optional settings:
 - `QUARANTINE_SECONDS`: the launch quarantine (default 7 days, at most 365
   days: the deployment sets it through `setQuarantine`, whose ceiling applies
   to it as to every later kind 11 change).
-- `RECOVERY_DELAY` (0, the default, disables the emergency recovery; otherwise
-  at least 30 days), `RECOVERY_THRESHOLD` and `RECOVERY_CANCEL_THRESHOLD`
-  (default 3; 3 or 4 when enabled, cancellation at most approval),
-  `RECOVERY_SILENCE` (default 30 days) and
+- `RECOVERY_DELAY` (default 30 days: the emergency recovery launches
+  enabled; at least 30 days; 0 deploys it disabled, test networks only),
+  `RECOVERY_THRESHOLD` and `RECOVERY_CANCEL_THRESHOLD` (default 3; 3 or 4,
+  cancellation at most approval), `RECOVERY_SILENCE` (default 30 days) and
   `RECOVERY_HOLD_PERIOD` (default 14 days), zero disabling either criterion.
-  The recovery is fixed at deployment: enabling it is a pre-deployment
-  decision, with no later governed enablement. With it disabled, a channel
-  loss with no repair already recorded can strand the escrow's backing for
-  good (see docs/controls.md).
+  The settings are fixed at deployment. gno.land's governance can later
+  disable the recovery for good (kind 14, after 7 days); nothing re-enables
+  it. With it disabled, a channel loss with no repair already recorded can
+  strand the escrow's backing for good (see docs/controls.md).
 - `PERMIT2`: the chain's Permit2 contract, fixed at deployment; unset, only
   allowance-based sends work (`sendTransferWithPermit2` is unavailable).
 

@@ -11,8 +11,9 @@ import { IBCAdminExec } from "./IBCAdminExec.sol";
 /// @notice Part of IBCAdmin's immutable code: IBCAdmin deploys it in its constructor and delegatecalls it at that
 /// address, which nothing can change (no pointer to it is stored, and since Cancun SELFDESTRUCT no longer removes
 /// code), so it runs exactly the code IBCAdmin was built with, never the installed executor's. It holds what must
-/// work whatever the executor does: kind 9 (the hand-over that replaces a broken executor) and the guardians'
-/// cancellation of an open emergency recovery (which suspends kind 9 while it stands). Called at its own address,
+/// work whatever the executor does: kind 9 (the hand-over that replaces a broken executor), the guardians'
+/// cancellation of an open emergency recovery (which suspends kind 9 while it stands), and kind 14 (the permanent
+/// disable of that recovery, which no executor may undo). Called at its own address,
 /// every function refuses (`NotDelegated`): it acts only as IBCAdmin.
 contract IBCAdminNative is IIBCAdmin {
     /// @notice The gas the transfer app's `setRecoveryBlock` gets when a cancellation lifts the recovery block.
@@ -45,9 +46,14 @@ contract IBCAdminNative is IIBCAdmin {
         delegated
         returns (uint8, string memory)
     {
-        // kind 9 is IBCAdmin's own: its parameters checked here, never by the executor
+        // kinds 9 and 14 are IBCAdmin's own: their parameters checked here, never by the executor
         if (kind == S.KIND_HANDOVER) return S.handoverParams(params);
         S.Layout storage l = S.layout();
+        if (kind == S.KIND_DISABLE_RECOVERY) {
+            string memory why = S.disableRecoveryCheck(l, params);
+            return bytes(why).length == 0 ? (S.WAIT, "") : (S.SPEND, why);
+        }
+        bool wasOff = l.recoveryDisabled;
         address x = l.exec;
         if (x.codehash != l.execHash) return (S.HALT, "");
         if (gasleft() < S.RECORD_FLOOR) return (S.STARVED, "");
@@ -63,6 +69,8 @@ contract IBCAdminNative is IIBCAdmin {
         }
         // a revert undid the executor's own effects; as undecodable parameters, it spends the decision
         if (!ok) return (S.SPEND, "params");
+        // an executor that wrote a disabled recovery back on (or opened a proposal): the frame undone, HALT
+        if (wasOff && (!l.recoveryDisabled || l.recovery.openedAt != 0)) revert Halted();
         // from here a refusal reverts (Halted), undoing whatever the executor did in this frame
         if (size < 96 || size > S.MAX_ANSWER) revert Halted();
         bytes memory ret = new bytes(size);
@@ -170,6 +178,23 @@ contract IBCAdminNative is IIBCAdmin {
         l.exec = x;
         l.execHash = h;
         emit ExecReplaced(x, h);
+        return "";
+    }
+
+    /// @notice Kind 14 at execution: its checks again (`IBCAdminStorage.disableRecoveryCheck`, a failure spends it),
+    /// then the emergency recovery is off for good: the bit set and every pending approval cleared. IBCAdmin never
+    /// executes it while a proposal is open (kind 14 is suspended then); were one open, it reverts and pends. Nothing
+    /// clears the bit: no kind writes it, IBCAdmin reads it before any recovery call reaches the executor's module,
+    /// and it refuses every executor frame that leaves it cleared (`keepRecoveryOff`, and HALT at recording).
+    function disableRecovery(uint32 ep, uint64 seq, bytes calldata p) external delegated returns (string memory) {
+        S.Layout storage l = S.layout();
+        string memory why = S.disableRecoveryCheck(l, p);
+        if (bytes(why).length != 0) return why;
+        S.Recovery storage r = l.recovery;
+        if (r.openedAt != 0) revert Suspended();
+        l.recoveryDisabled = true;
+        S.closeRecovery(r);
+        emit EmergencyRecoveryDisabled(ep, seq);
         return "";
     }
 
