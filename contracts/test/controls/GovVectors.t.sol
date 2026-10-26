@@ -32,6 +32,13 @@ contract GovVectorsTest is ControlsFixture {
 
     Vector[] internal vectors;
 
+    /// @notice The launch's recovery settings (ADR §13: the recovery launches enabled), so that kind 14 is recorded.
+    function _recovery() internal pure override returns (IIBCAdmin.RecoveryConfig memory) {
+        return IIBCAdmin.RecoveryConfig({
+            delay: 30 days, threshold: 3, cancelThreshold: 3, silence: 30 days, holdPeriod: 14 days
+        });
+    }
+
     function _deliver(string memory name, uint64 seq, uint8 kind, string memory desc, bytes memory params) internal {
         bytes memory envelope = _envelope(1, seq, kind, params);
         bytes memory ack = _recvGov(envelope);
@@ -183,6 +190,13 @@ contract GovVectorsTest is ControlsFixture {
             "(string clientId = \"client-0\", (uint64 sequence, uint8 action, uint256 amount)[] items = [(7, 5, 100000000)]) - action 5: a forged receive at inbound sequence 7 that released 100000000",
             P.settle1("client-0", 7, 5, 100_000_000)
         );
+        _deliver(
+            "kind14-disable-recovery",
+            18,
+            14,
+            "(string clientId = \"client-0\") - the current epoch's client; disables the emergency recovery for good after 7 days",
+            P.disableRecovery("client-0")
+        );
     }
 
     function _json() internal view returns (string memory j) {
@@ -305,7 +319,7 @@ contract GovVectorsTest is ControlsFixture {
     function test_govVectors() public {
         _build();
         // the statuses the protocol must produce
-        uint8[20] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1, 1, 1];
+        uint8[21] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1, 1, 1, 1];
         for (uint256 i = 0; i < vectors.length; i++) {
             (uint32 e, uint64 s, uint8 st,) = _govAck(vectors[i].ack);
             assertEq(e, 1);
@@ -314,7 +328,7 @@ contract GovVectorsTest is ControlsFixture {
         }
         (,,, uint8 redispatch) = _govAck(vectors[15].ack);
         assertEq(redispatch, 1);
-        assertEq(admin.lastSeq(), 17);
+        assertEq(admin.lastSeq(), 18);
 
         if (vm.envOr("WRITE_GOV_VECTORS", false)) {
             vm.writeFile(FILE, _json());

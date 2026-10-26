@@ -33,7 +33,8 @@ import { IBCAdminNative } from "./IBCAdminNative.sol";
 /// again, so this is the stable endpoint. After the setup it holds every authority of the deployment (the
 /// AccessManager's ADMIN_ROLE, hence every proxy's upgrade, `migrateClient`, the custom-ERC20 registration, the
 /// transfer controls) and acts only on decisions `ibcgov` sends from gno.land over the paired client, proven by the
-/// GnoLightClient, on its own timers, on the guardians' flags, and on the optional emergency recovery (§7.12).
+/// GnoLightClient, on its own timers, on the guardians' flags, and on the emergency recovery (§7.12), enabled at
+/// launch until a kind 14 disables it for good.
 ///
 /// Delivery (§5.4): a packet carries the envelope `version u8 = 1 | epoch u32 | seq u64 | kind u8 | params`
 /// (big-endian, params the ABI encoding of the kind's tuple, at most MAX_ENVELOPE = 1024 bytes in all). The app
@@ -54,6 +55,9 @@ import { IBCAdminNative } from "./IBCAdminNative.sol";
 /// lands through flags and lands through a hold no sooner than day 21 of it; an unpause (kind 2) waits 24 hours and is
 /// spent under a hold of its object. The kinds' logic runs in IBCAdminExec, delegatecalled at a pinned code hash and
 /// replaced only by kind 9, which IBCAdmin records and executes itself, never through the executor (IBCAdminNative).
+/// Kind 14, the permanent disable of the emergency recovery, is IBCAdmin's own too: a 7-day kind deferred by flags
+/// and holds and suspended while a recovery is open, after which no executor or upgrade can enable the recovery
+/// again (`IBCAdminStorage.recoveryDisabled`, `keepRecoveryOff`).
 
 /// @notice The transfer app's reentrancy lock, read by IBCAdmin.
 interface IGnoICS20Busy {
@@ -142,6 +146,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         l.lastRecordTime = uint64(block.timestamp);
         l.exec = c.exec;
         l.execHash = c.exec.codehash;
+        // a deployment without the recovery starts as if a kind 14 had applied: one bit says "off for good"
+        if (rc.delay == 0) l.recoveryDisabled = true;
         emit EpochOpened(1, c.govClientId);
     }
 
@@ -509,6 +515,11 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             spent = abi.decode(
                 _native(abi.encodeCall(IBCAdminNative.handover, (params, router, accessManager, ics20))), (string)
             );
+        } else if (kind == S.KIND_DISABLE_RECOVERY) {
+            // IBCAdmin's own path too: no executor can refuse, spend or undo the disable
+            d.state = S.EXECUTED;
+            delete d.params;
+            spent = abi.decode(_native(abi.encodeCall(IBCAdminNative.disableRecovery, (ep, seq, params))), (string));
         } else {
             spent = _run(l, d, kind, seq, params);
         }
@@ -587,8 +598,11 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     // ============================================================================================= recovery ==
 
+    /// @notice The recovery's settings, refused when the deployment never enabled it or a kind 14 disabled it: read
+    /// before any recovery call reaches the executor's recovery module.
     function _recoveryConfig() private view returns (RecoveryConfig memory) {
         if (_recoveryDelay == 0) revert RecoveryDisabled();
+        if (S.layout().recoveryDisabled) revert RecoveryPermanentlyDisabled();
         return RecoveryConfig(
             _recoveryDelay, _recoveryThreshold, _recoveryCancelThreshold, _recoverySilence, _recoveryHoldPeriod
         );
@@ -609,6 +623,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice A guardian withdraws its approval, or votes to cancel the open proposal; at the cancel threshold the
     /// recovery closes. IBCAdmin's own path (IBCAdminNative), never through the executor or its recovery module.
+    /// It stays available after a kind 14: nothing is open then and it changes nothing, but it is the native way to
+    /// close a proposal whatever the executor did.
     function cancelRecovery() external {
         if (_recoveryDelay == 0) revert RecoveryDisabled();
         _native(abi.encodeCall(IBCAdminNative.cancelRecovery, (msg.sender, _recoveryCancelThreshold, ics20)));
@@ -691,8 +707,12 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return _delegateTo(_exec(l), call);
     }
 
-    /// @notice Runs `target`'s code as this contract; a revert there reverts here with its own reason.
+    /// @notice Runs `target`'s code as this contract; a revert there reverts here with its own reason. Every frame of
+    /// the executor's code (and of its recovery module) passes here, nested ones included: with the recovery off
+    /// before it, a frame that leaves it on again, or a proposal open, reverts whole (`keepRecoveryOff`).
     function _delegateTo(address target, bytes memory call) private returns (bytes memory) {
+        S.Layout storage l = S.layout();
+        bool off = l.recoveryDisabled;
         (bool ok, bytes memory ret) = target.delegatecall(call);
         if (!ok) {
             // solhint-disable-next-line no-inline-assembly
@@ -700,6 +720,7 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
                 revert(add(ret, 32), mload(ret))
             }
         }
+        if (off) S.keepRecoveryOff(l);
         return ret;
     }
 
@@ -766,6 +787,11 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     function setupDone() external view returns (bool) {
         return S.layout().setupDone;
+    }
+
+    /// @notice Whether the emergency recovery is off for good: disabled by a kind 14, or never enabled (delay zero).
+    function recoveryDisabled() external view returns (bool) {
+        return S.layout().recoveryDisabled;
     }
 
     function recoveryConfig() external view returns (RecoveryConfig memory) {

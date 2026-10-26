@@ -29,7 +29,7 @@ import { IGnoLightClientStatus } from "../../src/interfaces/IGnoLightClientStatu
 import { StatusMock } from "../utils/ControlsMocks.sol";
 import { ControlsFixture } from "./ControlsFixture.sol";
 
-/// @notice The emergency route replacement is off unless the deployment enables it (ADR §7.12).
+/// @notice A deployment with a zero recovery delay has no emergency route replacement (ADR §7.12); launch enables it.
 contract IBCAdminRecoveryDisabledTest is ControlsFixture {
     function test_disabledByDefault() public {
         IIBCAdmin.RecoveryProposal memory p;

@@ -31,7 +31,6 @@ interface IIBCAdmin {
         uint64 suspectFrom;
     }
 
-    /// @notice The recovery's settings, fixed at deployment. `delay == 0` disables the emergency path.
     /// @notice What the deployment created, for `finishSetup` to check against the chain (ADR E11): the launch
     /// client's id, its verifier (address and code hash), the verifier's original checkpoint (its launch height and
     /// the hash of the consensus state stored there) and its parameters no update changes (the hash of
@@ -50,6 +49,8 @@ interface IIBCAdmin {
         uint64 quarantineSeconds;
     }
 
+    /// @notice The recovery's settings, fixed at deployment. `delay == 0` deploys the emergency path disabled (as if
+    /// a kind 14 had already applied).
     struct RecoveryConfig {
         uint64 delay;
         uint8 threshold;
@@ -86,7 +87,13 @@ interface IIBCAdmin {
     error SetupPending();
     /// @notice No notice recorded for that epoch (the launch epoch, or one not opened yet).
     error NoNotice();
+    /// @notice The deployment never enabled the emergency recovery (its delay is zero).
     error RecoveryDisabled();
+    /// @notice A kind 14 from gno.land disabled the emergency recovery for good: nothing opens or executes one again.
+    error RecoveryPermanentlyDisabled();
+    /// @notice A frame of the executor's code left a disabled recovery enabled again, or a proposal open: refused,
+    /// the frame undone.
+    error RecoveryReenabled();
     error RecoveryNotEligible();
     error RecoveryState();
     error NotGuardian();
@@ -121,6 +128,8 @@ interface IIBCAdmin {
     /// the route stays blocked until `clearRecoveryBlock` succeeds.
     event RecoveryBlockKept(bytes32 indexed proposal);
     event RecoveryExecuted(bytes32 indexed proposal, string newClientId);
+    /// @notice Kind 14 `seq` of `epoch` disabled the emergency recovery for good, every pending approval cleared.
+    event EmergencyRecoveryDisabled(uint32 indexed epoch, uint64 indexed seq);
     event SetupDone();
     /// @notice The epoch notice sent over the new client (§7.12); `sequence` zero: the router refused it, resend.
     event EpochNoticeSent(uint32 indexed epoch, string clientId, uint64 sequence);
