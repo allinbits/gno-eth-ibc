@@ -24,15 +24,22 @@ Ethereum.
 | | Chain id | RPC |
 |---|---|---|
 | Arc mainnet | 5042 | |
-| Arc testnet | 5042002 | `https://rpc.blockdaemon.testnet.arc.io` (certificates and latest-block proofs) |
+| Arc testnet | 5042002 | certificates and transactions: `https://rpc.testnet.arc.io`; latest-block proofs: `https://rpc.drpc.testnet.arc.io` |
 | Arc devnet | 5042001 | |
 
 Arc's public nodes serve `eth_getProof` at the latest block only, which is
-why the client is shaped the way it is (ADR 0005, "Why B and not C"). The
-official RPC serves `arc_getCertificate` but not `eth_getProof`; blockdaemon
-serves both (drpc serves both too, but refuses `eth_getProof` at a block
-number). The relayer takes the two endpoints separately (`-arc-cert-rpc`,
-`-arc-rpc`) and defaults both to blockdaemon.
+why the client is shaped the way it is (ADR 0005, "Why B and not C"). No one
+public endpoint serves everything well:
+
+- the official `rpc.testnet.arc.io` serves `arc_getCertificate`, but not
+  `eth_getProof`;
+- drpc serves `eth_getProof` at `latest` (not at a block number), but
+  answers "Certificate not found";
+- blockdaemon serves both, but sometimes returns a compressed body without a
+  `Content-Encoding` header, which go-ethereum and forge cannot read.
+
+The relayer takes the two separately (`-arc-cert-rpc`, default the official
+RPC; `-arc-rpc`, default drpc); deploy with the official RPC.
 
 ## Deploying on Arc
 

@@ -27,8 +27,12 @@ import (
 // Testnet defaults.
 const (
 	TestnetChainID   = 5042002
-	TestnetCertRPC   = "https://rpc.blockdaemon.testnet.arc.io"
-	TestnetProofRPC  = "https://rpc.blockdaemon.testnet.arc.io"
+	// TestnetCertRPC serves arc_getCertificate (the official RPC, which does
+	// not serve eth_getProof); TestnetProofRPC serves eth_getProof at the
+	// latest block (drpc, which has no certificates). blockdaemon serves
+	// both but sometimes returns a compressed body without saying so.
+	TestnetCertRPC   = "https://rpc.testnet.arc.io"
+	TestnetProofRPC  = "https://rpc.drpc.testnet.arc.io"
 	maxProofKeys     = 64
 	snapshotAttempts = 20
 )
@@ -288,7 +292,7 @@ func (c *Client) snapshot(ctx context.Context, knownRegistryRoot common.Hash, ro
 // registration ids, and each registration's status, key length, key and
 // power.
 func (c *Client) proveSet(ctx context.Context, root common.Hash) (Proof, error) {
-	setSlot := slotAdd(RegistryStorageLocation, 1)
+	setSlot := SetSlot()
 	p, _, err := c.proveLatest(ctx, RegistryAddress, []common.Hash{setSlot}, root)
 	if err != nil {
 		return Proof{}, err
@@ -297,23 +301,39 @@ func (c *Client) proveSet(ctx context.Context, root common.Hash) (Proof, error) 
 	if n > 256 {
 		return Proof{}, fmt.Errorf("registry holds %d active registrations, more than the client reads", n)
 	}
-	values := crypto.Keccak256Hash(setSlot[:])
-	keys := []common.Hash{ImplementationSlot, setSlot}
-	for i := uint64(0); i < n; i++ {
-		keys = append(keys, slotAdd(values, i))
-	}
+	keys := SetKeys(n)
 	p, _, err = c.proveLatest(ctx, RegistryAddress, keys, root)
 	if err != nil {
 		return Proof{}, err
 	}
 	for i := uint64(0); i < n; i++ {
-		id := p.Values[slotAdd(values, i)]
-		entry := crypto.Keccak256Hash(id[:], RegistryStorageLocation[:])
-		keyLen := slotAdd(entry, 1)
-		keys = append(keys, entry, keyLen, crypto.Keccak256Hash(keyLen[:]), slotAdd(entry, 2))
+		keys = append(keys, RegistrationKeys(p.Values[keys[2+i]])...)
 	}
 	p, _, err = c.proveLatest(ctx, RegistryAddress, keys, root)
 	return p, err
+}
+
+// SetSlot is the registry slot holding the length of its active set.
+func SetSlot() common.Hash { return slotAdd(RegistryStorageLocation, 1) }
+
+// SetKeys are the registry slots read for an active set of n registrations:
+// the proxy's implementation, the set's length, and its n registration ids.
+func SetKeys(n uint64) []common.Hash {
+	setSlot := SetSlot()
+	values := crypto.Keccak256Hash(setSlot[:])
+	keys := []common.Hash{ImplementationSlot, setSlot}
+	for i := uint64(0); i < n; i++ {
+		keys = append(keys, slotAdd(values, i))
+	}
+	return keys
+}
+
+// RegistrationKeys are the registry slots read for the registration id: its
+// status, key length, key and power.
+func RegistrationKeys(id common.Hash) []common.Hash {
+	entry := crypto.Keccak256Hash(id[:], RegistryStorageLocation[:])
+	keyLen := slotAdd(entry, 1)
+	return []common.Hash{entry, keyLen, crypto.Keccak256Hash(keyLen[:]), slotAdd(entry, 2)}
 }
 
 // findByStateRoot finds the recent block whose state root is root.
