@@ -518,7 +518,7 @@ one incident is never counted by another; nothing is counted on the live client.
   execution, the settlement is not reopened: a settled record refuses every later kind 12. A genuine refund it
   denied (settled as delivered, actions 2 and 3) is an **accepted residual**: the ADR reconciles each record once
   (§7.12) and specifies no path for it. Its credit-by-vote rule concerns destination claims backed by a receipt with
-  a successful or asynchronous acknowledgement, not refunds denied by a final Ethereum settlement. **No compensation
+  a successful acknowledgement, not refunds denied by a final Ethereum settlement. **No compensation
   path exists on Ethereum.** No kind pays from escrow or credits a sender outside kind 12, and kind 12 cannot book a
   loss against a settled record. This document's operating policy is to compensate such a refund outside the
   bridge; a governed path (it would need a kind 7 upgrade of the transfer app) is a proposed extension, not part of
