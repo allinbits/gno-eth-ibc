@@ -1,4 +1,4 @@
-# gno.land ⇄ Arc (experimental)
+# gno.land ⇄ Arc
 
 [Arc](https://github.com/circlefin/arc-node) is Circle's EVM L1, with
 Malachite (Tendermint BFT) consensus, Reth execution and USDC as gas. This
