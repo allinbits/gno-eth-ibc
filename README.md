@@ -1,15 +1,25 @@
 # gno-eth-ibc
 
-IBC v2 between a gno.land chain and Ethereum: a gno.land light client in
-Solidity, the deployment of the solidity-ibc-eureka router and ICS20 app with
-it, a relayer for both directions, and scripts for a local testnet and Sepolia.
+IBC v2 between a gno.land chain and EVM chains, Ethereum and Arc: a
+gno.land light client in Solidity, the deployment of the solidity-ibc-eureka
+router and ICS20 app with it, the route controls and IBCAdmin that carry
+gno.land's governance, a relayer for both directions, and scripts for a local
+testnet and Sepolia.
 
-The other halves live in two branches:
+A gno.land chain runs one route per counterparty chain, so an Ethereum route
+and an Arc route can run side by side. Each has its own contracts, its own
+IBCAdmin and its own governance channel; the contracts are the same on both
+chains. Arc specifics are in [docs/arc.md](docs/arc.md); the controls and
+governance in [docs/controls.md](docs/controls.md).
 
-| Repo | Branch | What |
+The other halves:
+
+| Repo | Where | What |
 |---|---|---|
-| gnolang/gno | `feat/secp256k1-validators-ibc` | secp256k1 validator keys; `crypto/bls12381` natives; colons in realm param names |
-| allinbits/gno-realms | `feat/ethereum-light-client` | Ethereum light client (`p/aib/ibc/lightclient/ethereum`), `r/aib/ibc/ethrelay`, ABI ICS20 payloads |
+| gnolang/gno | `feat/secp256k1-validators-ibc` (gnolang/gno#6375, open) | secp256k1 validator keys; `crypto/bls12381` natives; colons in realm param names |
+| allinbits/gno-realms | `master` | Ethereum light client (`p/aib/ibc/lightclient/ethereum`), `r/aib/ibc/ethrelay`, ABI ICS20 payloads, the route controls (`apps/transfer/impl/controls/v0`), `r/aib/ibc/ibcgov`, uint256 amounts |
+| allinbits/gno-realms | open PRs | #98 the Arc light client (`p/aib/ibc/lightclient/arc`); #100 ibcgov governing one route per chain (ADR 0007); #96 pruning of expired Ethereum consensus states; #99 proofs carried as opaque bytes |
+| allinbits/ibc-v2-ts-relayer | | the TypeScript relayer: gno.land ⇄ Ethereum and Arc |
 
 ## How it fits
 
@@ -26,6 +36,10 @@ gno.land (3 secp256k1 validators)                    Ethereum (Sepolia)
   secp256k1 (`ecrecover`), caches validator sets by hash, and proves the core
   realm's packet state (params under `/pv/vm:gno.land/r/aib/ibc/core:` in the
   `main` B+tree store) with ICS23.
+- **Arc → gno**: the gno Arc client, a variant of 07-tendermint, checks
+  Malachite's Ed25519 commit certificates and reads the validator set from
+  Arc's ValidatorRegistry by storage proofs. Packets are proven with
+  `eth_getProof`, as on Ethereum. gno → Arc is the EVM path unchanged.
 - **Ethereum → gno**: the gno client follows the Altair sync protocol through
   Gloas. Updates carry no committee keys: the signature is checked against the
   committee's aggregate key minus the non-signers
@@ -74,6 +88,9 @@ deployment and its checks). Optional settings:
 - `PERMIT2`: the chain's Permit2 contract, fixed at deployment; unset, only
   allowance-based sends work (`sendTransferWithPermit2` is unavailable).
 
+`DeployGnoIBC` deploys on Arc the same way, with Arc's RPC; see
+[docs/arc.md](docs/arc.md#deploying-on-arc).
+
 ```sh
 make sepolia-setup   # fresh testnet, deploy on Sepolia, create gno's Ethereum client
 make sepolia-to-eth  # ugnot gno -> Sepolia, ack back to gno (waits for Sepolia finality)
@@ -93,6 +110,8 @@ maximum proof window`); `https://rpc.sepolia.ethpandaops.io` can. Set
 | gno: next sync committee update | ~37M |
 | gno: acknowledgement with a Sepolia storage proof | ~63M |
 | gno: ICS20 transfer to Ethereum | ~70M |
+| gno: Arc client creation (reads the validator set; testnet data, 21 validators) | ~206M |
+| gno: Arc client update, validator set unchanged / changed | ~15M / ~171M |
 | Sepolia: `GnoLightClient` update, 3 validators, set cached | ~463k |
 | anvil (Cancun pricing): same update | ~196k |
 | anvil: `recvPacket` ICS20, steady state / first of a denom | ~360k / ~880k |

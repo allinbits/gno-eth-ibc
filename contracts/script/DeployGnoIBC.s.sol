@@ -43,7 +43,8 @@ import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol
 ///   DEPLOYER_PRIVATE_KEY        deployer key (required; never stored)
 ///   GNO_TRUST_FILE              JSON with "clientState" and "consensusState", each the ABI encoding of the
 ///                               GnoLightClient struct (written by `relayer trust`); default deployments/trust.json
-///   GNO_COUNTERPARTY_CLIENT_ID  the gno-side Ethereum client id; default "ethereum-1"
+///   GNO_COUNTERPARTY_CLIENT_ID  the gno-side client id of this chain; default "arc-1" on Arc (chain ids 5042,
+///                               5042001, 5042002), "ethereum-1" elsewhere
 ///   PERMIT2                     the chain's Permit2 contract (canonically 0x000000000022D473030F116dDEE9F6B43aC78BA3),
 ///                               fixed at deployment; unset, `sendTransferWithPermit2` is unavailable
 ///   RELAYER_ADDRESS             testing only, with ALLOW_RESTRICTED_RELAYING=true: only this address may relay
@@ -166,7 +167,7 @@ contract DeployGnoIBC is Script {
         _checkRelaying(p.relayer, vm.envOr("ALLOW_RESTRICTED_RELAYING", false));
         p.clientState = abi.decode(trust.readBytes(".clientState"), (Msgs.ClientState));
         p.consensusState = abi.decode(trust.readBytes(".consensusState"), (Msgs.ConsensusState));
-        p.counterparty = vm.envOr("GNO_COUNTERPARTY_CLIENT_ID", string("ethereum-1"));
+        p.counterparty = vm.envOr("GNO_COUNTERPARTY_CLIENT_ID", _isArc() ? string("arc-1") : string("ethereum-1"));
         address[] memory none = new address[](0);
         address[] memory g = vm.envOr("GUARDIANS", ",", none);
         address[] memory w = vm.envOr("WATCH_KEYS", ",", none);
@@ -196,7 +197,7 @@ contract DeployGnoIBC is Script {
             vm.envOr("GNOT_REFUND_CAP", uint256(0))
         );
         if (vm.envOr("LAUNCH_ACTIVE", false)) {
-            require(block.chainid != 1, "LAUNCH_ACTIVE is for test networks only");
+            require(!_isMainnet(), "LAUNCH_ACTIVE is for test networks only");
             p.gnotLimits = p.activationLimits;
         }
         p.quarantineSeconds = _u64(vm.envOr("QUARANTINE_SECONDS", uint256(7 days)), "QUARANTINE_SECONDS");
@@ -208,7 +209,7 @@ contract DeployGnoIBC is Script {
             holdPeriod: _u64(vm.envOr("RECOVERY_HOLD_PERIOD", uint256(14 days)), "RECOVERY_HOLD_PERIOD")
         });
         // the recovery launches enabled on mainnet (ADR §13); a test network may still deploy without it
-        require(block.chainid != 1 || p.recovery.delay != 0, "RECOVERY_DELAY: the recovery launches enabled on mainnet");
+        require(!_isMainnet() || p.recovery.delay != 0, "RECOVERY_DELAY: the recovery launches enabled on mainnet");
         // an enabled recovery's public delay is long (IBCAdmin refuses less, too)
         require(
             p.recovery.delay == 0 || p.recovery.delay >= 30 days, "RECOVERY_DELAY: zero (disabled) or 30 days or more"
@@ -225,6 +226,20 @@ contract DeployGnoIBC is Script {
     /// delivery and the epoch-notice acks too, and the only repair (a kind 8 grant) arrives over that very
     /// delivery: a lost relayer key would lock governance out for good. A restricted deployment is for testing only,
     /// and needs ALLOW_RESTRICTED_RELAYING=true.
+    /// @notice Arc's mainnet chain id; its testnet is 5042002 and its devnet 5042001 (arc-node
+    /// crates/shared/src/chain_ids.rs).
+    uint256 internal constant ARC_MAINNET = 5042;
+
+    /// @notice Whether this is a production chain: Ethereum or Arc mainnet, where the testing switches are refused.
+    function _isMainnet() internal view returns (bool) {
+        return block.chainid == 1 || block.chainid == ARC_MAINNET;
+    }
+
+    /// @notice Whether this is an Arc network, whose gno-side client is an Arc light client ("arc-N").
+    function _isArc() internal view returns (bool) {
+        return block.chainid == ARC_MAINNET || block.chainid == 5_042_001 || block.chainid == 5_042_002;
+    }
+
     function _checkRelaying(address relayer, bool allowRestricted) internal pure {
         require(
             relayer == address(0) || allowRestricted,
