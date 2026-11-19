@@ -157,7 +157,7 @@ func Test%[1]s(t *testing.T) {
 
 	if proofErr == nil {
 		fmt.Fprintf(&b, `
-	err := c.VerifyNonMembershipProof(types.NewHeight(0, %d), %s,
+	err := c.VerifyNonMembership(types.NewHeight(0, %d), %s.Encode(),
 		types.MerklePath{KeyPath: [][]byte{[]byte(%q)}})
 	if err != nil {
 		t.Fatal(err)

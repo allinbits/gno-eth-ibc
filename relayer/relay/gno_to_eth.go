@@ -21,7 +21,7 @@ import (
 // AckRelayer takes acknowledgements written on Ethereum back to gno.land
 // (core.Acknowledgement). Proving them on gno needs gno's Ethereum light
 // client to have a consensus state covering the EVM block, i.e. a beacon
-// chain; see GnoAckSubmitter.
+// chain; see EthToGno.RelayAck, or SkipAcks where there is none.
 type AckRelayer interface {
 	RelayAck(ctx context.Context, w WrittenAck) error
 }
