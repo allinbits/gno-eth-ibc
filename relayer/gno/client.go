@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gnolang/gno/gno.land/pkg/gnoclient"
@@ -193,19 +194,57 @@ func checkTx(res *ctypes.ResultBroadcastTxCommit, err error) (*ctypes.ResultBroa
 
 // Run submits a MsgRun of a single-file main package.
 func (c *Client) Run(cfg TxConfig, source string, send std.Coins) (*ctypes.ResultBroadcastTxCommit, error) {
-	b, err := c.base(cfg)
-	if err != nil {
-		return nil, err
-	}
 	msg := vm.NewMsgRun(c.signer, send, []*std.MemFile{{Name: "main.gno", Body: source}})
-	return checkTx(c.tx.Run(b, msg))
+	return retrySequence(sequenceAttempts, sequenceWait, func() (*ctypes.ResultBroadcastTxCommit, error) {
+		b, err := c.base(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return checkTx(c.tx.Run(b, msg))
+	})
 }
 
 // Call submits a MsgCall.
 func (c *Client) Call(cfg TxConfig, pkgPath, fn string, send std.Coins, args ...string) (*ctypes.ResultBroadcastTxCommit, error) {
-	b, err := c.base(cfg)
-	if err != nil {
-		return nil, err
+	return retrySequence(sequenceAttempts, sequenceWait, func() (*ctypes.ResultBroadcastTxCommit, error) {
+		b, err := c.base(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return checkTx(c.tx.Call(b, vm.MsgCall{Caller: c.signer, Send: send, PkgPath: pkgPath, Func: fn, Args: args}))
+	})
+}
+
+// Two relayers signing with one key (relay-arc and relay -arc both do) can
+// sign with the same account sequence: the second transaction then fails
+// its signature check (the sequence is signed), which changes no state, or,
+// when both built the same message (one update of the same snapshot), is
+// byte-identical to the pending first and refused as already in the
+// mempool's cache. Either way it is signed again with the account's sequence
+// read afresh, after a pause that lets the other transaction commit; a
+// rebuilt update then fails if the other moved the client, and the Arc
+// relayer retries it from the new trusted state.
+const (
+	sequenceAttempts = 5
+	sequenceWait     = 2 * time.Second
+	sequenceConflict = "verify correct account, sequence, and chain-id"
+	duplicateTx      = "Tx already exists in cache" // tm2 mempool.ErrTxInCache
+)
+
+// retrySequence runs submit until it succeeds, fails otherwise than by a
+// sequence conflict or a duplicate of a pending transaction, or has run
+// attempts times.
+func retrySequence(attempts int, wait time.Duration, submit func() (*ctypes.ResultBroadcastTxCommit, error)) (*ctypes.ResultBroadcastTxCommit, error) {
+	var res *ctypes.ResultBroadcastTxCommit
+	var err error
+	for i := 1; i <= attempts; i++ {
+		res, err = submit()
+		if err == nil || !(strings.Contains(err.Error(), sequenceConflict) || strings.Contains(err.Error(), duplicateTx)) {
+			return res, err
+		}
+		if i < attempts {
+			time.Sleep(wait)
+		}
 	}
-	return checkTx(c.tx.Call(b, vm.MsgCall{Caller: c.signer, Send: send, PkgPath: pkgPath, Func: fn, Args: args}))
+	return res, err
 }

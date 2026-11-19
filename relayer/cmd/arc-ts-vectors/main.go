@@ -103,12 +103,13 @@ func main() {
 		TrustNumerator: 1, TrustDenominator: 3,
 		Router:         common.HexToAddress("0x00000000000000000000000000000000000000aa"),
 		CommitmentSlot: common.BytesToHash(ethgno.IBCStoreCommitmentSlot),
+		Registry:       arc.TestnetRegistry,
 	}
 
 	ids := []common.Hash{common.HexToHash("0x01"), common.HexToHash("0x2a"), common.BytesToHash(fill(32, 0xc0))}
 	registrations := map[string][]string{}
 	for _, id := range ids {
-		registrations[id.Hex()] = hashesHex(arc.RegistrationKeys(id))
+		registrations[id.Hex()] = hashesHex(arc.TestnetRegistry.RegistrationKeys(id))
 	}
 
 	path := []byte("client-0\x01\x00\x00\x00\x00\x00\x00\x00\x07")
@@ -141,8 +142,8 @@ func main() {
 			"expected": hex.EncodeToString(arc.EncodeCreation(params, withSet)),
 		},
 		"slots": map[string]any{
-			"setSlot":       arc.SetSlot().Hex(),
-			"setKeys3":      hashesHex(arc.SetKeys(3)),
+			"setSlot":       arc.TestnetRegistry.SetSlot().Hex(),
+			"setKeys3":      hashesHex(arc.TestnetRegistry.SetKeys(3)),
 			"registrations": registrations,
 		},
 		"routerProof": map[string]any{

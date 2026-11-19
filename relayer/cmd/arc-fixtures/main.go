@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s0, err := c.LatestSnapshot(ctx, common.Hash{}, common.Address{}, nil)
+	s0, err := c.LatestSnapshot(ctx, arc.TestnetRegistry, common.Hash{}, common.Address{}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func main() {
 	time.Sleep(*gap)
 	// common.Hash{} as the known root: include the set, which the test
 	// can use or ignore.
-	s1, err := c.LatestSnapshot(ctx, common.Hash{}, common.Address{}, nil)
+	s1, err := c.LatestSnapshot(ctx, arc.TestnetRegistry, common.Hash{}, common.Address{}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,6 +63,7 @@ func main() {
 		TrustNumerator: 1, TrustDenominator: 3,
 		Router:         common.HexToAddress("0x00000000000000000000000000000000000000aa"),
 		CommitmentSlot: common.Hash{},
+		Registry:       arc.TestnetRegistry,
 	}
 	creation := arc.EncodeCreation(p, s0)
 	header := arc.EncodeHeader(s0.Number, cert, certRLP, s1)
