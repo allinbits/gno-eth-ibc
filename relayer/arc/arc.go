@@ -26,7 +26,7 @@ import (
 
 // Testnet defaults.
 const (
-	TestnetChainID   = 5042002
+	TestnetChainID = 5042002
 	// TestnetCertRPC serves arc_getCertificate (the official RPC, which does
 	// not serve eth_getProof); TestnetProofRPC serves eth_getProof at the
 	// latest block (drpc, which has no certificates). blockdaemon serves
