@@ -15,7 +15,7 @@ IBCAdmin (gno-realms ADR 0007, allinbits/gno-realms#100).
 
 The design of the gno.land client, with what was verified in Arc's source and
 on the testnet, is gno-realms
-[`docs/adrs/0006-arc-light-client.md`](https://github.com/allinbits/gno-realms/blob/feat/arc-light-client/docs/adrs/0006-arc-light-client.md).
+[`docs/adrs/0008-arc-light-client.md`](https://github.com/allinbits/gno-realms/blob/feat/arc-light-client/docs/adrs/0008-arc-light-client.md).
 In short: an update proves a block B from its own state (the registry's
 validator set, by storage proofs) and certifies it with the Malachite
 commit certificate of B+1, whose Ed25519 precommits sign an SSZ vote over
@@ -31,7 +31,7 @@ Ethereum.
 | Arc devnet | 5042001 | |
 
 Arc's public nodes serve `eth_getProof` at the latest block only, which is
-why the client is shaped the way it is (ADR 0006, "Why B and not C"). No one
+why the client is shaped the way it is (ADR 0008, "Why B and not C"). No one
 public endpoint serves everything well:
 
 - the official `rpc.testnet.arc.io` serves `arc_getCertificate`, but not
