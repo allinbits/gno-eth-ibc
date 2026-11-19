@@ -75,6 +75,25 @@ func (r *GnoToEth) RelayRange(ctx context.Context, from, to int64) ([]Relayed, e
 		}
 		q = sent[len(sent)-1].Height
 	}
+	// A packet gno already settled (acknowledged or timed out, which deletes
+	// its commitment) was relayed by an earlier run: skip it, and pay for no
+	// update when nothing is left.
+	pending := sent[:0:0]
+	for _, sp := range sent {
+		open, err := r.committed(ctx, sp.Packet, q)
+		if err != nil {
+			return nil, err
+		}
+		if !open {
+			r.log().Info("packet already settled on gno", "client", sp.Packet.SourceClient, "sequence", sp.Packet.Sequence)
+			continue
+		}
+		pending = append(pending, sp)
+	}
+	sent = pending
+	if len(sent) == 0 {
+		return nil, nil
+	}
 	update, err := r.UpdateClient(ctx, q+1)
 	if err != nil {
 		return nil, err
@@ -91,6 +110,15 @@ func (r *GnoToEth) RelayRange(ctx context.Context, from, to int64) ([]Relayed, e
 		out = append(out, rel)
 	}
 	return out, nil
+}
+
+// committed reports whether gno still holds p's commitment at height q.
+func (r *GnoToEth) committed(ctx context.Context, p ibc.Packet, q int64) (bool, error) {
+	v, _, err := r.Gno.ProveKey(ctx, gno.PacketCommitmentKey(p.SourceClient, p.Sequence), q)
+	if err != nil {
+		return false, err
+	}
+	return len(v) > 0, nil
 }
 
 // UpdateClient brings GnoLightClient to gno height target (no-op if it is

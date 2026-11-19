@@ -29,3 +29,23 @@ func TestSlotAdd(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// Every registry slot the relayer proves follows the registry's storage
+// location, and the creation message names the registry it is given.
+func TestRegistryLocation(t *testing.T) {
+	moved := Registry{Address: RegistryAddress, StorageLocation: common.HexToHash("0x01")}
+	if moved.SetSlot() != common.HexToHash("0x02") || TestnetRegistry.SetSlot() != slotAdd(RegistryStorageLocation, 1) {
+		t.Fatal("set slot does not follow the storage location")
+	}
+	id := common.HexToHash("0x2a")
+	if moved.RegistrationKeys(id)[0] == TestnetRegistry.RegistrationKeys(id)[0] {
+		t.Fatal("registration slots do not follow the storage location")
+	}
+	msg := EncodeCreation(ClientParams{Registry: moved}, Snapshot{})
+	// Five 8-byte uints, then the address blob and the location blob, each
+	// a one-byte length then the bytes.
+	off := 5*8 + 1 + 20 + 1
+	if got := common.BytesToHash(msg[off : off+32]); got != moved.StorageLocation {
+		t.Fatalf("creation names storage location %s", got)
+	}
+}

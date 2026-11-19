@@ -11,7 +11,7 @@ IBCAdmin (gno-realms ADR 0007, allinbits/gno-realms#100).
 |---|---|---|
 | Arc | solidity-ibc-eureka's ICS26 router, the ICS20 fork, `GnoLightClient.sol`, IBCAdmin | nothing in `contracts/src`; `DeployGnoIBC.s.sol` knows Arc's chain ids |
 | gno.land | the Arc light client, `gno.land/p/aib/ibc/lightclient/arc/v0` (allinbits/gno-realms#98, `feat/arc-light-client`) | new client; core, transfer and ibcgov treat `arc` as a router client like `ethereum` |
-| relayer | `relayer/arc`, `relay/arc_to_gno.go`, `cmd/relayer` `gno-create-arc-client`, `gno-update-arc-client`, `relay-arc`; the TypeScript relayer (ibc-v2-ts-relayer) also relays Arc | gno → Arc uses the EVM path unchanged (`relay`, `relay-gno-acks`) |
+| relayer | `relayer/arc`, `relay/arc_to_gno.go`, `cmd/relayer` `gno-create-arc-client`, `gno-update-arc-client`, `relay-arc`; the TypeScript relayer (ibc-v2-ts-relayer) also relays Arc | gno → Arc uses the EVM path (`relay`, `relay-gno-acks`); `relay -arc` relays Arc's acknowledgements back through gno's Arc client |
 
 The design of the gno.land client, with what was verified in Arc's source and
 on the testnet, is gno-realms
@@ -63,8 +63,30 @@ Then, on gno.land (the gno-realms `feat/arc-light-client` realms deployed):
 relayer gno-create-arc-client -deployment contracts/deployments/5042002.json
 relayer gno-register-counterparty ...            # the router's client id, as for Ethereum
 relayer relay-arc -deployment contracts/deployments/5042002.json -follow   # Arc -> gno
-relayer relay -deployment contracts/deployments/5042002.json -follow       # gno -> Arc
+relayer relay -deployment contracts/deployments/5042002.json -arc -follow  # gno -> Arc, and Arc's acks back
 ```
+
+`relay -arc` proves Arc's acknowledgements at the latest block, as
+`relay-arc` does, so `-proof-rpc` (default `-eth-rpc`) must serve
+`eth_getProof` there; `-arc-cert-rpc` serves the certificates. Without
+`-arc`, acknowledgements written on Arc are not relayed, and gno.land's
+packets stay pending.
+
+Both directions resume after a restart. `relay-arc` skips a packet gno.land
+already received; if Arc still holds its commitment, gno.land's
+acknowledgement of that earlier receive is logged as not relayed, and
+`relay-gno-acks` over the gno.land heights of that receive relays it. An ack
+gno.land already processed is skipped before any client update, and `relay`
+skips the packets gno.land already settled (acknowledged or timed out).
+`relay-arc` and `relay -arc` both update gno.land's Arc client; an update
+the other moved first is refused (it must build on the latest trusted
+height) and retried from the new trusted state, up to three times.
+
+The relayer reads the registry address and storage location from gno.land's
+client state, so it keeps proving the right slots after a recovery that
+moved the storage location. `gno-create-arc-client` takes them as
+`-registry` and `-registry-storage-location` (default: Arc testnet's), for
+creating a substitute.
 
 ## Fixtures
 

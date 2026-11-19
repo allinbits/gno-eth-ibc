@@ -31,6 +31,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 
+	"github.com/gnolang/gno-eth-ibc/relayer/arc"
 	"github.com/gnolang/gno-eth-ibc/relayer/beacon"
 	"github.com/gnolang/gno-eth-ibc/relayer/eth"
 	"github.com/gnolang/gno-eth-ibc/relayer/ethgno"
@@ -215,8 +216,13 @@ func cmdRelay(ctx context.Context, args []string) error {
 	follow := fs.Bool("follow", false, "keep relaying new blocks")
 	out := fs.String("out", "", "write a JSON summary of the relayed packets")
 	beaconURL := fs.String("beacon", "", "beacon node API; when set, acks written on the EVM chain are relayed back to gno")
-	proofRPC := fs.String("proof-rpc", "", "EVM RPC serving eth_getProof at finalized blocks (default: -eth-rpc)")
+	proofRPC := fs.String("proof-rpc", "", "EVM RPC serving eth_getProof at finalized blocks (default: -eth-rpc); with -arc, at the latest block")
+	arcAcks := fs.Bool("arc", false, "the EVM chain is Arc: relay the acks it writes back to gno through gno's Arc light client (-gno-client)")
+	arcCertRPC := fs.String("arc-cert-rpc", arc.TestnetCertRPC, "with -arc, the Arc RPC serving arc_getCertificate")
 	_ = fs.Parse(args)
+	if *arcAcks && *beaconURL != "" {
+		return errors.New("-arc and -beacon are exclusive: Arc has no beacon chain")
+	}
 
 	dep, err := eth.LoadDeployment(*depFile)
 	if err != nil {
@@ -228,7 +234,7 @@ func cmdRelay(ctx context.Context, args []string) error {
 	if *fromBlock != 0 {
 		dep.DeployBlock = *fromBlock
 	}
-	g, err := dialGno(ctx, *gnoRPC, *beaconURL != "")
+	g, err := dialGno(ctx, *gnoRPC, *beaconURL != "" || *arcAcks)
 	if err != nil {
 		return err
 	}
@@ -243,6 +249,17 @@ func cmdRelay(ctx context.Context, args []string) error {
 			return err
 		}
 		acks = e2g
+	}
+	if *arcAcks {
+		proofURL := *proofRPC
+		if proofURL == "" {
+			proofURL = *ethRPC
+		}
+		a, err := arc.Dial(ctx, *arcCertRPC, proofURL)
+		if err != nil {
+			return err
+		}
+		acks = &relay.ArcToGno{Gno: g, Arc: a, Eth: e, GnoClientID: *gnoClient, Tx: gno.EthClientTx, Log: slog.Default()}
 	}
 	r := &relay.GnoToEth{Gno: g, Eth: e, GnoClientID: *gnoClient, Ack: acks}
 

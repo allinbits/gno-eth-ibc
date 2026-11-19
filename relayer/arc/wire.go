@@ -15,6 +15,10 @@ type ClientParams struct {
 	TrustDenominator uint64
 	Router           common.Address
 	CommitmentSlot   common.Hash
+	// Registry is the ValidatorRegistry the client reads (TestnetRegistry
+	// on Arc testnet; a substitute for a recovery may name another storage
+	// location).
+	Registry Registry
 }
 
 // EncodeCreation is the wire creation message of the gno.land Arc client
@@ -23,7 +27,7 @@ type ClientParams struct {
 func EncodeCreation(p ClientParams, s Snapshot) []byte {
 	w := &ethgno.Writer{}
 	w.Uint(p.ChainID).Uint(p.TrustingPeriod).Uint(p.MaxClockDrift).Uint(p.TrustNumerator).Uint(p.TrustDenominator)
-	w.Blob(RegistryAddress[:]).Blob(RegistryStorageLocation[:]).Blob(p.Router[:]).Blob(p.CommitmentSlot[:])
+	w.Blob(p.Registry.Address[:]).Blob(p.Registry.StorageLocation[:]).Blob(p.Router[:]).Blob(p.CommitmentSlot[:])
 	w.Blob(s.HeaderRLP).Blobs(s.Registry.AccountProof).Blobs(s.Registry.Nodes)
 	return w.Bytes()
 }
