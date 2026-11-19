@@ -2,17 +2,20 @@
 
 [Arc](https://github.com/circlefin/arc-node) is Circle's EVM L1, with
 Malachite (Tendermint BFT) consensus, Reth execution and USDC as gas. This
-branch (`feat/arc-ibc`) runs the gno.land ⇄ Ethereum stack against Arc.
+branch (`feat/arc-ibc`) runs the gno.land ⇄ Ethereum stack against Arc. A
+gno.land chain can run an Arc route beside its Ethereum route: ibcgov governs
+one route per counterparty chain, each with its own governance channel and
+IBCAdmin (gno-realms ADR 0007, allinbits/gno-realms#100).
 
 | Side | What runs | Changed for Arc |
 |---|---|---|
 | Arc | solidity-ibc-eureka's ICS26 router, the ICS20 fork, `GnoLightClient.sol`, IBCAdmin | nothing in `contracts/src`; `DeployGnoIBC.s.sol` knows Arc's chain ids |
-| gno.land | the Arc light client, `gno.land/p/aib/ibc/lightclient/arc/v0` in allinbits/gno-realms `feat/arc-ibc` | new client; core, transfer and ibcgov treat `arc` as a router client like `ethereum` |
-| relayer | `relayer/arc`, `relay/arc_to_gno.go`, `cmd/relayer` `gno-create-arc-client`, `gno-update-arc-client`, `relay-arc` | gno → Arc uses the EVM path unchanged (`relay`, `relay-gno-acks`) |
+| gno.land | the Arc light client, `gno.land/p/aib/ibc/lightclient/arc/v0` (allinbits/gno-realms#98, `feat/arc-light-client`) | new client; core, transfer and ibcgov treat `arc` as a router client like `ethereum` |
+| relayer | `relayer/arc`, `relay/arc_to_gno.go`, `cmd/relayer` `gno-create-arc-client`, `gno-update-arc-client`, `relay-arc`; the TypeScript relayer (ibc-v2-ts-relayer) also relays Arc | gno → Arc uses the EVM path unchanged (`relay`, `relay-gno-acks`) |
 
 The design of the gno.land client, with what was verified in Arc's source and
 on the testnet, is gno-realms
-[`docs/adrs/0005-arc-light-client.md`](https://github.com/allinbits/gno-realms/blob/feat/arc-ibc/docs/adrs/0005-arc-light-client.md).
+[`docs/adrs/0006-arc-light-client.md`](https://github.com/allinbits/gno-realms/blob/feat/arc-light-client/docs/adrs/0006-arc-light-client.md).
 In short: an update proves a block B from its own state (the registry's
 validator set, by storage proofs) and certifies it with the Malachite
 commit certificate of B+1, whose Ed25519 precommits sign an SSZ vote over
@@ -28,7 +31,7 @@ Ethereum.
 | Arc devnet | 5042001 | |
 
 Arc's public nodes serve `eth_getProof` at the latest block only, which is
-why the client is shaped the way it is (ADR 0005, "Why B and not C"). No one
+why the client is shaped the way it is (ADR 0006, "Why B and not C"). No one
 public endpoint serves everything well:
 
 - the official `rpc.testnet.arc.io` serves `arc_getCertificate`, but not
@@ -51,11 +54,10 @@ RPC; `-arc-rpc`, default drpc); deploy with the official RPC.
   recovery launches enabled.
 - Gas is paid in USDC: fund the deployer from Circle's testnet faucet.
 - `PERMIT2`: leave unset unless Permit2 is deployed on the network.
-- On the testnet use `LAUNCH_ACTIVE=true`: gno.land's governance channel
-  binds Ethereum's IBCAdmin only (ADR 0005, "Not yet done"), so the Arc
-  route cannot be activated by a gno.land decision yet.
+- On test networks `LAUNCH_ACTIVE=true` works as on Sepolia; otherwise
+  the route is activated by gno.land's kind 4, as on Ethereum.
 
-Then, on gno.land (the gno-realms `feat/arc-ibc` realms deployed):
+Then, on gno.land (the gno-realms `feat/arc-light-client` realms deployed):
 
 ```sh
 relayer gno-create-arc-client -deployment contracts/deployments/5042002.json
@@ -70,10 +72,11 @@ relayer relay -deployment contracts/deployments/5042002.json -follow       # gno
 live testnet into gno-realms `gno.land/p/aib/ibc/lightclient/arc/testing/v0/testnet.gno`,
 which the client's unit tests and the `ethrelay` filetest replay.
 
-## Not done
+## Testnet
 
-- A packet round trip on the testnet: no ICS26 router is deployed on Arc
-  yet (needs a funded deployer).
-- The Arc governance channel (IBCAdmin on Arc receiving gno.land decisions).
-- A Solidity-side change: none was needed, so the Foundry suite is the
-  Ethereum one.
+On 2026-11-03 a separate gno.land chain, `test-arc-1`, ran a route to Arc
+testnet: the contracts deployed with this script, the governance launch done
+over the channel bound to `arc-1` (Arc's IBCAdmin recorded gno.land's
+decisions), GNOT sent gno → Arc and acknowledged, and a test ERC20 sent
+Arc → gno and claimed. No Solidity change was needed, so the Foundry suite is
+the Ethereum one.
