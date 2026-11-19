@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import { ReentrancyGuardTransient } from "@openzeppelin-contracts/utils/ReentrancyGuardTransient.sol";
+import { AccessManagedUpgradeable } from "@openzeppelin-upgradeable/access/manager/AccessManagedUpgradeable.sol";
+
+import { IIBCStore } from "@eureka/interfaces/IIBCStore.sol";
+import { IICS02Client } from "@eureka/interfaces/IICS02Client.sol";
+import { ILightClient } from "@eureka/interfaces/ILightClient.sol";
+import { ILightClientMsgs } from "@eureka/msgs/ILightClientMsgs.sol";
+import { IGnoLightClientStatus } from "../interfaces/IGnoLightClientStatus.sol";
+import { IIBCSenderCallbacks } from "@eureka/interfaces/IIBCSenderCallbacks.sol";
+import { IIBCAppCallbacks } from "@eureka/msgs/IIBCAppCallbacks.sol";
+import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS20TransferMsgs } from "@eureka/msgs/IICS20TransferMsgs.sol";
+import { ICS20Lib } from "@eureka/utils/ICS20Lib.sol";
+import { ICS24Host } from "@eureka/utils/ICS24Host.sol";
+
+import { IGnoICS20ControlsTypes } from "../interfaces/IGnoICS20Controls.sol";
+import { LeakyBucket } from "../lib/LeakyBucket.sol";
+import { GnoTransferStorage } from "./GnoTransferStorage.sol";
+
+/// @title The reconciliation functions of GnoICS20Transfer's controls (ADR pr6375 §5.4 kinds 12 and 13, §7.12,
+/// §7.13)
+/// @notice Runs only by delegatecall, from GnoICS20Controls' fallback (itself delegatecalled by the transfer
+/// proxy), in the proxy's storage and under its AccessManager: parked refunds, settlement by decision and
+/// reopening.
+contract GnoICS20Reconcile is IGnoICS20ControlsTypes, ReentrancyGuardTransient, AccessManagedUpgradeable {
+    address private immutable _self;
+    /// @notice GnoICS20Evidence: the proofs, views and notifications, served by this contract's fallback.
+    address public immutable EVIDENCE;
+    /// @notice The evidence module's code hash when this module was built (see GnoICS20Transfer).
+    bytes32 public immutable EVIDENCE_HASH;
+
+    error NotDelegated();
+
+    constructor(address evidence) {
+        require(evidence.code.length != 0, GnoBadModule());
+        _self = address(this);
+        EVIDENCE = evidence;
+        EVIDENCE_HASH = evidence.codehash;
+    }
+
+    /// @notice Serves the evidence functions from GnoICS20Evidence, in the transfer proxy's storage.
+    // solhint-disable-next-line no-complex-fallback
+    fallback() external {
+        address e = EVIDENCE;
+        require(e.codehash == EVIDENCE_HASH, GnoBadModule());
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let ok := delegatecall(gas(), e, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch ok
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
+    }
+
+    /// @notice The controls version this module implements (kind 7 checks it on the module and through the proxy).
+    function gnoReconcileModuleVersion() external pure returns (uint256) {
+        return 1;
+    }
+
+    /// @notice The address this module recorded as its own at construction (kind 7 requires it to be the module's
+    /// address: a module whose recorded address is another, such as the proxy's, would refuse every delegated call).
+    function gnoSelf() external view returns (address) {
+        return _self;
+    }
+
+    modifier delegated() {
+        if (address(this) == _self) revert NotDelegated();
+        _;
+    }
+
+    function _g() private pure returns (GnoTransferStorage.Layout storage) {
+        return GnoTransferStorage.layout();
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function claimParked(
+        string calldata clientId,
+        uint64 sequence,
+        uint256 gasBudget
+    )
+        external
+        delegated
+        nonReentrant
+        returns (uint256 got)
+    {
+        GnoTransferStorage.Layout storage g = _g();
+        SendRecord storage rec = g.records[keccak256(bytes(clientId))][sequence];
+        require(rec.payment == Payment.Parked, GnoNotParked(clientId, sequence));
+        bytes32 route = GnoTransferStorage.openRoute(clientId);
+        GnoTransferStorage.TokenControls storage t = g.tokens[route][rec.token];
+        uint64 now_ = uint64(block.timestamp);
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        uint256 remaining = GnoTransferStorage.refundable(rec);
+        // a refund kind 12 decided is not metered; one from an ack or timeout is
+        // the meter charged first (checks-effects-interactions); a failed payment reverts it all
+        got = rec.settlement == 1 ? remaining : LeakyBucket.chargeUpTo(t.refunded, t.limits.refundCap, remaining, now_);
+        if (got == 0) return 0;
+        require(
+            GnoTransferStorage.tryPayRefund(rec, got, route, reservedBefore, gasBudget),
+            GnoRefundFailed(clientId, sequence)
+        );
+        emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, got);
+        if (got == remaining) {
+            rec.payment = Payment.Claimed;
+            GnoTransferStorage.closeRecord(rec, keccak256(bytes(clientId)));
+            emit GnoOutcomeRecorded(clientId, sequence, rec.outcome, Payment.Claimed);
+            GnoTransferStorage.releaseNotice(clientId, sequence);
+        }
+        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+    }
+
+    // -------------------------------------------------------------------------------------- reconciliation --
+
+    /// @notice See IGnoICS20Controls.
+    function settleRecords(
+        string calldata clientId,
+        SettleItem[] calldata items
+    )
+        external
+        delegated
+        restricted
+        nonReentrant
+    {
+        GnoTransferStorage.Layout storage g = _g();
+        require(g.retired[clientId], GnoBadSettlement(type(uint256).max));
+        bytes32 clientHash = keccak256(bytes(clientId));
+        bytes32 route = GnoTransferStorage.routeHash(clientId);
+        // sealed while its incident reopens: the records kind 13 found settled never change behind it
+        uint32 inc = g.clients[clientHash].incident;
+        require(
+            inc != 0 && GnoTransferStorage.incidentStatus(g.routes[route], inc - 1) != GnoTransferStorage.REOPENING,
+            GnoRouteReopening(clientId)
+        );
+        // an outcome counts only while the client that proved it is still the route's active replacement, under
+        // the same generation; checked again for every outcome consumed and after the last payment, since a
+        // payment runs token code that could freeze or swap it (any change rolls the whole batch back)
+        address active = GnoTransferStorage.activeClient(clientId);
+        uint64 gen = g.routes[route].verifierGen;
+        // two passes. The first validates and settles every item, and owes every refund (action 1) its whole unpaid
+        // remainder, so each one's reservation is restored, a refund a forged success ack hid included. The second
+        // pays the refunds, each against the batch's complete reservations, whatever the items' order: a payment
+        // never takes the backing of another refund of the same batch
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].action == 5) _bookForgedReceive(g, route, clientHash, clientId, items[i], i);
+            else _settleRecord(g, route, clientHash, clientId, items[i], i, active, gen);
+        }
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].action == 1) _payOwed(g, route, clientHash, clientId, items[i].sequence);
+        }
+        require(
+            GnoTransferStorage.activeClient(clientId) == active && g.routes[route].verifierGen == gen,
+            GnoBadSettlement(type(uint256).max)
+        );
+    }
+
+    /// @notice One kind 12 item on a send record (actions 1 to 4).
+    function _settleRecord(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        bytes32 clientHash,
+        string calldata clientId,
+        SettleItem calldata it,
+        uint256 i,
+        address active,
+        uint64 gen
+    )
+        private
+    {
+        SendRecord storage rec = g.records[clientHash][it.sequence];
+        // a record (written by the send), settled at most once
+        require(
+            rec.commitment != bytes32(0) && rec.settlement == 0 && active != address(0) && rec.provenBy == active
+                && rec.provenGen == gen && GnoTransferStorage.activeClient(clientId) == active
+                && g.routes[route].verifierGen == gen,
+            GnoBadSettlement(i)
+        );
+        // a record processed in the suspected compromise interval: one fewer to settle
+        GnoTransferStorage.ClientRecon storage c = g.clients[clientHash];
+        if (rec.processedBlock != 0 && rec.processedIndex >= c.suspectStart) {
+            bool had = GnoTransferStorage.hasWork(c);
+            --c.suspectOpen;
+            GnoTransferStorage.noteWork(c, had);
+        }
+        uint8 action = it.action;
+        // the transport's notification already delivered to the sender (before any drop below): it stays final
+        bool delivered = g.noticeDone[clientHash][it.sequence];
+        bool owed = rec.payment == Payment.Queued || rec.payment == Payment.Parked;
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        if (action == 1) {
+            // a genuine refund: its whole remainder, never cut short (ADR §7.9); zero when it was already paid in
+            // full, which only settles the record
+            uint256 left = rec.amount - rec.refunded;
+            // proven not delivered: an error ack, never receivable, or another packet at its sequence
+            require(
+                it.amount == left && (rec.proven == Proven.Refundable || rec.proven == Proven.Collision),
+                GnoBadSettlement(i)
+            );
+            rec.settlement = 1;
+            // owed, and reserved, before any payment of the batch (paid in the second pass)
+            if (left != 0) rec.payment = Payment.Parked;
+        } else if (action == 2 || action == 3) {
+            // a refund already (partly) paid can only be settled as forged (action 4, which books the loss) or
+            // genuine (action 1)
+            require((action == 3 || owed) && rec.refunded == 0 && rec.proven == Proven.Delivered, GnoBadSettlement(i));
+            rec.settlement = action;
+            if (owed) _reject(rec, clientId, it.sequence);
+        } else if (action == 4) {
+            // a forged refund (of a packet that was delivered): its unpaid remainder is rejected and what was
+            // already paid is the loss, at once
+            require(
+                (rec.outcome == Outcome.ErrorAck || rec.outcome == Outcome.Timeout) && it.amount == rec.refunded
+                    && rec.proven == Proven.Delivered,
+                GnoBadSettlement(i)
+            );
+            rec.settlement = 4;
+            if (owed) _reject(rec, clientId, it.sequence);
+            if (it.amount != 0) _bookLoss(g, route, clientId, rec.token, it.sequence, it.amount, OUTBOUND);
+        } else {
+            revert GnoBadSettlement(i);
+        }
+        // one terminal notification per record: a settlement deciding another kind than the transport's
+        // supersedes the transport's (never delivered after); `notifySettled` delivers the settlement's
+        (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+        if (transport != terminal && delivered) {
+            // a delivered transport callback is final: no second, contradictory terminal callback ever follows
+            // (`notifySettled` refuses); the settlement is reported by GnoSettled alone, once
+            g.settledNoticeDone[clientHash][it.sequence] = true;
+        } else if (transport != terminal) {
+            if (transport != 0) GnoTransferStorage.dropNotice(clientId, it.sequence);
+            // a refund settled with nothing left to pay is due now; one still owed, once paid
+            if (terminal == 1 || (action == 1 && rec.refunded == rec.amount)) {
+                emit GnoNotificationDue(clientId, it.sequence);
+            }
+        }
+        GnoTransferStorage.closeRecord(rec, clientHash);
+        GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+        emit GnoSettled(clientId, it.sequence, action, it.amount);
+    }
+
+    /// @notice The gas a replacement gives the failing verifier's `lastTransition()` view.
+    uint256 internal constant PROBE_GAS = 100_000;
+
+    /// @notice See IGnoICS20Controls.
+    function checkpointForReplacement(string calldata clientId) external delegated restricted nonReentrant {
+        GnoTransferStorage.Layout storage g = _g();
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        GnoTransferStorage.Route storage r = g.routes[keccak256(bytes(key))];
+        string memory current = GnoTransferStorage.currentClient(key);
+        // the route's current verifier and its last transition, if it answers exactly (two uint64 words)
+        (bool ok, bytes memory ret) =
+            GnoTransferStorage.ics20Router().staticcall(abi.encodeCall(IICS02Client.getClient, (current)));
+        address lc = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
+        // the failing verifier's view, isolated: a fixed gas cap (PROBE_GAS: a GnoLightClient answers with two
+        // storage reads, a few thousand gas; the cap leaves the replacement's frame almost whole whatever the view
+        // burns) and only the first 64 bytes of its answer copied, never more
+        uint256 id;
+        uint256 time;
+        uint256 size;
+        ok = false;
+        if (lc != address(0)) {
+            bytes4 sel = IGnoLightClientStatus.lastTransition.selector;
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                let p := mload(0x40)
+                mstore(p, sel)
+                ok := staticcall(PROBE_GAS, lc, p, 4, p, 64)
+                size := returndatasize()
+                id := mload(p)
+                time := mload(add(p, 32))
+            }
+        }
+        ok = ok && size == 64 && id <= type(uint64).max && time <= type(uint64).max;
+        uint256 until;
+        if (ok) {
+            until = GnoTransferStorage.quarantineUntil(r, lc, uint64(id), uint64(time));
+            (r.seenClient, r.seenTransition) = (lc, uint64(id));
+        }
+        if (!ok) {
+            // the failed verifier cannot say when it last transitioned: assume it just did
+            until = r.quarantineDeadline;
+            uint256 fresh = block.timestamp + r.quarantineSeconds;
+            if (fresh > until) until = fresh;
+        }
+        r.quarantineDeadline = until > type(uint64).max ? type(uint64).max : uint64(until);
+        // outcomes proven through the old verifier are void
+        ++r.verifierGen;
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function prepareIncident(string calldata clientId, uint256 n) external delegated nonReentrant returns (uint256) {
+        GnoTransferStorage.Layout storage g = _g();
+        bytes32 clientHash = keccak256(bytes(clientId));
+        GnoTransferStorage.ClientRecon storage c = g.clients[clientHash];
+        uint256 end = c.processed.length;
+        uint256 i = c.prepCursor;
+        if (c.incident == 0 || c.prepared) return 0;
+        bytes32 route = c.route;
+        for (uint256 stop = i + n < end ? i + n : end; i < stop; i++) {
+            SendRecord storage rec = g.records[clientHash][c.processedSeq[i]];
+            // every unsettled success of the suspect interval: a potential refund, held until settled
+            if (rec.settlement == 0 && rec.outcome == Outcome.Success && !rec.held) {
+                uint256 before = GnoTransferStorage.reservation(rec);
+                rec.held = true;
+                GnoTransferStorage.syncReserve(route, rec, before);
+            }
+        }
+        c.prepCursor = uint64(i);
+        if (i == end) {
+            c.prepared = true;
+            --g.routes[route].unprepared;
+            emit GnoIncidentPrepared(clientId);
+        }
+        return end - i;
+    }
+
+    /// @notice Kind 12's second pass: pays a refund action 1 owed, against the batch's complete reservations; one
+    /// that cannot be paid now stays parked (owed, reserved) for `claimParked`.
+    function _payOwed(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        bytes32 clientHash,
+        string calldata clientId,
+        uint64 sequence
+    )
+        private
+    {
+        SendRecord storage rec = g.records[clientHash][sequence];
+        if (rec.payment != Payment.Parked) return; // settled with nothing left to pay
+        // no refund leaves the route's escrow until every incident's suspect successes are reserved
+        if (g.routes[route].unprepared != 0) {
+            emit GnoRefundParked(clientId, sequence, rec.token, rec.amount - rec.refunded);
+            return;
+        }
+        uint256 left = rec.amount - rec.refunded;
+        uint256 reservedBefore = GnoTransferStorage.reservation(rec);
+        if (GnoTransferStorage.tryPayRefund(rec, left, route, reservedBefore, 0)) {
+            rec.payment = Payment.Claimed;
+            emit GnoRefundPaid(clientId, sequence, rec.token, rec.sender, left);
+            // the notification is due: anyone delivers it by retryNotification
+            GnoTransferStorage.releaseNotice(clientId, sequence);
+            (uint8 transport, uint8 terminal) = GnoTransferStorage.noticeKinds(rec);
+            if (transport != terminal && !g.settledNoticeDone[clientHash][sequence]) {
+                emit GnoNotificationDue(clientId, sequence);
+            }
+            GnoTransferStorage.syncReserve(route, rec, reservedBefore);
+        } else {
+            emit GnoRefundParked(clientId, sequence, rec.token, left);
+        }
+    }
+
+    /// @notice Kind 12 action 5: a forged receive at an inbound sequence of the retired client, whose release or
+    /// mint is booked as a loss once, for exactly the amount the receive recorded.
+    function _bookForgedReceive(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        bytes32 clientHash,
+        string calldata clientId,
+        SettleItem calldata it,
+        uint256 i
+    )
+        private
+    {
+        uint256 r = g.receives[clientHash][it.sequence];
+        uint256 amount = r >> 160;
+        require(amount != 0 && amount == it.amount, GnoBadSettlement(i));
+        address token = address(uint160(r));
+        g.receives[clientHash][it.sequence] = uint160(token); // booked: never again
+        _bookLoss(g, route, clientId, token, it.sequence, amount, INBOUND);
+        emit GnoSettled(clientId, it.sequence, 5, amount);
+    }
+
+    /// @notice Books a loss of the route. A loss found after the route reopened closes it again at once: it opens
+    /// only by a new kind 13, which accepts the loss as a deficit (ADR §7.9), never with a loss left unaccepted.
+    function _bookLoss(
+        GnoTransferStorage.Layout storage g,
+        bytes32 route,
+        string calldata clientId,
+        address token,
+        uint64 sequence,
+        uint256 amount,
+        uint8 direction
+    )
+        private
+    {
+        // one canonical identity per packet, whatever the booking path: (client id, sequence, direction)
+        bytes32 id = keccak256(abi.encode(keccak256(bytes(clientId)), sequence, direction));
+        require(!g.lossBooked[id], GnoLossBooked(clientId, sequence, direction));
+        g.lossBooked[id] = true;
+        GnoTransferStorage.Route storage r = g.routes[route];
+        // the loss ledger never changes while a reopening walks it
+        require(!r.reopening, GnoRouteReopening(clientId));
+        if (g.losses[route][token] == 0) r.lossTokens.push(token);
+        g.losses[route][token] += amount;
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        emit GnoLossRecorded(key, token, sequence, amount);
+        if (!r.closed) {
+            // a late loss: an incident of its own, which needs only its loss accepted by a new kind 13
+            r.closed = true;
+            r.incidents.push(Incident(GnoTransferStorage.LATE_LOSS, GnoTransferStorage.OPEN, bytes32(0), 0));
+            emit GnoRouteClosedForLoss(key);
+        }
+    }
+
+    /// @notice A queued or parked refund rejected by reconciliation: never paid, its notification dropped.
+    function _reject(SendRecord storage rec, string calldata clientId, uint64 sequence) private {
+        rec.payment = Payment.Rejected;
+        GnoTransferStorage.dropNotice(clientId, sequence);
+        emit GnoRefundRejected(clientId, sequence);
+    }
+
+    /// @notice A loss's direction: a send's forged refund (action 4), or a forged receive (action 5).
+    uint8 private constant OUTBOUND = 1;
+    uint8 private constant INBOUND = 2;
+
+    /// @notice Deficits accepted per call: kind 13's first batch, and at most this per `continueReopen` call.
+    uint256 private constant REOPEN_BATCH = 16;
+
+    /// @notice See IGnoICS20Controls.
+    function reopenRoute(string calldata clientId) external delegated restricted nonReentrant {
+        // named by the route's current client only (ADR §7.12), never a retired alias
+        require(!_g().retired[clientId], GnoBadRoute());
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
+        require(r.closed && !r.reopening, GnoNotClosed(clientId));
+        // every unresolved incident settled (constant work: the count is kept as records settle): its client's
+        // records reconciled (no outstanding packet, no refund owed, no unsettled suspect record); a late loss needs
+        // only its loss accepted
+        require(r.pendingIncidents == 0, GnoIncidentsPending(clientId, r.pendingIncidents));
+        r.reopening = true;
+        r.reopenUpTo = uint64(r.incidents.length);
+        r.deficitCursor = 0;
+        _acceptDeficits(r, clientId, REOPEN_BATCH);
+    }
+
+    /// @notice See IGnoICS20Controls.
+    function continueReopen(string calldata clientId, uint256 n) external delegated nonReentrant {
+        GnoTransferStorage.Route storage r = GnoTransferStorage.routeFor(clientId);
+        require(r.reopening, GnoNotClosed(clientId));
+        _acceptDeficits(r, clientId, n > REOPEN_BATCH ? REOPEN_BATCH : n);
+    }
+
+    /// @notice Accepts as deficits up to `n` tokens' losses not yet accepted (ADR §7.9: a loss not recapitalized),
+    /// and opens the route when none is left.
+    function _acceptDeficits(GnoTransferStorage.Route storage r, string calldata clientId, uint256 n) private {
+        string memory key = GnoTransferStorage.routeKey(clientId);
+        bytes32 route = keccak256(bytes(key));
+        GnoTransferStorage.Layout storage g = _g();
+        uint256 i = r.deficitCursor;
+        uint256 end = r.lossTokens.length;
+        if (end > i + n) end = i + n;
+        for (; i < end; i++) {
+            address token = r.lossTokens[i];
+            uint256 open_ = g.losses[route][token] - g.acceptedDeficit[route][token];
+            if (open_ != 0) {
+                g.acceptedDeficit[route][token] += open_;
+                emit GnoDeficitAccepted(key, token, open_);
+            }
+        }
+        r.deficitCursor = uint64(i);
+        if (i == r.lossTokens.length) {
+            // every reopening incident again before the route opens: nothing opened or became suspect meanwhile
+            if (r.pendingIncidents != 0) {
+                GnoTransferStorage.abortReopening(r, key);
+                return;
+            }
+            r.resolvedUpTo = r.reopenUpTo;
+            r.reopening = false;
+            r.closed = false;
+            emit GnoRouteReopened(key);
+        }
+    }
+}

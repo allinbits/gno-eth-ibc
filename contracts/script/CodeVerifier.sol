@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import { Script } from "forge-std/Script.sol";
+import { console2 } from "forge-std/console2.sol";
+import { ERC1967Utils } from "@openzeppelin-contracts/proxy/ERC1967/ERC1967Utils.sol";
+import { IIBCAdmin } from "../src/interfaces/IIBCAdmin.sol";
+import { IGnoLightClientMsgs as Msgs } from "../src/msgs/IGnoLightClientMsgs.sol";
+
+interface IAccessManagedLike {
+    function authority() external view returns (address);
+}
+
+interface IRouterLike {
+    function getIBCApp(string calldata portId) external view returns (address);
+    function getClient(string calldata clientId) external view returns (address);
+}
+
+interface IVoucherLike {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+    function ics20() external view returns (address);
+    function fullDenomPath() external view returns (string memory);
+}
+
+interface IBCAdminLike {
+    function deployer() external view returns (address);
+    function exec() external view returns (address, bytes32);
+    function govClient() external view returns (string memory);
+    function gnoChainId() external view returns (string memory);
+    function recoveryConfig() external view returns (IIBCAdmin.RecoveryConfig memory);
+}
+
+/// @notice Checks deployed runtime code against a reproducible build of the named source (ADR §6.12, the T5 watch
+/// tool). No byte of the deployed code is taken on trust: each contract is rebuilt, in the verifier's own simulation,
+/// by running its build's creation code at its own address with the constructor arguments the system's graph calls
+/// for, and the result must equal the deployed code byte for byte. So every immutable is checked against its
+/// constructor relationship: a module's recorded own address (`_self`, UUPS's `__self`) is its address, its bindings
+/// and dependencies are the graph's actual contracts, and every recorded code hash is that dependency's live code
+/// hash. An executor is rebuilt with its creation nonce, so the modules it deploys come out at their recorded
+/// addresses and are compared too. Configuration values with no relationship to check (IBCAdmin's deployer and its
+/// recovery settings) are printed, for comparison with the deployment plan. Every rebuild is rolled back.
+///
+/// Two uses: `verifyLive` checks what runs now, read from the chain (the proxies' live implementation slots, the
+/// beacons' implementations, IBCAdmin's installed executor), never from a deployment file; `verifyPending` checks a
+/// recorded kind 7 or kind 9 decision's candidate before it matures: the decision must be the expected one (its
+/// hash, which the watcher computes from gno.land's envelope), name the expected candidate, pin its code hash, and the
+/// candidate's whole delegate graph must rebuild to its deployed code.
+abstract contract CodeVerifier is Script {
+    uint8 internal constant KIND_VOUCHER = 5;
+    uint8 internal constant KIND_CLIENT = 6;
+    uint8 internal constant KIND_UPGRADE = 7;
+    uint8 internal constant KIND_HANDOVER = 9;
+
+    /// @notice Whether `a`'s code is exactly what `artifact`'s creation code, run at `a` with `args` (by `from`, with
+    /// `a`'s nonce at `nonce` when non-zero), produces. The contracts it creates are compared too: `created` lists
+    /// their addresses, emptied before the rebuild so that it can place them there again. Rolled back.
+    function rebuilds(
+        address a,
+        string memory artifact,
+        bytes memory args,
+        address from,
+        uint64 nonce,
+        address[] memory created
+    )
+        public
+        returns (bool same)
+    {
+        bytes memory live = a.code;
+        if (live.length == 0) return false;
+        bytes[] memory liveCreated = new bytes[](created.length);
+        for (uint256 i = 0; i < created.length; i++) {
+            liveCreated[i] = created[i].code;
+        }
+        uint256 snap = vm.snapshotState();
+        for (uint256 i = 0; i < created.length; i++) {
+            vm.etch(created[i], "");
+            vm.setNonceUnsafe(created[i], 0);
+        }
+        if (nonce != 0) vm.setNonceUnsafe(a, nonce);
+        vm.etch(a, abi.encodePacked(vm.getCode(artifact), args));
+        if (from != address(0)) vm.prank(from);
+        (bool ok, bytes memory runtime) = a.call("");
+        same = ok && keccak256(runtime) == keccak256(live);
+        for (uint256 i = 0; same && i < created.length; i++) {
+            same = keccak256(created[i].code) == keccak256(liveCreated[i]);
+        }
+        vm.revertToState(snap);
+    }
+
+    function _word(address a, string memory sig) internal view returns (address) {
+        (bool ok, bytes memory ret) = a.staticcall(abi.encodeWithSignature(sig));
+        return ok && ret.length >= 32 ? address(uint160(uint256(bytes32(ret)))) : address(0); // its first word
+    }
+
+    function _check(address a, string memory artifact, bytes memory args) internal returns (bool ok) {
+        ok = rebuilds(a, artifact, args, address(0), 0, new address[](0));
+        console2.log(ok ? "ok      " : "MISMATCH", artifact, a);
+    }
+
+    /// @notice The live implementation of an ERC-1967 proxy, read from its slot.
+    function implementationOf(address proxy) public view returns (address) {
+        return address(uint160(uint256(vm.load(proxy, ERC1967Utils.IMPLEMENTATION_SLOT))));
+    }
+
+    /// @notice The transfer app's graph from an implementation: the fork, its controls, reconciliation and evidence,
+    /// each rebuilt with the next one as its dependency.
+    function verifyTransfer(address impl) public returns (bool all) {
+        address controls = _word(impl, "CONTROLS()");
+        address reconcile = _word(controls, "RECONCILE()");
+        address evidence = _word(reconcile, "EVIDENCE()");
+        all = _check(impl, "GnoICS20Transfer.sol:GnoICS20Transfer", abi.encode(controls));
+        all = _check(controls, "GnoICS20Controls.sol:GnoICS20Controls", abi.encode(reconcile)) && all;
+        all = _check(reconcile, "GnoICS20Reconcile.sol:GnoICS20Reconcile", abi.encode(evidence)) && all;
+        all = _check(evidence, "GnoICS20Evidence.sol:GnoICS20Evidence", "") && all;
+    }
+
+    /// @notice An executor bound to `router`, `accessManager` and `ics20`: rebuilt from its creation nonce, with the
+    /// four modules it deploys at the addresses it records.
+    function verifyExec(address exec, address router, address accessManager, address ics20) public returns (bool ok) {
+        address[] memory created = new address[](4);
+        created[0] = _word(exec, "frozenClient()");
+        created[1] = _word(exec, "setupCheck()");
+        created[2] = _word(exec, "checks()");
+        created[3] = _word(exec, "recoveryModule()");
+        ok = rebuilds(
+            exec, "IBCAdminExec.sol:IBCAdminExec", abi.encode(router, accessManager, ics20), address(0), 1, created
+        );
+        console2.log(ok ? "ok      " : "MISMATCH", "IBCAdminExec.sol:IBCAdminExec (and its four modules)", exec);
+    }
+
+    /// @notice The system around IBCAdmin, from the router's own registry: IBCAdmin must be the router's `ibcgov`
+    /// app, the transfer app its `transfer` app, and the access manager the router's authority.
+    function _system(address ibcAdmin) internal view returns (address router, address am, address ics20) {
+        router = _word(ibcAdmin, "router()");
+        require(IRouterLike(router).getIBCApp("ibcgov") == ibcAdmin, "IBCAdmin is not the router's ibcgov app");
+        ics20 = IRouterLike(router).getIBCApp("transfer");
+        am = IAccessManagedLike(router).authority();
+    }
+
+    /// @notice IBCAdmin rebuilt with the system's router, access manager and transfer app, its installed executor,
+    /// its deployer and its recovery settings (the configuration values, printed).
+    function verifyAdmin(address ibcAdmin) public returns (bool ok) {
+        (address router, address am, address ics20) = _system(ibcAdmin);
+        IBCAdminLike a = IBCAdminLike(ibcAdmin);
+        (address exec,) = a.exec();
+        address[4] memory seats = [address(0xA1), address(0xA2), address(0xA3), address(0xA4)];
+        address[2] memory watch = [address(0xB1), address(0xB2)];
+        IIBCAdmin.RecoveryConfig memory rc = a.recoveryConfig();
+        bytes memory config =
+            abi.encode(IBCAdminConfigLike(router, am, ics20, exec, a.govClient(), a.gnoChainId(), seats, watch, rc));
+        // its constructor deploys the launch check and its executor-independent code (IBCAdminNative), from its
+        // first nonce: both are part of IBCAdmin's immutable code and come out of the rebuild at their addresses
+        address[] memory created = new address[](2);
+        created[0] = _word(ibcAdmin, "launchCheck()");
+        created[1] = _word(ibcAdmin, "native()");
+        ok = rebuilds(ibcAdmin, "IBCAdmin.sol:IBCAdmin", config, a.deployer(), 1, created);
+        console2.log(
+            ok ? "ok      " : "MISMATCH", "IBCAdmin.sol:IBCAdmin (its launch check and IBCAdminNative)", ibcAdmin
+        );
+        console2.log("  deployer", a.deployer());
+        console2.log("  recovery delay, threshold, cancel threshold", rc.delay, rc.threshold, rc.cancelThreshold);
+        console2.log("  recovery silence, hold period", rc.silence, rc.holdPeriod);
+    }
+
+    /// @notice A GnoVoucher: rebuilt with its own name, symbol, decimals and denom path, and bound to the system's
+    /// transfer app (`ics20`), which its immutable must name. A proxy, or any code other than this build, fails.
+    function verifyVoucher(address voucher, address ics20) public returns (bool ok) {
+        IVoucherLike v = IVoucherLike(voucher);
+        if (voucher.code.length == 0) return false;
+        try v.ics20() returns (address bound) {
+            if (bound != ics20) {
+                console2.log("MISMATCH voucher bound to another transfer app", voucher);
+                return false;
+            }
+        } catch {
+            console2.log("MISMATCH voucher answers no ics20()", voucher);
+            return false;
+        }
+        ok = _check(
+            voucher,
+            "GnoVoucher.sol:GnoVoucher",
+            abi.encode(v.name(), v.symbol(), v.decimals(), ics20, v.fullDenomPath())
+        );
+    }
+
+    /// @notice A GnoLightClient: it has no immutables, so its runtime code is the build's whatever its trusted
+    /// state; rebuilt from a placeholder state. A proxy, or any other verifier code, fails (another verifier type is
+    /// checked by hand against its own source).
+    function verifyLightClient(address lc) public returns (bool) {
+        Msgs.ClientState memory cs = Msgs.ClientState({
+            chainId: "verify",
+            revisionNumber: 0,
+            latestHeight: 1,
+            trustLevel: Msgs.TrustThreshold(1, 1),
+            trustingPeriod: 1,
+            maxClockDrift: 0,
+            isFrozen: false
+        });
+        Msgs.ConsensusState memory cons = Msgs.ConsensusState(1, bytes32(0), bytes32(0));
+        return _check(lc, "GnoLightClient.sol:GnoLightClient", abi.encode(cs, cons));
+    }
+
+    /// @notice The launch's pinned code beyond the delegate graphs: the epoch client's verifier and the ugnot voucher
+    /// registered for it (`transfer/<client>/ugnot`).
+    function verifyLaunch(address ibcAdmin) public returns (bool all) {
+        all = verifyComponent(ibcAdmin, "launchClient");
+        all = verifyComponent(ibcAdmin, "launchVoucher") && all;
+    }
+
+    /// @notice What runs now, from the chain alone: the transfer proxy's and the router proxy's live implementations,
+    /// the escrow and voucher beacons' implementations, IBCAdmin and its installed executor, each graph complete.
+    /// All from one checkout: for a deployment whose components come from different releases (kind 7 and kind 9
+    /// replace them one at a time), check each with `verifyComponent` from its own release's checkout instead.
+    function verifyLive(address ibcAdmin) public returns (bool all) {
+        all = true;
+        string[6] memory live = ["transfer", "router", "escrow", "ibcerc20", "admin", "exec"];
+        for (uint256 i = 0; i < live.length; i++) {
+            all = verifyComponent(ibcAdmin, live[i]) && all;
+        }
+    }
+
+    /// @notice One deployed component, read from the chain and rebuilt from this checkout (the deployment manifest
+    /// names the release each one comes from, docs/controls.md):
+    /// - `transfer`: the transfer proxy's live implementation and its three modules (one kind 7 installs them
+    /// together); - `router`: the router proxy's live implementation;
+    /// - `escrow`, `ibcerc20`: the escrow and voucher beacons' implementations;
+    /// - `admin`: IBCAdmin with the launch check and IBCAdminNative it deploys (immutable: always its launch release);
+    /// - `exec`: IBCAdmin's installed executor and its four modules (one kind 9 installs them together);
+    /// - `launchClient`, `launchVoucher`: the epoch client's verifier and its ugnot voucher.
+    /// Reverts on an unknown name.
+    function verifyComponent(address ibcAdmin, string memory name) public returns (bool) {
+        (address router, address am, address ics20) = _system(ibcAdmin);
+        bytes32 n = keccak256(bytes(name));
+        if (n == keccak256("transfer")) return verifyTransfer(implementationOf(ics20));
+        if (n == keccak256("router")) return _check(implementationOf(router), "ICS26Router.sol:ICS26Router", "");
+        if (n == keccak256("escrow")) {
+            return _check(_word(_word(ics20, "getEscrowBeacon()"), "implementation()"), "Escrow.sol:Escrow", "");
+        }
+        if (n == keccak256("ibcerc20")) {
+            return _check(_word(_word(ics20, "getIBCERC20Beacon()"), "implementation()"), "IBCERC20.sol:IBCERC20", "");
+        }
+        if (n == keccak256("admin")) return verifyAdmin(ibcAdmin);
+        if (n == keccak256("exec")) return verifyExec(_word(ibcAdmin, "exec()"), router, am, ics20);
+        string memory client = IBCAdminLike(ibcAdmin).govClient();
+        if (n == keccak256("launchClient")) return verifyLightClient(IRouterLike(router).getClient(client));
+        if (n == keccak256("launchVoucher")) {
+            (bool ok, bytes memory ret) = ics20.staticcall(
+                abi.encodeWithSignature("ibcERC20Contract(string)", string.concat("transfer/", client, "/ugnot"))
+            );
+            address voucher = ok && ret.length >= 32 ? abi.decode(ret, (address)) : address(0);
+            return voucher != address(0) && verifyVoucher(voucher, ics20);
+        }
+        revert(string.concat("unknown component ", name));
+    }
+
+    /// @notice A pending kind 7 or kind 9 decision of the current epoch, before it matures: it must be the expected
+    /// decision (`expectedHash`), name `candidate` as the implementation or executor it installs, pin `candidate`'s
+    /// live code hash, and `candidate`'s whole graph must rebuild to its deployed code (a kind 7 by the proxy it
+    /// upgrades; a kind 9 bound to IBCAdmin's system).
+    function verifyPending(address ibcAdmin, uint64 seq, bytes32 expectedHash, address candidate)
+        public
+        returns (bool)
+    {
+        (bool ok, bytes memory ret) = ibcAdmin.staticcall(abi.encodeWithSignature("epoch()"));
+        require(ok, "epoch");
+        uint32 ep = abi.decode(ret, (uint32));
+        (ok, ret) = ibcAdmin.staticcall(abi.encodeWithSignature("decision(uint32,uint64)", ep, seq));
+        require(ok, "decision");
+        IIBCAdmin.Decision memory d = abi.decode(ret, (IIBCAdmin.Decision));
+        if (d.hash != expectedHash) {
+            console2.log("MISMATCH decision hash, seq", seq);
+            return false;
+        }
+        (address router, address am, address ics20) = _system(ibcAdmin);
+        if (d.kind == KIND_HANDOVER) {
+            (address x, bytes32 codeHash,) = abi.decode(d.params, (address, bytes32, bytes));
+            if (x != candidate || x.codehash != codeHash) {
+                console2.log("MISMATCH kind 9 candidate or its pinned hash", x);
+                return false;
+            }
+            return verifyExec(x, router, am, ics20);
+        }
+        if (d.kind == KIND_VOUCHER) {
+            (,, address v, bytes32 codeHash) = abi.decode(d.params, (string, string, address, bytes32));
+            if (v != candidate || v.codehash != codeHash) {
+                console2.log("MISMATCH kind 5 candidate or its pinned hash", v);
+                return false;
+            }
+            return verifyVoucher(v, ics20);
+        }
+        if (d.kind == KIND_CLIENT) {
+            (,,,, address lc, bytes32 codeHash) =
+                abi.decode(d.params, (uint8, string, string, bytes[], address, bytes32));
+            if (lc != candidate || lc.codehash != codeHash) {
+                console2.log("MISMATCH kind 6 candidate or its pinned hash", lc);
+                return false;
+            }
+            return verifyLightClient(lc);
+        }
+        if (d.kind == KIND_UPGRADE) {
+            (address proxy, address impl, bytes32 codeHash,) = abi.decode(d.params, (address, address, bytes32, bytes));
+            if (impl != candidate || impl.codehash != codeHash) {
+                console2.log("MISMATCH kind 7 candidate or its pinned hash", impl);
+                return false;
+            }
+            if (proxy == ics20) return verifyTransfer(impl);
+            if (proxy == router) return _check(impl, "ICS26Router.sol:ICS26Router", "");
+            if (proxy == _word(ics20, "getEscrowBeacon()")) return _check(impl, "Escrow.sol:Escrow", "");
+            if (proxy == _word(ics20, "getIBCERC20Beacon()")) return _check(impl, "IBCERC20.sol:IBCERC20", "");
+            console2.log("MISMATCH kind 7 of an unknown proxy", proxy);
+            return false;
+        }
+        console2.log("MISMATCH not a kind 5, 6, 7 or 9, seq", seq);
+        return false;
+    }
+}
+
+/// @notice IBCAdmin's constructor argument, field for field (IBCAdmin.Config).
+struct IBCAdminConfigLike {
+    address router;
+    address accessManager;
+    address ics20;
+    address exec;
+    string govClientId;
+    string gnoChainId;
+    address[4] seats;
+    address[2] watch;
+    IIBCAdmin.RecoveryConfig recovery;
+}

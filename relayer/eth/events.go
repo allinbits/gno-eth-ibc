@@ -3,7 +3,6 @@ package eth
 import (
 	"context"
 	"fmt"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -21,12 +20,10 @@ type SentPacket struct {
 // SendPackets returns the packets the router sent in blocks [from, to].
 func (c *Client) SendPackets(ctx context.Context, from, to uint64) ([]SentPacket, error) {
 	ev := RouterABI.Events["SendPacket"]
-	logs, err := c.EC.FilterLogs(ctx, ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(from),
-		ToBlock:   new(big.Int).SetUint64(to),
+	logs, err := c.allLogs(ctx, ethereum.FilterQuery{
 		Addresses: []common.Address{c.Dep.ICS26Router},
 		Topics:    [][]common.Hash{{ev.ID}},
-	})
+	}, from, to)
 	if err != nil {
 		return nil, err
 	}

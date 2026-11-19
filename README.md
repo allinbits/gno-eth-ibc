@@ -16,7 +16,7 @@ The other halves live in two branches:
 ```
 gno.land (3 secp256k1 validators)                    Ethereum (Sepolia)
   r/aib/ibc/core ── client ethereum-1  <──────────>  ICS26Router ── client-0 = GnoLightClient
-  r/aib/ibc/apps/transfer (ICS20)                     ICS20Transfer (ICS20, GnoVoucher vouchers)
+  r/aib/ibc/apps/transfer (ICS20)                     GnoICS20Transfer (ICS20 fork + controls, GnoVoucher)
   p/aib/ibc/lightclient/ethereum                      contracts/src/GnoLightClient.sol
       sync committee + BLS (gno native)                   tm2 commits: sha256 + ecrecover
       MPT storage proofs                                  ICS23 B+tree + multistore proofs
@@ -42,7 +42,37 @@ make e2e-local     # local testnet + anvil: gno -> EVM transfers, end to end
 ```
 
 Against Sepolia (needs a funded key in `.env`: `DEPLOYER_PRIVATE_KEY`,
-`ETH_PRIVATE_KEY`, `DEPLOYER_ADDRESS`):
+`ETH_PRIVATE_KEY`, `DEPLOYER_ADDRESS`; and, off a local chain, the deployment
+settings `DeployGnoIBC` requires: `GUARDIANS` (4 comma-separated addresses),
+`WATCH_KEYS` (2) and `EXPECTED_LOCK` (the expected ugnot lock in base units, from which the
+launch limits derive). Relaying is public: `scripts/sepolia.sh` forwards
+neither `RELAYER_ADDRESS` nor `ALLOW_RESTRICTED_RELAYING`, so the Sepolia
+setup always deploys public relaying whatever `.env` says; a restricted
+deployment (testing only) is made by running `DeployGnoIBC` directly with
+`RELAYER_ADDRESS` and `ALLOW_RESTRICTED_RELAYING=true`. See [docs/controls.md](docs/controls.md#deployment) for the
+deployment and its checks). Optional settings:
+
+- The ugnot route launches **inactive** (zero limits): nothing moves until
+  gno.land, once IBCAdmin has recorded its first decision, activates it with a
+  kind 4 carrying the deployment file's `activationKind4Params`.
+  `GNOT_MAX_PER_MESSAGE`, `GNOT_DAY_CAP`, `GNOT_REFUND_CAP` lower the activation
+  limits derived from `EXPECTED_LOCK` (zero, the default, keeps the derived
+  value). `LAUNCH_ACTIVE=true` installs them at launch instead: test networks
+  only (refused on mainnet); `make e2e-local` and the Sepolia setup use it.
+- `QUARANTINE_SECONDS`: the launch quarantine (default 7 days, at most 365
+  days: the deployment sets it through `setQuarantine`, whose ceiling applies
+  to it as to every later kind 11 change).
+- `RECOVERY_DELAY` (default 30 days: the emergency recovery launches
+  enabled; at least 30 days; 0 deploys it disabled, test networks only),
+  `RECOVERY_THRESHOLD` and `RECOVERY_CANCEL_THRESHOLD` (default 3; 3 or 4,
+  cancellation at most approval), `RECOVERY_SILENCE` (default 30 days) and
+  `RECOVERY_HOLD_PERIOD` (default 14 days), zero disabling either criterion.
+  The settings are fixed at deployment. gno.land's governance can later
+  disable the recovery for good (kind 14, after 7 days); nothing re-enables
+  it. With it disabled, a channel loss with no repair already recorded can
+  strand the escrow's backing for good (see docs/controls.md).
+- `PERMIT2`: the chain's Permit2 contract, fixed at deployment; unset, only
+  allowance-based sends work (`sendTransferWithPermit2` is unavailable).
 
 ```sh
 make sepolia-setup   # fresh testnet, deploy on Sepolia, create gno's Ethereum client

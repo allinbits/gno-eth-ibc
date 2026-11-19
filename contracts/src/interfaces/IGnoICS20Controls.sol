@@ -1,0 +1,384 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import { IICS26RouterMsgs } from "@eureka/msgs/IICS26RouterMsgs.sol";
+import { IICS02ClientMsgs } from "@eureka/msgs/IICS02ClientMsgs.sol";
+import { IGuardians } from "./IGuardians.sol";
+
+/// @title The types, errors and events of the controls GnoICS20Transfer adds to eureka's ICS20Transfer (ADR pr6375
+/// E5-E7, E9, E12, §7.2-§7.4, §7.10, §7.12, §7.13)
+/// @notice Every control is keyed by a route: a stable route key (the first client id the route had) that each of
+/// its client ids aliases. Receive limits, send limits, flags, the refunds hold, the quarantine duration, escrows and
+/// the voucher registry follow the route when `migrateRoute` re-points a new client id at it.
+interface IGnoICS20ControlsTypes {
+    /// @notice A route's limits for one token. Receive: `maxPerMessage` and a leaky-bucket `dayCap`. Refunds: a
+    /// leaky-bucket `refundCap`. Sends of escrowed (Ethereum-native) tokens: `sendMax`/`sendMin`, 0 = unset.
+    struct Limits {
+        uint256 maxPerMessage;
+        uint256 dayCap;
+        uint256 refundCap;
+        uint256 sendMax;
+        uint256 sendMin;
+    }
+
+    /// @notice Limits as read back, with the buckets' current levels.
+    struct LimitsView {
+        bool set;
+        Limits limits;
+        uint256 receiveLevel;
+        uint256 refundLevel;
+    }
+
+    /// @notice What the ack or timeout callback attached to a send record.
+    enum Outcome {
+        Pending,
+        Success,
+        ErrorAck,
+        Timeout
+    }
+
+    /// @notice A send record's destination outcome, proven through the route's replacement client (`proveOutcome`,
+    /// ADR §7.12): delivered (its receipt and a success ack), refundable (an error ack, or no receipt once it can no
+    /// longer be received), or a collision (another packet's receipt at its sequence: the honest one is refundable).
+    enum Proven {
+        None,
+        Delivered,
+        Refundable,
+        Collision
+    }
+
+    /// @notice The destination's state for one packet at `proofHeight`: its receipt with a membership proof and its
+    /// app acknowledgement with a membership proof of the ack commitment; or `receipt` zero and a non-membership
+    /// proof of the receipt (`ack`, `ackProof` unused). A receipt other than the packet's needs no ack.
+    struct OutcomeProof {
+        IICS02ClientMsgs.Height proofHeight;
+        bytes32 receipt;
+        bytes receiptProof;
+        bytes ack;
+        bytes ackProof;
+    }
+
+    /// @notice The refund state of a send record: none owed, paid at once, queued under the refund meter or the
+    /// refunds hold, paid in full by `claim`, or parked: its payment reverted (a token that refuses the sender, a
+    /// paused token), so it waits apart and `claimParked` retries it, and no other refund waits behind it.
+    enum Payment {
+        None,
+        Paid,
+        Queued,
+        Claimed,
+        Parked,
+        Rejected
+    }
+
+    /// @notice The per-packet send record (§7.13), keyed by (source client id, sequence). Written by every send
+    /// variant after the router returned the sequence (the deployment is fresh: every packet has one); the ack and
+    /// timeout callbacks only attach the outcome, the local processing block and the payment state, and refuse a packet
+    /// without a record. `commitment` is the router's packet commitment, which binds the full packet (timeout and
+    /// payload; the packet itself is in the router's
+    /// SendPacket event and is authenticated against it).
+    struct SendRecord {
+        bytes32 commitment;
+        address sender;
+        address token;
+        address escrow;
+        uint64 timeoutTimestamp;
+        uint64 sendBlock;
+        uint64 processedBlock;
+        /// The record's index in its route's list of processed records (meaningful once `processedBlock` is set).
+        uint64 processedIndex;
+        bool burned;
+        Outcome outcome;
+        Payment payment;
+        uint256 amount;
+        uint256 refunded;
+        /// The reconciliation outcome kind 12 applied (0: none; 1 refund, 2 rejected, 3 delivered, 4 forged
+        /// refund).
+        uint8 settlement;
+        /// Still open: an outstanding packet, or a refund owed (queued, parked) not settled by kind 12.
+        bool open;
+        /// The destination outcome `proveOutcome` verified, which kind 12's actions 1-4 must match, and the light
+        /// client that verified it: void once that client is no longer the route's active one (frozen, expired, or
+        /// replaced), when kind 12 refuses it and a new proof may replace it.
+        Proven proven;
+        /// A success that may hide a refund (in a suspect interval, prepared; processed while retired; or proven
+        /// owed): held (reserved) until a kind 12 settles it. No proof releases it, whatever it proves.
+        bool held;
+        address provenBy;
+        /// The route's verifier generation when it was proven: any re-pointing of the route's client since voids it.
+        uint64 provenGen;
+    }
+
+    /// @notice A closure of a route (the reconciliation state machine, docs/controls.md): a replacement (kind 10
+    /// or the emergency recovery) covering the client id it retired, or a loss kind 12 booked while the route was
+    /// open (covering no records); open, then reopening (kind 13 under way), then resolved.
+    struct Incident {
+        uint8 kind;
+        uint8 status;
+        bytes32 client;
+        uint64 suspectFrom;
+    }
+
+    /// @notice One reconciliation outcome of kind 12 (ADR §5.4, §7.12) for the send record at `sequence`.
+    struct SettleItem {
+        uint64 sequence;
+        uint8 action;
+        uint256 amount;
+    }
+
+    // ------------------------------------------------------------------------------------- expected refusals --
+    // The router turns a receive callback's revert with non-empty data into an error acknowledgement, which
+    // refunds the sender at the source.
+
+    error GnoClientRetired(string clientId);
+    error GnoRoutePaused(string clientId);
+    error GnoRouteRecovering(string clientId);
+    error GnoRouteClosed(string clientId);
+    error GnoNoSendRecord(string clientId, uint64 sequence);
+    error GnoBadSettlement(uint256 item);
+    error GnoNotClosed(string clientId);
+    error GnoNoNotification(string clientId, uint64 sequence);
+    error GnoBadProof();
+    error GnoBadModule();
+    /// @notice A receive refused: its packet data does not decode, or the token or escrow refused the transfer.
+    error GnoBadPacketData();
+    error GnoReceiveFailed(address token);
+    /// @notice Less gas left than a bounded refund payment needs: the caller starves it (retry with more gas).
+    error GnoPaymentStarved();
+    /// @notice Less gas left than a caller-funded notification's budget and reserve.
+    error GnoNotificationStarved();
+    error GnoRouteReopening(string clientId);
+    /// @notice A loss of this packet (client id, sequence, direction 1 outbound, 2 inbound) is already booked.
+    error GnoLossBooked(string clientId, uint64 sequence, uint8 direction);
+    /// @notice Kind 13 waits: `pending` unresolved incidents still have an open or unsettled suspect record.
+    error GnoIncidentsPending(string clientId, uint64 pending);
+    error GnoEscrowReserved(address token, uint256 balance, uint256 reserved);
+    error GnoQuarantined(string clientId, uint256 until);
+    error GnoQuarantineUnknown(string clientId);
+    error GnoDenomNotRegistered(string denom);
+    error GnoLimitsNotSet(string clientId, address token);
+    /// @notice A transfer packet's encoded payload value above ADR §9's 262,144 bytes (gno.land refuses it).
+    error GnoPayloadTooLarge(uint256 size);
+    error GnoOverMaxPerMessage(address token, uint256 amount, uint256 maxPerMessage);
+    error GnoOverDayCap(address token, uint256 amount, uint256 dayCap);
+    error GnoSendAboveMax(address token, uint256 amount, uint256 sendMax);
+    error GnoSendBelowMin(address token, uint256 amount, uint256 sendMin);
+    error GnoRefundsHeld(string clientId);
+    error GnoBadLimits();
+    error GnoBadRoute();
+    error GnoNotParked(string clientId, uint64 sequence);
+    error GnoRefundFailed(string clientId, uint64 sequence);
+
+    // ------------------------------------------------------------------------------------------------ events --
+
+    event GnoRouteFlagSet(string routeKey, address indexed key, uint8 seat, bool refunds);
+    event GnoRouteFlagCleared(string routeKey, address indexed key, uint8 seat, bool refunds);
+    event GnoRouteUnpaused(string routeKey, uint64 beforeBlock, uint256 cleared);
+    event GnoGuardianKeysSet(address[6] keys);
+    event GnoLimitsSet(string routeKey, address indexed token, Limits limits);
+    event GnoQuarantineSet(string routeKey, uint64 quarantineSeconds);
+    event GnoRecoveryBlockSet(string routeKey, bool blocked);
+    event GnoRouteMigrated(string oldClientId, string newClientId, string routeKey);
+    event GnoSendRecorded(string clientId, uint64 indexed sequence, bytes32 commitment, address token, uint256 amount);
+    event GnoOutcomeRecorded(string clientId, uint64 indexed sequence, Outcome outcome, Payment payment);
+    event GnoRefundPaid(string clientId, uint64 indexed sequence, address token, address to, uint256 amount);
+    event GnoRefundQueued(string clientId, uint64 indexed sequence, address token, uint256 amount);
+    event GnoRefundParked(string clientId, uint64 indexed sequence, address token, uint256 amount);
+    event GnoRefundRejected(string clientId, uint64 indexed sequence);
+    /// @notice An ack or timeout of a record reconciliation already settled: ignored.
+    event GnoOutcomeIgnored(string clientId, uint64 indexed sequence, Outcome outcome);
+    event GnoSettled(string clientId, uint64 indexed sequence, uint8 action, uint256 amount);
+    event GnoLossRecorded(string routeKey, address indexed token, uint64 indexed sequence, uint256 amount);
+    event GnoRouteReopened(string routeKey);
+    /// @notice Kind 13 accepted a recorded loss not recapitalized as a deficit of the route (ADR §7.9).
+    event GnoDeficitAccepted(string routeKey, address indexed token, uint256 amount);
+    /// @notice A reopening found a prerequisite broken at its last batch (a record opened meanwhile): the route
+    /// stays closed, for kind 12 and a new kind 13.
+    event GnoReopenAborted(string routeKey);
+    /// @notice A loss booked after the route reopened closed it again, until a kind 13 accepts it.
+    event GnoRouteClosedForLoss(string routeKey);
+    event GnoOutcomeProven(string clientId, uint64 indexed sequence, Proven proven);
+    event GnoIncidentPrepared(string clientId);
+    /// @notice The sender's IIBCSenderCallbacks notification of an error ack or timeout, delivered once the refund
+    /// is paid; `ok` false when the sender reverted (the refund stands).
+    event GnoSenderNotified(string clientId, uint64 indexed sequence, bool ok);
+    /// @notice A refund paid by a claim or by kind 12: its sender's held notification is due, delivered by
+    /// `retryNotification` (only its hash is stored).
+    event GnoNotificationDue(string clientId, uint64 indexed sequence);
+}
+
+/// @title The functions of the controls (served by GnoICS20Controls through GnoICS20Transfer's fallback)
+interface IGnoICS20Controls is IGnoICS20ControlsTypes {
+    // ------------------------------------------------------------------------------------------- governance --
+    // Restricted by the AccessManager to ADMIN_ROLE (IBCAdmin).
+
+    /// @notice One-time setup of the fork's storage in the UUPS upgrade from eureka's ICS20Transfer.
+    function initializeGno(address[6] calldata keys) external;
+    function setGuardianKeys(address[6] calldata keys) external;
+    function setLimits(string calldata clientId, address token, Limits calldata limits) external;
+    function setQuarantine(string calldata clientId, uint64 quarantineSeconds) external;
+    /// @notice Stores the route's quarantine deadline so far (its current client's transitions): IBCAdmin calls it
+    /// before any verifier swap (kind 6 migrate, kind 10, the emergency recovery), so a swap never drops it.
+    function checkpointQuarantine(string calldata clientId) external;
+
+    /// @notice As `checkpointQuarantine`, for a route replacement (kind 10, the emergency recovery): it never depends
+    /// on the failing verifier. When its `lastTransition()` cannot be read (it reverts or answers malformed data), the
+    /// deadline becomes max(saved deadline, now + the route's quarantine), conservatively. Outcomes proven through the
+    /// old verifier are void either way. Only IBCAdmin.
+    function checkpointForReplacement(string calldata clientId) external;
+    /// @notice Clears the route's flags and refunds flags set at a block before `beforeBlock`; refused while either
+    /// set holds (IGuardians.HoldStands).
+    function unpauseRoute(string calldata clientId, uint64 beforeBlock) external returns (uint256 cleared);
+    /// @notice Refuses (or allows again) every token receive on the route while an emergency recovery is open.
+    function setRecoveryBlock(string calldata clientId, bool blocked) external;
+    /// @notice Points `newClientId` at `oldClientId`'s route, retires `oldClientId` and closes the route (constant
+    /// work); kind 12 settles its records and kind 13 reopens it.
+    /// `suspectFrom`: the Ethereum block from which acks and timeouts processed through the old client are suspect;
+    /// each record processed from then on must be settled by kind 12 before kind 13 (never reaching back past the
+    /// previous replacement). Refused while the route is closed (one replacement at a time).
+    function migrateRoute(string calldata oldClientId, string calldata newClientId, uint64 suspectFrom) external;
+    /// @notice Kind 13: starts reopening a closed route, refused while any of its send records is open
+    /// (`openRecords`). Every recorded loss not yet accepted becomes an accepted deficit, in batches: the first here,
+    /// the rest by `continueReopen`; the route opens when the last batch completes.
+    function reopenRoute(string calldata clientId) external;
+    /// @notice Accepts the next batch (at most 16 tokens) of a reopening route's deficits, and opens it after the
+    /// last. Permissionless.
+    function continueReopen(string calldata clientId, uint256 n) external;
+    /// @notice Kind 12: applies reconciliation outcomes to send records of a retired client id, each at most once:
+    /// 1 genuine refund: pay its remainder (`amount` must equal the amount less what was refunded, zero when it was
+    /// paid in full, which only settles the record; parked if the token refuses), 2 reject a queued or parked refund,
+    /// 3 settled as delivered (a queued or parked refund is rejected), 2 and 3 only when nothing was refunded yet,
+    /// 4 forged refund: reject the unpaid remainder and record what was already paid as a loss (`amount` must equal
+    /// what was paid). All or nothing.
+    function settleRecords(string calldata clientId, SettleItem[] calldata items) external;
+    /// @notice Delivers a sender notification held or kept after it failed, once its outcome is final for the sender
+    /// (a success ack, or a refund paid in full). Only its hash is stored: `call` is the IIBCSenderCallbacks calldata
+    /// the router's callback carried (`onAckPacket(success, msg)` or `onTimeoutPacket(msg)`, the router's message
+    /// with the relayer of that ack or timeout), authenticated against it. Permissionless; it only calls the sender,
+    /// never pays. Returns whether the sender took it (if not, it stays kept).
+    /// `gasBudget`: the callback's gas, at least the automatic 100,000 (0: exactly that); the caller sends enough
+    /// for it and a reserve, or it reverts (`GnoNotificationStarved`).
+    function retryNotification(
+        string calldata clientId,
+        uint64 sequence,
+        bytes calldata call,
+        uint256 gasBudget
+    )
+        external
+        returns (bool);
+
+    /// @notice Permissionless: delivers a settled record's terminal notification when kind 12 decided another kind
+    /// than its ack or timeout brought (or none): one terminal notification per record, decided by its final
+    /// outcome. Action 1 is a refund (`onTimeoutPacket`, once paid in full); actions 2-4 a success (`onAckPacket`
+    /// with `ack`, the success ack `proveOutcome` proved). The transport's notification is superseded at settlement.
+    /// The packet is authenticated against the record's commitment; delivered once, with `gasBudget` as in
+    /// `retryNotification`; false if the sender reverted, and anyone calls again.
+    function notifySettled(
+        IICS26RouterMsgs.Packet calldata packet,
+        bytes calldata ack,
+        uint256 gasBudget
+    )
+        external
+        returns (bool);
+
+    /// @notice Permissionless: proves a send record's destination outcome through its route's replacement client
+    /// (the route's current client id; the record's client id must be retired). The packet is authenticated against
+    /// the record's commitment; gno.land's receipt is recomputed from it (R19: sha256(0x03 | uint64be(sequence) |
+    /// sha256(sourceClient) | packet commitment)) and compared with the proven one. A non-receipt counts only once
+    /// the proven time reaches the packet's timeout (it can then never be received). Proven once, before kind 12.
+    /// @notice Clears an outcome its verifier no longer vouches for (the route's active client or its generation
+    /// changed since the proof), so that the active verifier can prove it again. A held success's reservation stays:
+    /// only its settlement releases it. Permissionless.
+    function voidOutcome(string calldata clientId, uint64 sequence) external;
+
+    /// @notice Reserves, in batches of at most `n` records, every unsettled success a retired client processed in
+    /// its suspected compromise interval: each is a potential refund (a forged success ack may hide one), held until
+    /// a kind 12 settles it. Kind 12 pays no refund of the route until every incident is prepared. Permissionless;
+    /// returns the records left (zero once prepared).
+    function prepareIncident(string calldata clientId, uint256 n) external returns (uint256 left);
+
+    /// @notice When the route's quarantine ends (receives wait until then): the deadline of the transitions already
+    /// seen and, with the duration in force, of its current client's latest transition.
+    function quarantineEnd(string calldata clientId) external view returns (uint256);
+
+    function proveOutcome(
+        IICS26RouterMsgs.Packet calldata packet,
+        OutcomeProof calldata proof
+    )
+        external
+        returns (Proven);
+
+    /// @notice gno.land's receipt value for `packet` (ADR R19; `types.CommitPacketReceipt` in gno-realms).
+    function gnoReceipt(IICS26RouterMsgs.Packet calldata packet) external pure returns (bytes32);
+
+    // ------------------------------------------------------------------------------------------- guardians --
+
+    function setRouteFlag(string calldata clientId) external;
+    function clearRouteFlag(string calldata clientId) external;
+    /// @notice The refunds hold of §7.13: any one key's flag suspends proof-based refunds and claims on the route.
+    function setRefundsFlag(string calldata clientId) external;
+    function clearRefundsFlag(string calldata clientId) external;
+
+    // ----------------------------------------------------------------------------------------------- refunds --
+
+    /// @notice Pays queued refunds of a route and token in order, as the refund meter allows (an installment when
+    /// it allows part of one). Permissionless.
+    function claim(string calldata clientId, address token, uint256 maxCount) external returns (uint256 paid);
+
+    /// @notice Retries a parked refund (as the refund meter allows, an installment if it allows part of it), under
+    /// no refunds hold. Permissionless; reverts if the payment still fails.
+    /// `gasBudget`: the gas the balance read and each token or escrow call get (0: the automatic bound; at least it
+    /// otherwise), the caller sending enough for them and a reserve (`GnoPaymentStarved` otherwise).
+    function claimParked(string calldata clientId, uint64 sequence, uint256 gasBudget) external returns (uint256 paid);
+
+    // ------------------------------------------------------------------------------------------------- views --
+
+    function routeKey(string calldata clientId) external view returns (string memory);
+    function currentClient(string calldata routeKey_) external view returns (string memory);
+    function isRetired(string calldata clientId) external view returns (bool);
+    function guardianKeys() external view returns (address[6] memory);
+    function routeFlags(string calldata clientId) external view returns (IGuardians.Flag[6] memory);
+    function refundsFlags(string calldata clientId) external view returns (IGuardians.Flag[6] memory);
+    function routeHold(string calldata clientId) external view returns (IGuardians.Flag memory);
+    /// @notice The hold of the route's refunds flags (two guardian refunds flags), zero when none stands.
+    function refundsHold(string calldata clientId) external view returns (IGuardians.Flag memory);
+    function routePaused(string calldata clientId) external view returns (bool);
+    function routeClosed(string calldata clientId) external view returns (bool);
+    function routeReopening(string calldata clientId) external view returns (bool);
+    /// @notice The last replacement's suspected compromise interval start, and its records still to settle.
+    function suspectRecords(string calldata clientId) external view returns (uint64 from, uint64 open);
+    /// @notice Losses kind 12 recorded on the route for the token.
+    function losses(string calldata clientId, address token) external view returns (uint256);
+
+    /// @notice A receive at an inbound `sequence` of `clientId`: the token released or minted and its amount (zero
+    /// once kind 12 action 5 booked it as forged, or if there was none).
+    function receiveRecord(string calldata clientId, uint64 sequence) external view returns (address, uint256);
+
+    /// @notice Whether a loss of a packet is booked, by its canonical identity (direction 1 a send, 2 a receive).
+    function lossBooked(string calldata clientId, uint64 sequence, uint8 direction) external view returns (bool);
+    /// @notice Escrow of the token reserved for the route's owed refunds (queued, parked or decided but unpaid).
+    function reserved(string calldata clientId, address token) external view returns (uint256);
+    /// @notice The route's send records still open (an outstanding packet, or a refund owed not settled).
+    function openRecords(string calldata clientId) external view returns (uint64);
+
+    /// @notice The incidents of `clientId`'s route (statuses derived), how many of them (from the first) are
+    /// resolved, and how many unresolved ones kind 13 still waits for.
+    function incidents(string calldata clientId)
+        external
+        view
+        returns (Incident[] memory, uint64 resolvedUpTo, uint64 pending);
+
+    /// @notice A client id's reconciliation counters: open records, the incident covering it (1-based, 0 while
+    /// live), its first suspect index and suspect count, and how many acks and timeouts it processed.
+    function clientRecon(string calldata clientId)
+        external
+        view
+        returns (uint64 open, uint32 incident, uint64 suspectStart, uint64 suspectOpen, uint64 processed);
+    /// @notice The part of the route's losses of the token kind 13 accepted as a deficit.
+    function acceptedDeficit(string calldata clientId, address token) external view returns (uint256);
+    function refundsHeld(string calldata clientId) external view returns (bool);
+    function limits(string calldata clientId, address token) external view returns (LimitsView memory);
+    function quarantineSeconds(string calldata clientId) external view returns (uint64);
+    function recoveryBlocked(string calldata clientId) external view returns (bool);
+    function sendRecord(string calldata clientId, uint64 sequence) external view returns (SendRecord memory);
+    function refundQueue(string calldata clientId, address token) external view returns (uint64 head, uint64 tail);
+}

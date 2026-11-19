@@ -211,6 +211,7 @@ func cmdRelay(ctx context.Context, args []string) error {
 	gnoClient := fs.String("gno-client", "", "gno-side client id the packets are sent on (default: the deployment's counterpartyClientId)")
 	from := fs.Int64("from", 1, "first gno height to scan")
 	to := fs.Int64("to", 0, "last gno height to scan (0 = latest)")
+	fromBlock := fs.Uint64("from-block", 0, "earliest EVM block the router's logs are scanned from (default: the deployment's deployBlock)")
 	follow := fs.Bool("follow", false, "keep relaying new blocks")
 	out := fs.String("out", "", "write a JSON summary of the relayed packets")
 	beaconURL := fs.String("beacon", "", "beacon node API; when set, acks written on the EVM chain are relayed back to gno")
@@ -223,6 +224,9 @@ func cmdRelay(ctx context.Context, args []string) error {
 	}
 	if *gnoClient == "" {
 		*gnoClient = dep.CounterpartyClientID
+	}
+	if *fromBlock != 0 {
+		dep.DeployBlock = *fromBlock
 	}
 	g, err := dialGno(ctx, *gnoRPC, *beaconURL != "")
 	if err != nil {
@@ -396,7 +400,7 @@ func cmdRelayEth(ctx context.Context, args []string) error {
 	beaconURL := fs.String("beacon", os.Getenv("BEACON_URL"), "beacon node API (default $BEACON_URL)")
 	depFile := fs.String("deployment", "", "deployment JSON written by DeployGnoIBC.s.sol")
 	gnoClient := fs.String("gno-client", "", "gno-side Ethereum client id (default: the deployment's counterpartyClientId)")
-	from := fs.Uint64("from", 0, "first EVM block to scan")
+	from := fs.Uint64("from", 0, "first EVM block to scan (0 = the deployment's deployBlock)")
 	to := fs.Uint64("to", 0, "last EVM block to scan (0 = latest)")
 	follow := fs.Bool("follow", false, "keep relaying new blocks")
 	_ = fs.Parse(args)
@@ -407,6 +411,9 @@ func cmdRelayEth(ctx context.Context, args []string) error {
 	}
 	if *gnoClient == "" {
 		*gnoClient = dep.CounterpartyClientID
+	}
+	if *from == 0 {
+		*from = dep.DeployBlock
 	}
 	g, err := dialGno(ctx, *gnoRPC, true)
 	if err != nil {

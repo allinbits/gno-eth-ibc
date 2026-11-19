@@ -18,6 +18,10 @@ contracts/
   src/lib/Tm2Merkle.sol              tm2 simple Merkle tree
   src/lib/ICS23.sol                  generic ICS23 existence / non-existence verifier
   src/lib/GnoProofSpecs.sol          bptree and Tendermint (rootmulti) ProofSpecs
+  src/GnoICS20Transfer.sol           minimal fork of eureka's ICS20Transfer with the route controls
+  src/transfer/                      its delegatecalled controls (GnoICS20Controls) and shared storage
+  src/admin/                         IBCAdmin (governance app, port ibcgov) and its executor
+  src/lib/Guardians.sol, LeakyBucket.sol   ported from gnolang/bridges (licenses/GNO-Network-GPL.md)
   test/                              Foundry tests; fixtures/ holds JSON made from real tm2 code
   lib/                               forge-std v1.15.0, solidity-ibc-eureka solidity-v3.0.2 (submodules)
 fixtures/                            Go: relayer-side encoder (gnoibc) and fixture generators
@@ -303,5 +307,6 @@ The rotated case caches the new set (its next set is itself), hence its cost.
   against a next consensus state is needed.
 * No consensus state pruning and no client upgrades / recovery.
 * The chain ID is fixed; there is no revision-format handling (`revisionNumber` is a constant of the
-  client state that every proof height must carry).
+  client state that every proof height must carry; `relayer trust` derives it from the chain id,
+  `{name}-{N}` giving N, as gno.land does).
 * Validator sets are passed in full on every update; with large sets, calldata grows linearly.

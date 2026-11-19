@@ -106,22 +106,25 @@ func (c *Client) CommitmentAt(ctx context.Context, path []byte, block *big.Int) 
 }
 
 // WrittenAck finds the acknowledgement the router wrote for a packet it
-// received on clientID, and the block it was written in.
-func (c *Client) WrittenAck(ctx context.Context, clientID string, sequence uint64, fromBlock uint64) ([][]byte, uint64, error) {
+// received on clientID, and the block it was written in. The router's logs
+// are scanned newest first, back to the deployment block at most.
+func (c *Client) WrittenAck(ctx context.Context, clientID string, sequence uint64) ([][]byte, uint64, error) {
 	ev := RouterABI.Events["WriteAcknowledgement"]
-	seq := common.BigToHash(new(big.Int).SetUint64(sequence))
-	logs, err := c.EC.FilterLogs(ctx, ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(fromBlock),
-		Addresses: []common.Address{c.Dep.ICS26Router},
-		Topics:    [][]common.Hash{{ev.ID}, {crypto.Keccak256Hash([]byte(clientID))}, {seq}},
-	})
+	head, err := c.Logs.BlockNumber(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	if len(logs) == 0 {
+	seq := common.BigToHash(new(big.Int).SetUint64(sequence))
+	l, ok, err := c.lastLog(ctx, ethereum.FilterQuery{
+		Addresses: []common.Address{c.Dep.ICS26Router},
+		Topics:    [][]common.Hash{{ev.ID}, {crypto.Keccak256Hash([]byte(clientID))}, {seq}},
+	}, c.Dep.DeployBlock, head)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !ok {
 		return nil, 0, fmt.Errorf("no acknowledgement written for %s/%d", clientID, sequence)
 	}
-	l := logs[len(logs)-1]
 	vals, err := ev.Inputs.NonIndexed().Unpack(l.Data)
 	if err != nil {
 		return nil, 0, fmt.Errorf("WriteAcknowledgement: %w", err)
