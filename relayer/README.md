@@ -1,8 +1,8 @@
 # relayer
 
 An IBC v2 relayer between gno.land and an EVM chain running solidity-ibc-eureka v3.0.2 with
-`GnoLightClient`. Today it relays gno.land → EVM; the EVM → gno.land direction plugs into the same
-packages (see "Adding the other direction").
+`GnoLightClient`. It relays gno.land → EVM, the acks back, and EVM → gno.land for Ethereum and Arc
+(see "Acks back to gno.land" and "The other direction").
 
 ## Layout
 
@@ -16,7 +16,8 @@ packages (see "Adding the other direction").
 | `cmd/relayer` | the CLI |
 
 `relayer/ethgno` and `relayer/beacon` (beacon API client, Ethereum light-client messages rendered as
-Gno literals) are written separately and plug in as an `relay.AckProofSource`.
+Gno literals) serve `relay.EthToGno`, and `relayer/arc` serves `relay.ArcToGno`; both relay acks back
+to gno as the `relay.AckRelayer`.
 
 ## CLI
 
