@@ -45,7 +45,18 @@ var (
 	// ImplementationSlot is the ERC-1967 implementation slot of its proxy,
 	// whose value the client pins at creation.
 	ImplementationSlot = common.HexToHash("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")
+	// TestnetRegistry is the registry a new client reads by default.
+	TestnetRegistry = Registry{Address: RegistryAddress, StorageLocation: RegistryStorageLocation}
 )
+
+// Registry locates the ValidatorRegistry a gno.land client reads: its proxy
+// address and its ERC-7201 storage base slot. A recovery may move the
+// storage location (the client adopts the substitute's), so a relayer reads
+// both from the client state rather than assuming the defaults.
+type Registry struct {
+	Address         common.Address
+	StorageLocation common.Hash
+}
 
 // Client reads Arc. Certificates come from certRPC (a node run with
 // --enable-arc-rpc), headers and proofs from proofRPC (one serving
@@ -244,10 +255,10 @@ type Snapshot struct {
 
 // LatestSnapshot reads a Snapshot of the latest block, retrying while the
 // chain moves under the proof calls.
-func (c *Client) LatestSnapshot(ctx context.Context, knownRegistryRoot common.Hash, router common.Address, routerKeys []common.Hash) (Snapshot, error) {
+func (c *Client) LatestSnapshot(ctx context.Context, reg Registry, knownRegistryRoot common.Hash, router common.Address, routerKeys []common.Hash) (Snapshot, error) {
 	var lastErr error
 	for i := 0; i < snapshotAttempts; i++ {
-		s, err := c.snapshot(ctx, knownRegistryRoot, router, routerKeys)
+		s, err := c.snapshot(ctx, reg, knownRegistryRoot, router, routerKeys)
 		if err == nil {
 			return s, nil
 		}
@@ -259,14 +270,14 @@ func (c *Client) LatestSnapshot(ctx context.Context, knownRegistryRoot common.Ha
 	return Snapshot{}, fmt.Errorf("snapshot: %w", lastErr)
 }
 
-func (c *Client) snapshot(ctx context.Context, knownRegistryRoot common.Hash, router common.Address, routerKeys []common.Hash) (Snapshot, error) {
+func (c *Client) snapshot(ctx context.Context, registry Registry, knownRegistryRoot common.Hash, router common.Address, routerKeys []common.Hash) (Snapshot, error) {
 	s := Snapshot{}
-	reg, root, err := c.proveLatest(ctx, RegistryAddress, nil, common.Hash{})
+	reg, root, err := c.proveLatest(ctx, registry.Address, nil, common.Hash{})
 	if err != nil {
 		return Snapshot{}, err
 	}
 	if reg.StorageRoot != knownRegistryRoot {
-		reg, err = c.proveSet(ctx, root)
+		reg, err = c.proveSet(ctx, registry, root)
 		if err != nil {
 			return Snapshot{}, err
 		}
@@ -291,9 +302,9 @@ func (c *Client) snapshot(ctx context.Context, knownRegistryRoot common.Hash, ro
 // in state root root: the proxy's implementation, the set's length, its
 // registration ids, and each registration's status, key length, key and
 // power.
-func (c *Client) proveSet(ctx context.Context, root common.Hash) (Proof, error) {
-	setSlot := SetSlot()
-	p, _, err := c.proveLatest(ctx, RegistryAddress, []common.Hash{setSlot}, root)
+func (c *Client) proveSet(ctx context.Context, reg Registry, root common.Hash) (Proof, error) {
+	setSlot := reg.SetSlot()
+	p, _, err := c.proveLatest(ctx, reg.Address, []common.Hash{setSlot}, root)
 	if err != nil {
 		return Proof{}, err
 	}
@@ -301,25 +312,25 @@ func (c *Client) proveSet(ctx context.Context, root common.Hash) (Proof, error) 
 	if n > 256 {
 		return Proof{}, fmt.Errorf("registry holds %d active registrations, more than the client reads", n)
 	}
-	keys := SetKeys(n)
-	p, _, err = c.proveLatest(ctx, RegistryAddress, keys, root)
+	keys := reg.SetKeys(n)
+	p, _, err = c.proveLatest(ctx, reg.Address, keys, root)
 	if err != nil {
 		return Proof{}, err
 	}
 	for i := uint64(0); i < n; i++ {
-		keys = append(keys, RegistrationKeys(p.Values[keys[2+i]])...)
+		keys = append(keys, reg.RegistrationKeys(p.Values[keys[2+i]])...)
 	}
-	p, _, err = c.proveLatest(ctx, RegistryAddress, keys, root)
+	p, _, err = c.proveLatest(ctx, reg.Address, keys, root)
 	return p, err
 }
 
 // SetSlot is the registry slot holding the length of its active set.
-func SetSlot() common.Hash { return slotAdd(RegistryStorageLocation, 1) }
+func (r Registry) SetSlot() common.Hash { return slotAdd(r.StorageLocation, 1) }
 
 // SetKeys are the registry slots read for an active set of n registrations:
 // the proxy's implementation, the set's length, and its n registration ids.
-func SetKeys(n uint64) []common.Hash {
-	setSlot := SetSlot()
+func (r Registry) SetKeys(n uint64) []common.Hash {
+	setSlot := r.SetSlot()
 	values := crypto.Keccak256Hash(setSlot[:])
 	keys := []common.Hash{ImplementationSlot, setSlot}
 	for i := uint64(0); i < n; i++ {
@@ -330,8 +341,8 @@ func SetKeys(n uint64) []common.Hash {
 
 // RegistrationKeys are the registry slots read for the registration id: its
 // status, key length, key and power.
-func RegistrationKeys(id common.Hash) []common.Hash {
-	entry := crypto.Keccak256Hash(id[:], RegistryStorageLocation[:])
+func (r Registry) RegistrationKeys(id common.Hash) []common.Hash {
+	entry := crypto.Keccak256Hash(id[:], r.StorageLocation[:])
 	keyLen := slotAdd(entry, 1)
 	return []common.Hash{entry, keyLen, crypto.Keccak256Hash(keyLen[:]), slotAdd(entry, 2)}
 }

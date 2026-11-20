@@ -291,6 +291,16 @@ func (r *EthToGno) RelayRange(ctx context.Context, from, to uint64) ([]EthRelaye
 		if s.Packet.DestinationClient != r.GnoClientID {
 			continue
 		}
+		received, err := gnoReceived(ctx, r.Gno, s.Packet)
+		if err != nil {
+			return out, err
+		}
+		if received {
+			if err := skipReceived(ctx, r.Log, r.AckToEth, s.Packet); err != nil {
+				return out, err
+			}
+			continue
+		}
 		slot, block, err := r.UpdateTo(ctx, s.Block)
 		if err != nil {
 			return out, err

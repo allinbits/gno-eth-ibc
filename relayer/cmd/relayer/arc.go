@@ -64,12 +64,15 @@ func cmdCreateArcClient(ctx context.Context, args []string) error {
 	f := newArcFlags(fs)
 	trusting := fs.Duration("trusting-period", 14*24*time.Hour, "trusting period")
 	drift := fs.Duration("max-clock-drift", 90*time.Second, "max clock drift: Arc accepts proposer clocks 30s ahead, and gno.land block time trails real time")
+	registry := fs.String("registry", arc.RegistryAddress.Hex(), "ValidatorRegistry proxy address")
+	location := fs.String("registry-storage-location", arc.RegistryStorageLocation.Hex(), "ValidatorRegistry ERC-7201 storage base slot (a substitute for a recovery may name another)")
 	_ = fs.Parse(args)
+	reg := arc.Registry{Address: common.HexToAddress(*registry), StorageLocation: common.HexToHash(*location)}
 	g, a, dep, err := f.dial(ctx)
 	if err != nil {
 		return err
 	}
-	s, err := a.LatestSnapshot(ctx, common.Hash{}, common.Address{}, nil)
+	s, err := a.LatestSnapshot(ctx, reg, common.Hash{}, common.Address{}, nil)
 	if err != nil {
 		return err
 	}
@@ -77,6 +80,7 @@ func cmdCreateArcClient(ctx context.Context, args []string) error {
 		ChainID: dep.ChainID, TrustingPeriod: uint64(trusting.Seconds()), MaxClockDrift: uint64(drift.Seconds()),
 		TrustNumerator: 1, TrustDenominator: 3,
 		Router: dep.ICS26Router, CommitmentSlot: common.BytesToHash(ethgno.IBCStoreCommitmentSlot),
+		Registry: reg,
 	}, s)
 	res, err := g.Call(gno.EthClientTx, relay.EthRelayRealm, "CreateArcClient", nil, base64.StdEncoding.EncodeToString(msg))
 	if err != nil {

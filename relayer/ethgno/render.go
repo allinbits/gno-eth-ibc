@@ -246,7 +246,8 @@ func Header(u beacon.LightClientUpdate, active beacon.SyncCommittee, isNext bool
 		nonSigners(active, u.SyncAggregate.SyncCommitteeBits))
 }
 
-// MembershipProof renders a storage proof for the client's extproof.Proof.
+// MembershipProof renders a storage proof as an ethereum.MembershipProof
+// literal; its Encode method gives the bytes the client's Verify methods take.
 func MembershipProof(p StorageProof) string {
 	return fmt.Sprintf("%s.MembershipProof{AccountProof: %s, StorageProof: %s}", Pkg, blist(p.AccountProof), blist(p.StorageProof))
 }

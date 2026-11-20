@@ -1,8 +1,8 @@
 # relayer
 
 An IBC v2 relayer between gno.land and an EVM chain running solidity-ibc-eureka v3.0.2 with
-`GnoLightClient`. Today it relays gno.land → EVM; the EVM → gno.land direction plugs into the same
-packages (see "Adding the other direction").
+`GnoLightClient`. It relays gno.land → EVM, the acks back, and EVM → gno.land for Ethereum and Arc
+(see "Acks back to gno.land" and "The other direction").
 
 ## Layout
 
@@ -16,7 +16,8 @@ packages (see "Adding the other direction").
 | `cmd/relayer` | the CLI |
 
 `relayer/ethgno` and `relayer/beacon` (beacon API client, Ethereum light-client messages rendered as
-Gno literals) are written separately and plug in as an `relay.AckProofSource`.
+Gno literals) serve `relay.EthToGno`, and `relayer/arc` serves `relay.ArcToGno`; both relay acks back
+to gno as the `relay.AckRelayer`.
 
 ## CLI
 
@@ -61,14 +62,14 @@ For the `send_packet` events of the core realm (`gno.land/r/aib/ibc/core`) on th
 
 ## Acks back to gno.land
 
-`relay.GnoAckSubmitter` submits `core.Acknowledgement(cross(cur), types.MsgAcknowledgement{...})` in a
-MsgRun with the proof in `Ext: extproof.Proof{Data: <ethereum.MembershipProof>}`. The proof
-expression comes from an `AckProofSource`, which must first bring gno's Ethereum client to a finalized
-slot covering the EVM block; that needs a beacon chain. On anvil there is none, so the CLI uses
-`relay.SkipAcks`, which only logs.
+Acks go back through `ethrelay.Acknowledgement` (MsgCall), whose last field is the wire-encoded
+`ethereum.MembershipProof`; the core hands those bytes to the light client, which decodes them
+(gno-realms#99). Proving the ack first needs gno's Ethereum client at a finalized slot covering the
+EVM block, so a beacon chain (`relay.EthToGno`; Arc: `relay.ArcToGno`). On anvil there is none, so
+the CLI uses `relay.SkipAcks`, which only logs.
 
-## Adding the other direction
+## The other direction
 
-EVM → gno.land packets reuse `eth` (watch `SendPacket` logs), `ibc` (packet types and paths), `gno`
-(`Run` with a rendered `core.RecvPacket` script, as `AcknowledgementScript` does for acks) and the
-same `AckProofSource`-style proof rendering; it goes in its own `relay` file next to `gno_to_eth.go`.
+EVM → gno.land packets are in `relay/eth_to_gno.go` (Ethereum) and `relay/arc_to_gno.go` (Arc): they
+watch `SendPacket` logs, bring gno's client past the block, and deliver with `ethrelay.RecvPacket`,
+the proof again the wire-encoded `ethereum.MembershipProof`.
