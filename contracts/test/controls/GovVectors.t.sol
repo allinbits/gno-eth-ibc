@@ -14,9 +14,10 @@ import { ControlsFixture } from "./ControlsFixture.sol";
 
 /// @notice Byte-exact vectors of the governance channel (ADR pr6375 §5.4) for the gno.land side (`ibcgov`): for each
 /// kind, its params, the full envelope and the app acknowledgement IBCAdmin writes for it, delivered in order through
-/// the real router on a fresh deployment; plus the duplicate, conflict, buffered, spent and beyond-window-cancel
-/// acknowledgements. `WRITE_GOV_VECTORS=true forge test --match-contract GovVectors` rewrites
-/// test/fixtures/gov-vectors.json; otherwise the test checks every byte against it.
+/// the real router on a fresh deployment; plus the duplicate, conflict, buffered, spent, beyond-window-cancel,
+/// cancelled (status 6) and duplicate-of-recorded (status 7) acknowledgements. `WRITE_GOV_VECTORS=true forge test
+/// --match-contract GovVectors` rewrites test/fixtures/gov-vectors.json; otherwise the test checks every byte against
+/// it.
 contract GovVectorsTest is ControlsFixture {
     string internal constant FILE = "test/fixtures/gov-vectors.json";
 
@@ -139,7 +140,8 @@ contract GovVectorsTest is ControlsFixture {
         ranges[0] = P.Range(2, 3);
         _deliver("kind1-cancel", 11, 1, "((uint64 from, uint64 to)[] ranges = [(2, 3)])", P.cancel(ranges));
         // a duplicate and a conflict of seq 1, a buffered seq 13, a spent unknown kind at seq 12 (which drains 13), and
-        // a cancel beyond the window (tombstones applied, success ack with redispatch = 1)
+        // a cancel beyond the window (success ack with redispatch = 1; its range lies past the horizon, last + 64 = 77
+        // at its arrival, so it tombstones nothing)
         _deliver("duplicate-of-seq-1", 1, 2, "the bytes of kind2-unpause-route again", P.unpause(1, "client-0"));
         _deliver(
             "conflict-at-seq-1",
@@ -197,6 +199,44 @@ contract GovVectorsTest is ControlsFixture {
             "(string clientId = \"client-0\") - the current epoch's client; disables the emergency recovery for good after 7 days",
             P.disableRecovery("client-0")
         );
+        // ack 6: a cancel of the next number, that number recorded cancelled, and its re-delivery
+        _deliver("kind1-cancel-next", 19, 1, "((uint64 from, uint64 to)[] ranges = [(20, 20)])", P.cancel1(20, 20));
+        _deliver(
+            "cancelled-at-recording",
+            20,
+            11,
+            "(string clientId = \"client-0\", uint64 quarantineSeconds = 86400) - tombstoned by seq 19: status 6",
+            P.settings("client-0", 1 days)
+        );
+        _deliver(
+            "duplicate-of-cancelled",
+            20,
+            11,
+            "the bytes of cancelled-at-recording again: a duplicate of a cancelled decision, status 6",
+            P.settings("client-0", 1 days)
+        );
+        // ack 7 and 3: a duplicate of a recorded number (seq 18, pending) and of a buffered one (seq 22)
+        _deliver(
+            "duplicate-of-recorded",
+            18,
+            14,
+            "the bytes of kind14-disable-recovery again: a duplicate of a recorded number, status 7",
+            P.disableRecovery("client-0")
+        );
+        _deliver(
+            "buffered-seq-22",
+            22,
+            11,
+            "(string clientId = \"client-0\", uint64 quarantineSeconds = 172800)",
+            P.settings("client-0", 2 days)
+        );
+        _deliver(
+            "duplicate-of-buffered",
+            22,
+            11,
+            "the bytes of buffered-seq-22 again: a duplicate of a number still buffered, status 3",
+            P.settings("client-0", 2 days)
+        );
     }
 
     function _json() internal view returns (string memory j) {
@@ -205,7 +245,7 @@ contract GovVectorsTest is ControlsFixture {
             "Each vector was delivered in order, through the real ICS26Router, to a fresh IBCAdmin at epoch 1; ack is what IBCAdmin wrote.\",\n",
             "  \"payload\": {\"sourcePort\": \"gov\", \"destPort\": \"ibcgov\", \"version\": \"ibcgov-1\", \"encoding\": \"application/x-ibcgov\"},\n",
             "  \"envelope\": \"version u8 (1) | epoch u32 BE | seq u64 BE | kind u8 | params; params = abi.encode(field1, field2, ...) of the kind's tuple; at most 1024 bytes\",\n",
-            "  \"ack\": \"epoch u32 BE | seq u64 BE | status u8 (1 recorded, 2 buffered, 3 duplicate, 4 conflict, 5 spent) | redispatch u8\",\n",
+            "  \"ack\": \"epoch u32 BE | seq u64 BE | status u8 (1 recorded, 2 buffered, 3 duplicate of a buffered number, 4 conflict, 5 spent, 6 cancelled, 7 duplicate of a recorded number) | redispatch u8\",\n",
             "  \"vectors\": [\n"
         );
         for (uint256 i = 0; i < vectors.length; i++) {
@@ -319,7 +359,7 @@ contract GovVectorsTest is ControlsFixture {
     function test_govVectors() public {
         _build();
         // the statuses the protocol must produce
-        uint8[21] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 4, 2, 5, 2, 1, 1, 1, 1, 1];
+        uint8[27] memory want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 7, 4, 2, 5, 2, 1, 1, 1, 1, 1, 1, 6, 6, 7, 2, 3];
         for (uint256 i = 0; i < vectors.length; i++) {
             (uint32 e, uint64 s, uint8 st,) = _govAck(vectors[i].ack);
             assertEq(e, 1);
@@ -328,7 +368,7 @@ contract GovVectorsTest is ControlsFixture {
         }
         (,,, uint8 redispatch) = _govAck(vectors[15].ack);
         assertEq(redispatch, 1);
-        assertEq(admin.lastSeq(), 18);
+        assertEq(admin.lastSeq(), 20);
 
         if (vm.envOr("WRITE_GOV_VECTORS", false)) {
             vm.writeFile(FILE, _json());

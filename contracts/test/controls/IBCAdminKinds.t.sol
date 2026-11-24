@@ -740,14 +740,91 @@ contract IBCAdminKindsTest is ControlsFixture {
     }
 
     function test_kind10_checks() public {
-        uint64 notGov = _decidePending(S.KIND_ROUTE, P.route("other-1", "gnoland-2"));
+        // another epoch's old client is spent, whatever its new client (even one never enrolled)
+        uint64 notGov = _decidePending(S.KIND_ROUTE, P.route("other-1", "gnoland-404"));
         uint64 unknownNew = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-404"));
         _skip(7 days);
         admin.execute(notGov);
-        admin.execute(unknownNew);
         assertEq(_state(notGov), S.SPENT);
-        assertEq(_state(unknownNew), S.SPENT);
+        // a new client no kind 6 enrolled yet: it waits, never spent
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.RouteTargetNotEnrolled.selector, 1, unknownNew));
+        admin.execute(unknownNew);
+        assertEq(_state(unknownNew), S.PENDING);
         assertEq(admin.epoch(), 1);
+    }
+
+    /// @notice A kind 10 executed before the kind 6 that enrols its new client reverts and stays pending (anyone
+    /// may call `execute`: it could otherwise be spent ahead of its kind 6); once the kind 6 has executed, the same
+    /// kind 10 executes and switches the epoch.
+    function test_kind10_beforeItsKind6_waits_thenExecutes() public {
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decidePending(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        uint64 replace = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-2"));
+        _skip(7 days);
+        for (uint256 i = 0; i < 2; i++) {
+            vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.RouteTargetNotEnrolled.selector, 1, replace));
+            admin.execute(replace);
+            assertEq(_state(replace), S.PENDING);
+            _skip(30 days);
+        }
+        // deferral still comes first: under a flag it is Deferred, not waiting on its target
+        vm.prank(G[2]);
+        admin.setFlag();
+        vm.expectRevert(IIBCAdmin.Deferred.selector);
+        admin.execute(replace);
+        vm.prank(G[2]);
+        admin.clearFlag();
+        admin.execute(add);
+        assertEq(_state(add), S.EXECUTED);
+        admin.execute(replace);
+        assertEq(admin.decision(1, replace).state, S.EXECUTED);
+        assertEq(admin.epoch(), 2);
+        assertEq(admin.govClient(), "gnoland-2");
+    }
+
+    /// @notice gno.land's rebinding: the enrolling kind 6 was burned (tombstoned at recording, ack 6) and is sent
+    /// again at a later number; the kind 10 recorded between them waits for it, and executes after it.
+    function test_kind10_waitsForAReboundKind6() public {
+        MockLightClient lc2 = new MockLightClient();
+        bytes memory enrol = P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash);
+        uint64 s = admin.lastSeq();
+        _recvGov(_env(s + 1, S.KIND_CANCEL, P.cancel1(s + 2, s + 2))); // a forged cancel burns s + 2
+        assertEq(_status(_recvGov(_env(s + 2, S.KIND_CLIENT, enrol))), S.STATUS_CANCELLED);
+        assertEq(_status(_recvGov(_env(s + 3, S.KIND_ROUTE, P.route(clientId, "gnoland-2")))), S.STATUS_RECORDED);
+        _skip(7 days);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.RouteTargetNotEnrolled.selector, 1, s + 3));
+        admin.execute(s + 3);
+        // the rebound kind 6
+        assertEq(_status(_recvGov(_env(s + 4, S.KIND_CLIENT, enrol))), S.STATUS_RECORDED);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.RouteTargetNotEnrolled.selector, 1, s + 3));
+        admin.execute(s + 3);
+        _skip(7 days);
+        admin.execute(s + 4);
+        admin.execute(s + 3);
+        assertEq(admin.epoch(), 2);
+        assertEq(admin.govClient(), "gnoland-2");
+    }
+
+    /// @notice A kind 10 still waiting when another epoch opens is gone with its epoch: enrolling its target later
+    /// never runs it.
+    function test_kind10_waiting_droppedByTheEpochSwitch() public {
+        MockLightClient lc2 = new MockLightClient();
+        uint64 add = _decidePending(
+            S.KIND_CLIENT, P.client(1, "gnoland-2", "ethereum-2", _prefix(), address(lc2), address(lc2).codehash)
+        );
+        uint64 waiting = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-3"));
+        uint64 replace = _decidePending(S.KIND_ROUTE, P.route(clientId, "gnoland-2"));
+        _skip(7 days);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.RouteTargetNotEnrolled.selector, 1, waiting));
+        admin.execute(waiting);
+        admin.execute(add);
+        admin.execute(replace);
+        assertEq(admin.epoch(), 2);
+        assertEq(admin.decision(1, waiting).state, S.PENDING, "left behind in epoch 1");
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.NotPending.selector, waiting));
+        admin.execute(waiting);
     }
 
     // ============================================================================================== kind 11 ==

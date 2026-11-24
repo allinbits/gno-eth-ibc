@@ -718,6 +718,38 @@ contract HandOverTest is ControlsFixture {
         assertEq(x, address(next));
     }
 
+    /// @notice A cancel beyond the window still clears a halted head: its targets are clamped to the horizon its
+    /// arrival read, which always covers the head, so the halted decision records cancelled without the executor
+    /// and the kind 9 behind it records; the rest of the range, past the horizon, is dropped. gno.land's redispatch
+    /// of the halted decision is answered 6 (cancelled).
+    function test_kind9_haltedHead_cancelBeyondWindow_clearsIt() public {
+        vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
+        uint64 s = admin.lastSeq();
+        assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED, "halted, buffered");
+        // a halted head is not recorded: its re-send is a duplicate of a buffered number
+        assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_DUPLICATE);
+        IBCAdminExec next = _good();
+        assertEq(_at(s + 2, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), S.STATUS_BUFFERED);
+        P.Range[] memory r = new P.Range[](2);
+        r[0] = P.Range(s + 1, s + 1);
+        r[1] = P.Range(s + S.WINDOW + 1, type(uint64).max); // past the horizon: dropped
+        bytes memory cancel = _env(s + 500, S.KIND_CANCEL, P.cancel(r));
+        bytes memory ack = _recvGov(cancel);
+        (,, uint8 st, uint8 redispatch) = _govAck(ack);
+        assertEq(st, S.STATUS_BUFFERED);
+        assertEq(redispatch, 1);
+        assertEq(_state(s + 1), S.CANCELLED, "the halted head cleared");
+        assertEq(_state(s + 2), S.PENDING, "the kind 9 recorded");
+        assertEq(admin.lastSeq(), s + 2);
+        assertFalse(admin.isTombstoned(admin.epoch(), s + S.WINDOW + 1));
+        assertEq(admin.tombstones(admin.epoch()).length, 1);
+        assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_CANCELLED);
+        _skip(7 days);
+        admin.execute(s + 2);
+        (address x,) = admin.exec();
+        assertEq(x, address(next));
+    }
+
     /// @notice An executor that reverts at recording answers like malformed parameters: the decision behind the kind
     /// 9 is spent (a revert is indistinguishable from undecodable parameters), and the kind 9 records and executes.
     function test_kind9_bufferedBehind_revertingExecutor_spent() public {

@@ -41,6 +41,13 @@ library IBCAdminStorage {
     uint8 internal constant STATUS_DUPLICATE = 3;
     uint8 internal constant STATUS_CONFLICT = 4;
     uint8 internal constant STATUS_SPENT = 5;
+    /// @notice A tombstoned decision at its recording, or a re-delivery of a decision in state CANCELLED: gno.land
+    /// tells a burned number (cancelled without its own kind 1) from an executed one.
+    uint8 internal constant STATUS_CANCELLED = 6;
+    /// @notice A re-delivery of a number IBCAdmin has recorded (`seq <= lastSeq`: pending, executed or spent; a
+    /// cancelled one is 6), where 3 is a re-delivery of a number still buffered: gno.land's known head moves on
+    /// re-sends too, whatever order the first deliveries took.
+    uint8 internal constant STATUS_DUPLICATE_RECORDED = 7;
 
     // decision state
     uint8 internal constant NONE = 0;

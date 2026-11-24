@@ -82,7 +82,7 @@ contract IBCAdminDeliveryTest is ControlsFixture {
 
     function test_duplicate_recordedAndBuffered() public {
         _recvGov(_shorten(1, 1));
-        _assertAck(_recvGov(_shorten(1, 1)), 1, S.STATUS_DUPLICATE, 0);
+        _assertAck(_recvGov(_shorten(1, 1)), 1, S.STATUS_DUPLICATE_RECORDED, 0);
         _recvGov(_shorten(5, 5));
         _assertAck(_recvGov(_shorten(5, 5)), 5, S.STATUS_DUPLICATE, 0);
         assertEq(admin.conflictBlock(), 0);
@@ -181,14 +181,198 @@ contract IBCAdminDeliveryTest is ControlsFixture {
     }
 
     function test_cancel_rangesMergeAndStayBounded() public {
-        // 70 disjoint single-number cancels, beyond the window: at most MAX_TOMBSTONES stored
+        // 70 disjoint single-number cancels, beyond the window: at most MAX_TOMBSTONES stored; only the targets
+        // within the horizon (last + WINDOW, here 64) are tombstoned
         for (uint64 i = 0; i < 70; i++) {
             _recvGov(_env(1000 + i, S.KIND_CANCEL, P.cancel1(10 * i + 1, 10 * i + 1)));
         }
         assertLe(admin.tombstones(1).length, S.MAX_TOMBSTONES);
         for (uint64 i = 0; i < 70; i++) {
-            assertTrue(admin.isTombstoned(1, 10 * i + 1));
+            assertEq(admin.isTombstoned(1, 10 * i + 1), 10 * i + 1 <= S.WINDOW);
         }
+    }
+
+    // ============================================================================================ horizon ==
+
+    /// @notice Every stored tombstone ends at or before the current horizon `last + WINDOW`.
+    function _assertUnderHorizon() internal view {
+        uint64[2][] memory t = admin.tombstones(admin.epoch());
+        for (uint256 i = 0; i < t.length; i++) {
+            assertLe(t[i][1], admin.lastSeq() + S.WINDOW, "a tombstone past the horizon");
+        }
+    }
+
+    /// @notice moul's review of gno#6375: a forged cancel `(1, 2^64-1)` beyond the window is clamped to the horizon
+    /// read at its arrival; it burns the WINDOW numbers past the head (each acked 6 at its recording), and every
+    /// later decision records and executes.
+    function test_horizon_forgedFullRange_beyondWindow_burnsAtMostWindow() public {
+        for (uint64 s = 1; s <= 5; s++) {
+            _recvGov(_shorten(s, 1 days));
+        }
+        _assertAck(_recvGov(_env(1000, S.KIND_CANCEL, P.cancel1(1, type(uint64).max))), 1000, S.STATUS_BUFFERED, 1);
+        uint64[2][] memory t = admin.tombstones(1);
+        assertEq(t.length, 1);
+        assertEq(t[0][0], 1);
+        assertEq(t[0][1], 5 + S.WINDOW, "clamped to the horizon");
+        for (uint64 s = 6; s <= 5 + S.WINDOW; s++) {
+            _assertAck(_recvGov(_shorten(s, 2 days)), s, S.STATUS_CANCELLED, 0);
+            assertEq(_state(s), S.CANCELLED);
+        }
+        uint64 next = 6 + S.WINDOW;
+        assertFalse(admin.isTombstoned(1, next));
+        _assertAck(_recvGov(_shorten(next, 3 days)), next, S.STATUS_RECORDED, 0);
+        _assertAck(_recvGov(_shorten(next + 1, 4 days)), next + 1, S.STATUS_RECORDED, 0);
+        _skip(7 days);
+        admin.execute(next);
+        admin.execute(next + 1);
+        assertEq(_state(next), S.EXECUTED);
+        assertEq(_state(next + 1), S.EXECUTED);
+        assertEq(ctl.quarantineSeconds(clientId), 4 days);
+        _assertUnderHorizon();
+    }
+
+    /// @notice The same forged range inside the window, at the next number: the cancel is recorded, its targets
+    /// clamped to the horizon its arrival read.
+    function test_horizon_forgedFullRange_inWindow_burnsAtMostWindow() public {
+        _recvGov(_shorten(1, 1 days));
+        _assertAck(_recvGov(_env(2, S.KIND_CANCEL, P.cancel1(1, type(uint64).max))), 2, S.STATUS_RECORDED, 0);
+        assertEq(admin.tombstones(1)[0][1], 1 + S.WINDOW);
+        for (uint64 s = 3; s <= 1 + S.WINDOW; s++) {
+            _assertAck(_recvGov(_shorten(s, 2 days)), s, S.STATUS_CANCELLED, 0);
+        }
+        _assertAck(_recvGov(_shorten(2 + S.WINDOW, 3 days)), 2 + S.WINDOW, S.STATUS_RECORDED, 0);
+        _skip(7 days);
+        admin.execute(2 + S.WINDOW);
+        assertEq(_state(2 + S.WINDOW), S.EXECUTED);
+    }
+
+    /// @notice Single-number cancels of the even numbers 2 to 128 fill the store (64 ranges), the head moving from 0
+    /// to 64 between them; a forged `(130, 2^64-1)` then merges with its nearest stored range, `[128, 128]`, and
+    /// the merged range ends at the horizon 130: the merge of a full store never reaches past it.
+    function test_horizon_fullStoreMerge_staysUnderTheHorizon() public {
+        uint64 cs = 10_000; // the cancels' own numbers, beyond the window
+        for (uint64 base = 0; base < 128; base += 16) {
+            if (base == 64) {
+                // the head moves to 64: the evens recorded cancelled (ack 6), the odds pending
+                for (uint64 s = 1; s <= 64; s++) {
+                    _assertAck(_recvGov(_shorten(s, 1 days)), s, s % 2 == 0 ? S.STATUS_CANCELLED : S.STATUS_RECORDED, 0);
+                }
+            }
+            P.Range[] memory r = new P.Range[](8);
+            for (uint64 k = 0; k < 8; k++) {
+                r[k] = P.Range(base + 2 * k + 2, base + 2 * k + 2);
+            }
+            _assertAck(_recvGov(_env(cs, S.KIND_CANCEL, P.cancel(r))), cs, S.STATUS_BUFFERED, 1);
+            cs++;
+            _assertUnderHorizon();
+        }
+        assertEq(admin.tombstones(1).length, S.MAX_TOMBSTONES, "the store is full");
+        _recvGov(_shorten(65, 1 days));
+        _assertAck(_recvGov(_shorten(66, 1 days)), 66, S.STATUS_CANCELLED, 0);
+        assertEq(admin.lastSeq(), 66); // the horizon is 130
+        _recvGov(_env(cs, S.KIND_CANCEL, P.cancel1(130, type(uint64).max)));
+        assertEq(admin.tombstones(1).length, S.MAX_TOMBSTONES);
+        _assertUnderHorizon();
+        assertTrue(admin.isTombstoned(1, 129), "the gap's number dies with the merge");
+        assertTrue(admin.isTombstoned(1, 130));
+        assertFalse(admin.isTombstoned(1, 131));
+        for (uint64 s = 67; s <= 130; s++) {
+            _assertAck(
+                _recvGov(_shorten(s, 1 days)), s, s % 2 == 0 || s >= 129 ? S.STATUS_CANCELLED : S.STATUS_RECORDED, 0
+            );
+        }
+        _assertAck(_recvGov(_shorten(131, 2 days)), 131, S.STATUS_RECORDED, 0);
+        _skip(7 days);
+        admin.execute(131);
+        assertEq(_state(131), S.EXECUTED);
+    }
+
+    /// @notice Codex's freeze of gno.land's known head: 2..64 delivered first (buffered, 2), then 1 (recorded, it
+    /// drains 2..9), then 65. Every re-send of a recorded number answers 7, never the bare 3, so gno.land learns how
+    /// far recording reached; a re-send of a number still buffered answers 3; a cancelled one 6; a spent one 7.
+    function test_ack7_duplicateOfARecordedNumber() public {
+        for (uint64 s = 2; s <= S.WINDOW; s++) {
+            _assertAck(_recvGov(_shorten(s, s)), s, S.STATUS_BUFFERED, 0);
+        }
+        _assertAck(_recvGov(_shorten(1, 1)), 1, S.STATUS_RECORDED, 0);
+        assertEq(admin.lastSeq(), 1 + S.DRAIN);
+        _assertAck(_recvGov(_shorten(S.WINDOW + 1, 1)), S.WINDOW + 1, S.STATUS_BUFFERED, 0);
+        uint64 last = admin.lastSeq();
+        for (uint64 s = 1; s <= S.WINDOW + 1; s++) {
+            uint64 q = s == S.WINDOW + 1 ? 1 : s;
+            _assertAck(_recvGov(_shorten(s, q)), s, s <= last ? S.STATUS_DUPLICATE_RECORDED : S.STATUS_DUPLICATE, 0);
+            last = admin.lastSeq(); // every delivery drains: the head moves while the re-sends go on
+        }
+        // a spent number (an unknown kind) and a cancelled one
+        uint64 n = admin.lastSeq();
+        while (admin.decision(1, n + 1).state == S.BUFFERED) {
+            admin.drain();
+            n = admin.lastSeq();
+        }
+        _assertAck(_recvGov(_env(n + 1, 99, "")), n + 1, S.STATUS_SPENT, 0);
+        _assertAck(_recvGov(_env(n + 1, 99, "")), n + 1, S.STATUS_DUPLICATE_RECORDED, 0);
+        _recvGov(_env(n + 2, S.KIND_CANCEL, P.cancel1(n + 3, n + 3)));
+        _assertAck(_recvGov(_shorten(n + 3, 1)), n + 3, S.STATUS_CANCELLED, 0);
+        _assertAck(_recvGov(_shorten(n + 3, 1)), n + 3, S.STATUS_CANCELLED, 0);
+    }
+
+    // ========================================================================================== ack 6 ==
+
+    /// @notice A tombstoned decision is acked 6 at its recording (formerly 1, like an executed one), and so is every
+    /// re-delivery of a decision in state CANCELLED (formerly 3): one recorded cancelled, one buffered and cancelled
+    /// by a drain, one pending and cancelled at execution. Other duplicates stay 3.
+    function test_ack6_atRecording_andOnADuplicateOfACancelledDecision() public {
+        _assertAck(_recvGov(_env(1, S.KIND_CANCEL, P.cancel1(2, 2))), 1, S.STATUS_RECORDED, 0);
+        _assertAck(_recvGov(_shorten(2, 1)), 2, S.STATUS_CANCELLED, 0);
+        assertEq(_state(2), S.CANCELLED);
+        _assertAck(_recvGov(_shorten(2, 1)), 2, S.STATUS_CANCELLED, 0);
+        // buffered, then cancelled when a drain records it
+        _assertAck(_recvGov(_shorten(5, 5)), 5, S.STATUS_BUFFERED, 0);
+        _assertAck(_recvGov(_env(3, S.KIND_CANCEL, P.cancel1(5, 5))), 3, S.STATUS_RECORDED, 0);
+        _assertAck(_recvGov(_shorten(5, 5)), 5, S.STATUS_DUPLICATE, 0); // still buffered
+        _assertAck(_recvGov(_shorten(4, 4)), 4, S.STATUS_RECORDED, 0); // drains 5
+        assertEq(_state(5), S.CANCELLED);
+        _assertAck(_recvGov(_shorten(5, 5)), 5, S.STATUS_CANCELLED, 0);
+        // pending, then cancelled at execution
+        _recvGov(_shorten(6, 6));
+        _recvGov(_env(7, S.KIND_CANCEL, P.cancel1(6, 6)));
+        _assertAck(_recvGov(_shorten(6, 6)), 6, S.STATUS_DUPLICATE_RECORDED, 0); // pending: recorded
+        _skip(7 days);
+        admin.execute(6);
+        assertEq(_state(6), S.CANCELLED);
+        _assertAck(_recvGov(_shorten(6, 6)), 6, S.STATUS_CANCELLED, 0);
+        // an executed cancel and an executed decision: duplicates of recorded numbers
+        _assertAck(_recvGov(_env(7, S.KIND_CANCEL, P.cancel1(6, 6))), 7, S.STATUS_DUPLICATE_RECORDED, 0);
+        admin.execute(4);
+        _assertAck(_recvGov(_shorten(4, 4)), 4, S.STATUS_DUPLICATE_RECORDED, 0);
+    }
+
+    /// @notice An honest cancel of a buffered decision behaves as before: the decision is cancelled when it is
+    /// recorded, its neighbours are not, and gno.land's redispatch of it learns it was cancelled (ack 6).
+    function test_honestCancel_ofABufferedDecision_unchanged() public {
+        for (uint64 s = 1; s <= 10; s++) {
+            _recvGov(_shorten(s, 1 days));
+        }
+        _assertAck(_recvGov(_shorten(20, 2 days)), 20, S.STATUS_BUFFERED, 0);
+        _assertAck(_recvGov(_env(11, S.KIND_CANCEL, P.cancel1(20, 20))), 11, S.STATUS_RECORDED, 0);
+        uint64[2][] memory t = admin.tombstones(1);
+        assertEq(t.length, 1);
+        assertEq(t[0][0], 20);
+        assertEq(t[0][1], 20);
+        for (uint64 s = 12; s <= 19; s++) {
+            _assertAck(_recvGov(_shorten(s, 3 days)), s, S.STATUS_RECORDED, 0);
+        }
+        assertEq(admin.lastSeq(), 20);
+        assertEq(_state(20), S.CANCELLED);
+        _assertAck(_recvGov(_shorten(20, 2 days)), 20, S.STATUS_CANCELLED, 0);
+        _assertAck(_recvGov(_shorten(21, 4 days)), 21, S.STATUS_RECORDED, 0);
+        _skip(7 days);
+        admin.execute(19);
+        admin.execute(21);
+        assertEq(_state(19), S.EXECUTED);
+        assertEq(_state(20), S.CANCELLED);
+        assertEq(_state(21), S.EXECUTED);
+        assertEq(ctl.quarantineSeconds(clientId), 4 days);
     }
 
     function test_cancel_badRanges_spent() public {
