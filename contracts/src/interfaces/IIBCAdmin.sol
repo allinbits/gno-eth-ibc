@@ -78,6 +78,8 @@ interface IIBCAdmin {
     /// @notice A transfer-app entry point is running (a hook called in): the decision pends.
     error Busy();
     error Suspended();
+    /// @notice A kind 10 whose new client no kind 6 has enrolled yet: it pends, executable once one has.
+    error RouteTargetNotEnrolled(uint32 epoch, uint64 seq);
     error NotDelegated();
     error NoCodeYet(address target);
     error CallStarved();

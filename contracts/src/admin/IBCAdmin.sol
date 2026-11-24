@@ -499,7 +499,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
 
     /// @notice Executes a recorded decision of the current epoch whose delay has passed. Permissionless. A decision
     /// whose parameters fail their checks now is spent; a call that reverts (code not deployed yet, too little gas)
-    /// reverts this, and the decision stays pending.
+    /// reverts this, and the decision stays pending, as does a kind 10 whose new client is not enrolled yet
+    /// (`RouteTargetNotEnrolled`).
     function execute(uint64 seq) external {
         S.Layout storage l = S.layout();
         if (!l.setupDone) revert SetupPending();
@@ -538,6 +539,8 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             revert Deferred();
         }
         if (block.timestamp < matureAt) revert NotMature(matureAt);
+        // a kind 10 whose new client is not enrolled yet pends (IBCAdminNative.routeTarget), never spent
+        if (kind == S.KIND_ROUTE) _native(abi.encodeCall(IBCAdminNative.routeTarget, (ep, seq)));
         string memory spent;
         if (kind == S.KIND_HANDOVER) {
             // IBCAdmin's own path, never through the executor (whatever its code or its pin): a broken executor is

@@ -896,7 +896,7 @@ contract ReviewRegressionsTest is ControlsFixture {
     }
 
     /// @notice Round 3 #7: kind 10 moves only to a client a governed kind 6 enrolled, never to one anybody created
-    /// through the router's permissionless addClient.
+    /// through the router's permissionless addClient: it waits (pending) for an enrolment that never comes.
     function test_r3_7_routeReplacementNeedsAnEnrolledClient() public {
         vm.prank(makeAddr("attacker"));
         string memory forged = router.addClient(
@@ -905,8 +905,9 @@ contract ReviewRegressionsTest is ControlsFixture {
         assertEq(forged, "client-1");
         uint64 seq = _decide(S.KIND_ROUTE, P.route(clientId, forged));
         _skip(7 days);
+        vm.expectRevert(abi.encodeWithSelector(IIBCAdmin.RouteTargetNotEnrolled.selector, 1, seq));
         admin.execute(seq);
-        assertEq(_state(seq), S.SPENT);
+        assertEq(_state(seq), S.PENDING);
         assertEq(admin.epoch(), 1);
         assertFalse(ctl.isRetired(clientId));
     }
@@ -1864,8 +1865,8 @@ contract ReviewRegressionsTest is ControlsFixture {
         // kind 9: an executor bound elsewhere
         AllowingExec foreign = new AllowingExec(address(router), d.accessManager, address(usdc));
         seqs[n++] = _decide(S.KIND_HANDOVER, P.handover(address(foreign), address(foreign).codehash, ""));
-        // kind 10: a client no kind 6 enrolled
-        seqs[n++] = _decide(S.KIND_ROUTE, P.route(clientId, "gnoland-77", 0));
+        // kind 10: an old client that is not this epoch's (a client no kind 6 enrolled waits instead)
+        seqs[n++] = _decide(S.KIND_ROUTE, P.route("other-1", "gnoland-77", 0));
         // kind 11: a shortening a later lengthening (applied at recording) supersedes
         seqs[n++] = _decide(S.KIND_SETTINGS, P.settings(clientId, 1 days));
         _decide(S.KIND_SETTINGS, P.settings(clientId, 30 days));

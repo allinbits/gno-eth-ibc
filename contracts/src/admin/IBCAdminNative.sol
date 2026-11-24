@@ -203,6 +203,48 @@ contract IBCAdminNative is IIBCAdmin {
         return "";
     }
 
+    /// @notice Kind 10 at execution, before the executor: a route replacement whose `oldClientId` is this epoch's
+    /// client and whose `newClientId` no kind 6 has enrolled yet reverts `RouteTargetNotEnrolled` and stays
+    /// pending, never spent. Enrolment only ever grows within a deployment, so the decision executes once the kind 6
+    /// that enrols its target has executed (gno.land may rebind a burned kind 6 at a later number, and nobody may
+    /// spend the kind 10 ahead of it). Every other refusal stays the executor's and spends it (`client`: another
+    /// epoch's old client, a verifier not usable; `route`: a refused migration). IBCAdmin's own check, so no
+    /// executor can spend the kind 10 early by skipping it. Parameters that do not parse (only a replaced
+    /// executor could have recorded them) are left to the executor.
+    function routeTarget(uint32 ep, uint64 seq) external view delegated {
+        S.Layout storage l = S.layout();
+        bytes memory p = l.decisions[ep][seq].params;
+        (bool okOld, bytes32 oldId) = _strHash(p, 0);
+        (bool okNew, bytes32 newId) = _strHash(p, 32);
+        if (okOld && okNew && oldId == keccak256(bytes(l.govClient)) && !l.enrolled[newId]) {
+            revert RouteTargetNotEnrolled(ep, seq);
+        }
+    }
+
+    /// @notice The hash of the ABI-encoded string whose offset is the word at `at` of `p`, bounds-checked (false:
+    /// malformed).
+    function _strHash(bytes memory p, uint256 at) private pure returns (bool ok, bytes32 h) {
+        uint256 len = p.length;
+        if (len < at + 32) return (false, 0);
+        uint256 off;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            off := mload(add(add(p, 32), at))
+        }
+        if (off > len || len - off < 32) return (false, 0);
+        uint256 n;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            n := mload(add(add(p, 32), off))
+        }
+        if (n > len - off - 32) return (false, 0);
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            h := keccak256(add(add(p, 64), off), n)
+        }
+        return (true, h);
+    }
+
     /// @notice Sets the permanent disable. Only IBCAdmin calls it, directly (a delegated or any other call refuses):
     /// kind 14's execution, and the constructor of a deployment without the recovery. There is no way back. Code
     /// running as IBCAdmin (an executor) can call it too, which only disables, never re-enables.
