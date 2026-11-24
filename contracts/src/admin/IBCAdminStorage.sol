@@ -41,6 +41,9 @@ library IBCAdminStorage {
     uint8 internal constant STATUS_DUPLICATE = 3;
     uint8 internal constant STATUS_CONFLICT = 4;
     uint8 internal constant STATUS_SPENT = 5;
+    /// @notice A tombstoned decision at its recording, or a re-delivery of a decision in state CANCELLED: gno.land
+    /// tells a burned number (cancelled without its own kind 1) from an executed one.
+    uint8 internal constant STATUS_CANCELLED = 6;
 
     // decision state
     uint8 internal constant NONE = 0;

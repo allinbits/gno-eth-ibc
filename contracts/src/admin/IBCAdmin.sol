@@ -38,7 +38,9 @@ import { IBCAdminNative } from "./IBCAdminNative.sol";
 ///
 /// Delivery (§5.4): a packet carries the envelope `version u8 = 1 | epoch u32 | seq u64 | kind u8 | params`
 /// (big-endian, params the ABI encoding of the kind's tuple, at most MAX_ENVELOPE = 1024 bytes in all). The app
-/// acknowledgement is `epoch u32 | seq u64 | status u8 | redispatch u8`. IBCAdmin orders recording, not delivery:
+/// acknowledgement is `epoch u32 | seq u64 | status u8 | redispatch u8`, status 1 recorded (pending, executed at
+/// once, or a cancel done), 2 buffered, 3 duplicate, 4 conflict, 5 spent, 6 cancelled (a tombstoned decision at its
+/// recording, and a duplicate of a decision that was cancelled). IBCAdmin orders recording, not delivery:
 ///  - `seq == last + 1` is recorded, then buffered `last + 2...` in order, at most DRAIN per call (every delivery
 ///    drains, and so does the permissionless `drain()`);
 ///  - `last + 1 < seq <= last + WINDOW` is buffered with its hash;
@@ -49,6 +51,11 @@ import { IBCAdminNative } from "./IBCAdminNative.sol";
 ///  - another epoch, another client, port, version or encoding, or an envelope with no readable seq is refused;
 ///  - a decodable decision of an unknown kind or with bad parameters is recorded and spent.
 /// Every refusal reverts with a non-empty custom error, which the router turns into an error acknowledgement.
+///
+/// The horizon: a cancel's targets are clamped, on arrival, to `last + WINDOW` (the numbers IBCAdmin could hold at
+/// that moment); a range starting beyond it is dropped. The cancel's own number may lie beyond the window (it is
+/// bound to its hash), only its targets are clamped. So one forged cancel burns at most WINDOW numbers past the head,
+/// never the rest of the epoch, and gno.land learns of each burned number from its ack (status 6).
 ///
 /// Execution: anyone executes a recorded decision once its delay (§5.4 kind table) has passed. Every 7-day kind is
 /// deferred while a flag, a hold or a conflict stands on IBCAdmin, except the guardian replacement (kind 3), which
@@ -317,7 +324,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
                 emit Conflict(ep, seq, d.hash, hash);
                 return (S.STATUS_CONFLICT, false);
             }
-            if (d.state != S.NONE) return (S.STATUS_DUPLICATE, false);
+            if (d.state != S.NONE) {
+                return (d.state == S.CANCELLED ? S.STATUS_CANCELLED : S.STATUS_DUPLICATE, false);
+            }
             prebound = true;
         }
         bool bad = e.length > S.MAX_ENVELOPE;
@@ -361,12 +370,30 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
         return (true, ranges);
     }
 
-    /// @notice Tombstones a cancel's targets, the inclusive ranges as given (numbers start at 1), whatever the
-    /// cancel's own number.
+    /// @notice Tombstones a cancel's targets, the inclusive ranges (numbers start at 1) clamped to the horizon
+    /// `last + WINDOW` read now, at the cancel's arrival, whatever the cancel's own number: `to` is lowered to the
+    /// horizon and a range whose `from` lies beyond it is dropped. A number past the horizon cannot be held by
+    /// IBCAdmin yet (a decision there is refused, beyond the window, and arrives again only if gno.land re-sends
+    /// it, which it must not do for a decision it cancelled), so a forged cancel burns at most WINDOW numbers past
+    /// the head. The targets are clamped once, with the horizon of the cancel's first arrival: a re-delivery
+    /// applies nothing again.
+    ///
+    /// The merge of a full store (`addTombstone`, past MAX_TOMBSTONES ranges) never reaches past the newest
+    /// horizon either, so no code enforces it there: every stored range's endpoints are endpoints of ranges added
+    /// to the epoch (an overlap merge and a nearest merge take the min of the `from`s and the max of the `to`s),
+    /// each added `to` was at most its own arrival's horizon, and the horizon never decreases within an epoch:
+    /// `lastSeq` only grows (`_record` raises it; a halted recording restores, in the same call, the value it had
+    /// just raised), and a new epoch resets it together with a fresh, empty tombstone list (keyed by epoch). The
+    /// numbers a gap merge kills therefore lie between two stored ranges, both under the horizon. (The executor runs
+    /// in this storage and could write `lastSeq`, but it is governance-installed code with IBCAdmin's full authority
+    /// anyway.)
     function _tombstone(S.Layout storage l, uint32 ep, uint64[2][] memory ranges) private {
+        uint256 h = uint256(l.lastSeq) + S.WINDOW;
+        uint64 horizon = h > type(uint64).max ? type(uint64).max : uint64(h);
         for (uint256 i = 0; i < ranges.length; i++) {
             uint64 from = ranges[i][0] == 0 ? 1 : ranges[i][0];
-            if (from <= ranges[i][1]) S.addTombstone(l, ep, from, ranges[i][1]);
+            uint64 to = ranges[i][1] > horizon ? horizon : ranges[i][1];
+            if (from <= to) S.addTombstone(l, ep, from, to);
         }
     }
 
@@ -424,8 +451,11 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
             emit DecisionSpent(ep, seq, d.kind, reason);
             return S.STATUS_SPENT;
         }
-        if (state == S.CANCELLED) emit DecisionCancelled(ep, seq);
-        else emit DecisionExecuted(ep, seq, d.kind);
+        if (state == S.CANCELLED) {
+            emit DecisionCancelled(ep, seq);
+            return S.STATUS_CANCELLED;
+        }
+        emit DecisionExecuted(ep, seq, d.kind);
         return S.STATUS_RECORDED;
     }
 
