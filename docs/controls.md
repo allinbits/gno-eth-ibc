@@ -124,8 +124,8 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   6 cancelled, 7 duplicate of a recorded number. A cancel beyond the window is acknowledged `status 2, redispatch 1`.
   A re-delivery with the same hash answers 6 if the decision is cancelled, 7 if its number is recorded
   (`seq <= lastSeq`: pending, executed or spent) and 3 if it is still buffered (a halted head included: it is not
-  recorded). Why 7: gno.land binds no decision more than 64 past its known head, the highest number IBCAdmin
-  acknowledged recording (1, 5, 6 or 7). With a bare 3 for every duplicate, an honest order (2 to 64 buffered, then
+  recorded). Why 7: gno.land binds no decision but a cancel (kind 1, exempt: its own number may lie beyond the
+  window) more than 64 past its known head, the highest number IBCAdmin acknowledged recording (1, 5, 6 or 7). With a bare 3 for every duplicate, an honest order (2 to 64 buffered, then
   1 recorded and draining, then 65) left re-sends unable to tell recorded from buffered, and the known head stuck at
   1 for good (`test_ack7_duplicateOfARecordedNumber`; the vector `duplicate-of-seq-1` is acked 7). Status 6 answers the recording of a tombstoned decision (its own
   delivery, when it is the next number) and every re-delivery of a decision in state `CANCELLED` (recorded cancelled,
@@ -148,7 +148,7 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   cancels the gap's numbers too (`test_horizon_fullStoreMerge_staysUnderTheHorizon`); rebinding those is right, since
   governance never withdrew them. **Residual:** a compromised gno-side Ethereum verifier can forge a 6 for a
   decision IBCAdmin holds, and a Rebind of it runs the approved decision a second time, or lands a superseded limits
-  or settings decision (kinds 4, 11) after a newer one. Governance answers by cancelling the copy by its number (or
+  or settings decision (kinds 4, 11), guardian seats (kind 3), verifier migration (kind 6 op 2), upgrade or hand-over (kinds 7, 9) or role grant (kind 8) after a newer one, undoing it. Governance answers by cancelling the copy by its number (or
   the burned number before anyone rebinds it); the emergency recovery (§7.12) covers a verifier that keeps forging.
 - A conflict (other bytes at a recorded or buffered number) keeps the first bytes and sets IBCAdmin's conflict
   flag, which defers every 7-day decision except a seat change (kind 3, which only a hold delays, by its anchor
