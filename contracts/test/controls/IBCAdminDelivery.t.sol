@@ -82,7 +82,7 @@ contract IBCAdminDeliveryTest is ControlsFixture {
 
     function test_duplicate_recordedAndBuffered() public {
         _recvGov(_shorten(1, 1));
-        _assertAck(_recvGov(_shorten(1, 1)), 1, S.STATUS_DUPLICATE, 0);
+        _assertAck(_recvGov(_shorten(1, 1)), 1, S.STATUS_DUPLICATE_RECORDED, 0);
         _recvGov(_shorten(5, 5));
         _assertAck(_recvGov(_shorten(5, 5)), 5, S.STATUS_DUPLICATE, 0);
         assertEq(admin.conflictBlock(), 0);
@@ -287,6 +287,35 @@ contract IBCAdminDeliveryTest is ControlsFixture {
         assertEq(_state(131), S.EXECUTED);
     }
 
+    /// @notice Codex's freeze of gno.land's known head: 2..64 delivered first (buffered, 2), then 1 (recorded, it
+    /// drains 2..9), then 65. Every re-send of a recorded number answers 7, never the bare 3, so gno.land learns how
+    /// far recording reached; a re-send of a number still buffered answers 3; a cancelled one 6; a spent one 7.
+    function test_ack7_duplicateOfARecordedNumber() public {
+        for (uint64 s = 2; s <= S.WINDOW; s++) {
+            _assertAck(_recvGov(_shorten(s, s)), s, S.STATUS_BUFFERED, 0);
+        }
+        _assertAck(_recvGov(_shorten(1, 1)), 1, S.STATUS_RECORDED, 0);
+        assertEq(admin.lastSeq(), 1 + S.DRAIN);
+        _assertAck(_recvGov(_shorten(S.WINDOW + 1, 1)), S.WINDOW + 1, S.STATUS_BUFFERED, 0);
+        uint64 last = admin.lastSeq();
+        for (uint64 s = 1; s <= S.WINDOW + 1; s++) {
+            uint64 q = s == S.WINDOW + 1 ? 1 : s;
+            _assertAck(_recvGov(_shorten(s, q)), s, s <= last ? S.STATUS_DUPLICATE_RECORDED : S.STATUS_DUPLICATE, 0);
+            last = admin.lastSeq(); // every delivery drains: the head moves while the re-sends go on
+        }
+        // a spent number (an unknown kind) and a cancelled one
+        uint64 n = admin.lastSeq();
+        while (admin.decision(1, n + 1).state == S.BUFFERED) {
+            admin.drain();
+            n = admin.lastSeq();
+        }
+        _assertAck(_recvGov(_env(n + 1, 99, "")), n + 1, S.STATUS_SPENT, 0);
+        _assertAck(_recvGov(_env(n + 1, 99, "")), n + 1, S.STATUS_DUPLICATE_RECORDED, 0);
+        _recvGov(_env(n + 2, S.KIND_CANCEL, P.cancel1(n + 3, n + 3)));
+        _assertAck(_recvGov(_shorten(n + 3, 1)), n + 3, S.STATUS_CANCELLED, 0);
+        _assertAck(_recvGov(_shorten(n + 3, 1)), n + 3, S.STATUS_CANCELLED, 0);
+    }
+
     // ========================================================================================== ack 6 ==
 
     /// @notice A tombstoned decision is acked 6 at its recording (formerly 1, like an executed one), and so is every
@@ -307,15 +336,15 @@ contract IBCAdminDeliveryTest is ControlsFixture {
         // pending, then cancelled at execution
         _recvGov(_shorten(6, 6));
         _recvGov(_env(7, S.KIND_CANCEL, P.cancel1(6, 6)));
-        _assertAck(_recvGov(_shorten(6, 6)), 6, S.STATUS_DUPLICATE, 0); // pending: an ordinary duplicate
+        _assertAck(_recvGov(_shorten(6, 6)), 6, S.STATUS_DUPLICATE_RECORDED, 0); // pending: recorded
         _skip(7 days);
         admin.execute(6);
         assertEq(_state(6), S.CANCELLED);
         _assertAck(_recvGov(_shorten(6, 6)), 6, S.STATUS_CANCELLED, 0);
-        // an executed cancel and an executed decision: ordinary duplicates
-        _assertAck(_recvGov(_env(7, S.KIND_CANCEL, P.cancel1(6, 6))), 7, S.STATUS_DUPLICATE, 0);
+        // an executed cancel and an executed decision: duplicates of recorded numbers
+        _assertAck(_recvGov(_env(7, S.KIND_CANCEL, P.cancel1(6, 6))), 7, S.STATUS_DUPLICATE_RECORDED, 0);
         admin.execute(4);
-        _assertAck(_recvGov(_shorten(4, 4)), 4, S.STATUS_DUPLICATE, 0);
+        _assertAck(_recvGov(_shorten(4, 4)), 4, S.STATUS_DUPLICATE_RECORDED, 0);
     }
 
     /// @notice An honest cancel of a buffered decision behaves as before: the decision is cancelled when it is

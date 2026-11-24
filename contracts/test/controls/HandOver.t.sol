@@ -726,6 +726,8 @@ contract HandOverTest is ControlsFixture {
         vm.etch(d.ibcAdminExec, address(new RevertingExec(address(router), d.accessManager, address(ics20))).code);
         uint64 s = admin.lastSeq();
         assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_BUFFERED, "halted, buffered");
+        // a halted head is not recorded: its re-send is a duplicate of a buffered number
+        assertEq(_at(s + 1, S.KIND_SETTINGS, P.settings(clientId, 2 days)), S.STATUS_DUPLICATE);
         IBCAdminExec next = _good();
         assertEq(_at(s + 2, S.KIND_HANDOVER, P.handover(address(next), address(next).codehash, "")), S.STATUS_BUFFERED);
         P.Range[] memory r = new P.Range[](2);

@@ -39,8 +39,10 @@ import { IBCAdminNative } from "./IBCAdminNative.sol";
 /// Delivery (§5.4): a packet carries the envelope `version u8 = 1 | epoch u32 | seq u64 | kind u8 | params`
 /// (big-endian, params the ABI encoding of the kind's tuple, at most MAX_ENVELOPE = 1024 bytes in all). The app
 /// acknowledgement is `epoch u32 | seq u64 | status u8 | redispatch u8`, status 1 recorded (pending, executed at
-/// once, or a cancel done), 2 buffered, 3 duplicate, 4 conflict, 5 spent, 6 cancelled (a tombstoned decision at its
-/// recording, and a duplicate of a decision that was cancelled). IBCAdmin orders recording, not delivery:
+/// once, or a cancel done), 2 buffered, 3 duplicate of a number still buffered, 4 conflict, 5 spent, 6 cancelled (a
+/// tombstoned decision at its recording, and a duplicate of a decision that was cancelled), 7 duplicate of a number
+/// recorded (`seq <= last`, not cancelled), so that a re-send tells gno.land how far recording has reached whatever
+/// order the first deliveries took. IBCAdmin orders recording, not delivery:
 ///  - `seq == last + 1` is recorded, then buffered `last + 2...` in order, at most DRAIN per call (every delivery
 ///    drains, and so does the permissionless `drain()`);
 ///  - `last + 1 < seq <= last + WINDOW` is buffered with its hash;
@@ -325,7 +327,9 @@ contract IBCAdmin is IIBCApp, IIBCAdmin {
                 return (S.STATUS_CONFLICT, false);
             }
             if (d.state != S.NONE) {
-                return (d.state == S.CANCELLED ? S.STATUS_CANCELLED : S.STATUS_DUPLICATE, false);
+                if (d.state == S.CANCELLED) return (S.STATUS_CANCELLED, false);
+                // recorded (pending, executed, spent), or still buffered (a halted head included: not recorded)
+                return (seq <= last ? S.STATUS_DUPLICATE_RECORDED : S.STATUS_DUPLICATE, false);
             }
             prebound = true;
         }
