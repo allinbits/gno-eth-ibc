@@ -134,8 +134,16 @@ As ADR §5.4 has it (amended 2026-10-16 with the implementation):
   the rest of the epoch. The full store's nearest merge stays under the horizon too: every stored endpoint is an
   endpoint of an added range, each at most its own arrival's horizon, and `lastSeq` never decreases within an epoch.
   An honest cancel of a decision dispatched more than 64 ahead no longer pre-empts it; that decision is refused on
-  arrival anyway (beyond the window) until the head reaches it, and gno.land must not redispatch a decision it
-  cancelled. (`test_horizon_*`, `test_ack6_*`, `test_kind9_haltedHead_cancelBeyondWindow_clearsIt`.)
+  arrival anyway (beyond the window) until the head reaches it, and gno.land re-sends a decision it cancelled only
+  on a governed authorization. (`test_horizon_*`, `test_ack6_*`, `test_kind9_haltedHead_cancelBeyondWindow_clearsIt`.)
+- **Burned numbers (gno.land side).** A number acknowledged 6 that no cancel of gno.land's names is "burned", and
+  anyone may `Rebind` it on gno.land: the same decision is sent again at the epoch's next number. A burned number does
+  not prove a forgery: with all 64 tombstone slots full, an honest cancel merges into its nearest stored range and
+  cancels the gap's numbers too (`test_horizon_fullStoreMerge_staysUnderTheHorizon`); rebinding those is right, since
+  governance never withdrew them. **Residual:** a compromised gno-side Ethereum verifier can forge a 6 for a
+  decision IBCAdmin holds, and a Rebind of it runs the approved decision a second time, or lands a superseded limits
+  or settings decision (kinds 4, 11) after a newer one. Governance answers by cancelling the copy by its number (or
+  the burned number before anyone rebinds it); the emergency recovery (§7.12) covers a verifier that keeps forging.
 - A conflict (other bytes at a recorded or buffered number) keeps the first bytes and sets IBCAdmin's conflict
   flag, which defers every 7-day decision except a seat change (kind 3, which only a hold delays, by its anchor
   rule) and a hand-over (kind 9, which flags, a conflict's included, and holds defer no longer than their anchors
